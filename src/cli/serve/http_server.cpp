@@ -1405,13 +1405,17 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
 
 /// llama-server props for a single-model server: what it runs, so a client
 /// can record which model, build and settings answered it. `?model=` is
-/// accepted and not required, as in llama-server outside router mode. Fields
-/// the backend does not report are omitted rather than sent as zero.
+/// accepted and not required, as in llama-server outside router mode; when
+/// it names a session class, alias, slots and context are that class's.
+/// Fields the backend does not report are omitted rather than sent as zero.
 HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   const std::string requested = req.query_param("model");
+  const auto served = requested.empty()
+                          ? std::nullopt
+                          : ResolveServedModel(b, std::string_view(requested));
   json::Value resp = json::Value::object();
   resp["model"] = requested.empty() ? b.model_id() : requested;
-  resp["model_alias"] = b.model_id();
+  resp["model_alias"] = served ? served->id : b.model_id();
   resp["template"] = "";
   resp["model_info"] = json::Value::object();
   if (auto path = b.model_path(); !path.empty()) {
@@ -1420,8 +1424,14 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   if (auto build = b.build_info(); !build.empty()) {
     resp["build_info"] = std::move(build);
   }
-  if (const auto sessions = b.session_states().size(); sessions > 0) {
-    resp["total_slots"] = sessions;
+  const auto sessions = b.session_states();
+  // Sessions of a named class report its name; others belong to the model.
+  const auto slots = static_cast<std::size_t>(
+      std::ranges::count_if(sessions, [&](const auto& session) {
+        return !served || session.model.empty() || session.model == served->id;
+      }));
+  if (slots > 0) {
+    resp["total_slots"] = slots;
   }
 
   // What a request without sampling fields gets.
@@ -1445,9 +1455,6 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   params["n_predict"] = n_predict;
   json::Value generation = json::Value::object();
   // A served model named by `?model=` reports its own context.
-  const auto served = requested.empty()
-                          ? std::nullopt
-                          : ResolveServedModel(b, std::string_view(requested));
   if (const std::size_t context =
           served ? served->context_length : b.max_context();
       context > 0) {
@@ -1606,7 +1613,7 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "llamacpp:requests_deferred "
       << detail::RequestsDeferred().load(std::memory_order_relaxed) << "\n"
       << "# HELP llamacpp:kv_cache_usage_ratio In-flight prompt and generated "
-         "tokens over sessions times context; excludes retained cache\n"
+         "tokens over the sum of session contexts; excludes retained cache\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
       << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
   return {.status = 200,

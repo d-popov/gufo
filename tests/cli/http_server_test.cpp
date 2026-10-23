@@ -2188,6 +2188,15 @@ void TestSessionClassRouting() {
          slots.items()[0].member_size("n_ctx") == 1000);
   assert(slots.items()[1].member_str("model") == "sub" &&
          slots.items()[1].member_size("n_ctx") == 32);
+  const auto props =
+      body(server.Send("GET /props?model=sub HTTP/1.1\r\n\r\n"));
+  assert(props.member_str("model_alias") == "sub" &&
+         props.member_size("total_slots") == 1 &&
+         props.find("default_generation_settings")->member_size("n_ctx") ==
+             32);
+  const auto all = body(server.Send("GET /props HTTP/1.1\r\n\r\n"));
+  assert(all.member_str("model_alias") == "test" &&
+         all.member_size("total_slots") == 2);
   server.backend->sessions.clear();
   server.backend->served.clear();
 }

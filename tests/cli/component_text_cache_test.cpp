@@ -1902,13 +1902,34 @@ public:
     }
     return Runner::Prefill(state, prompt, offset, budget);
   }
+  // The held request decodes slowly, without blocking the scheduler, and
+  // stops at its next selection once the test releases it. Other requests
+  // therefore run while it is provably still decoding.
+  TextDecodeSelection SelectNext(TextRunnerState& state,
+                                 sampling::SamplerState& sampler) const override {
+    {
+      const std::lock_guard lock(mutex);
+      const auto label = labels.find(&state);
+      if (released && label != labels.end() && label->second == held)
+        return {.stop = true};
+    }
+    return Runner::SelectNext(state, sampler);
+  }
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    bool slow = false;
     {
       const std::lock_guard lock(mutex);
       events.push_back({true, labels.at(&state)});
       Require(state, CheckpointPosition(state) + 1);
+      slow = labels.at(&state) == held && !released;
     }
+    if (slow)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
     Runner::Advance(state, token);
+  }
+  void Release() {
+    const std::lock_guard lock(mutex);
+    released = true;
   }
   void AdvanceBatch(
       std::span<const TextRunnerAdvance> advances) const override {
@@ -1922,6 +1943,8 @@ public:
     TextModelRunner::AdvanceBatch(advances);
   }
   mutable std::mutex mutex;
+  TextRunnerToken held{0};
+  bool released{false};
   mutable std::map<const cache::Adapter*, std::uint32_t> capacities;
   mutable std::map<const TextRunnerState*, TextRunnerToken> labels;
   mutable std::vector<Event> events;
@@ -1999,45 +2022,90 @@ TextRequestMetadata ClassMetadata(std::size_t session_class) {
   metadata.session_class = session_class;
   return metadata;
 }
+// Waits until the held request has decoded, so it holds its session.
+void AwaitDecoding(const ClassRunner& runner) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    {
+      const std::lock_guard lock(runner.mutex);
+      if (std::ranges::any_of(runner.events, [&](const auto& event) {
+            return event.advance && event.label == runner.held;
+          }))
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  assert(false && "held request never decoded");
+}
 void SchedulerAdmitsOnlyIntoTheRequestClass() {
   auto runner = std::make_shared<ClassRunner>();
+  runner->held = 1;
   auto pool = std::make_shared<TextRunnerPool>(
       runner, std::vector<TextSessionClass>{
                   {.name = "main", .count = 1, .max_context = 4096},
                   {.name = "sub", .count = 1, .max_context = 4096}});
   TextGenerationScheduler scheduler(pool);
   const sampling::SamplingConfig greedy{.temperature = 0.0F};
-  // One client queues a long main request, a second main request and a sub
+  // One client queues a held main request, a second main request and a sub
   // request. The busy main class must hold back only its own second request.
-  auto first = scheduler.Submit(Labelled(1, 8), 500, greedy, {}, false,
+  auto first = scheduler.Submit(Labelled(1, 8), 0, greedy, {}, false,
                                 ClassMetadata(0));
   auto second = scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false,
                                  ClassMetadata(0));
   auto sub = scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false,
                               ClassMetadata(1));
-  assert(first.Wait().completion_tokens == 500);
-  assert(second.Wait().completion_tokens == 4);
+  // The sub class finishes while the main class is still held...
   assert(sub.Wait().completion_tokens == 4);
-  const std::lock_guard lock(runner->mutex);
-  const auto& events = runner->events;
-  const auto index = [&](bool advance, TextRunnerToken label, bool last) {
-    std::size_t found = events.size();
-    for (std::size_t i = 0; i < events.size(); ++i)
-      if (events[i].advance == advance && events[i].label == label) {
-        found = i;
-        if (!last)
-          break;
-      }
-    return found;
-  };
-  const auto first_done = index(true, 1, true);
-  // The sub class ran while the main class was busy...
-  assert(index(true, 3, true) < first_done);
-  // ...and the second main request waited for the main session.
-  assert(index(false, 2, false) > first_done);
+  {
+    const std::lock_guard lock(runner->mutex);
+    // ...and the second main request has not started.
+    assert(std::ranges::none_of(runner->events, [](const auto& event) {
+      return event.label == 2;
+    }));
+  }
+  runner->Release();
+  assert(first.Wait().finish_reason ==
+         TextGenerationBackend::FinishReason::kStop);
+  assert(second.Wait().completion_tokens == 4);
+}
+void SchedulerQueueLimitsApplyPerClass() {
+  auto runner = std::make_shared<ClassRunner>();
+  runner->held = 1;
+  auto pool = std::make_shared<TextRunnerPool>(
+      runner, std::vector<TextSessionClass>{
+                  {.name = "main", .count = 1, .max_context = 4096},
+                  {.name = "sub", .count = 1, .max_context = 4096}});
+  TextGenerationScheduler scheduler(
+      pool, {},
+      {.max_pending_requests = 1, .max_pending_requests_per_client = 1});
+  const sampling::SamplingConfig greedy{.temperature = 0.0F};
+  auto first = scheduler.Submit(Labelled(1, 8), 0, greedy, {}, false,
+                                ClassMetadata(0));
+  AwaitDecoding(*runner);
+  // The main class's one pending place is taken...
+  auto queued = scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false,
+                                 ClassMetadata(0));
+  bool refused = false;
+  try {
+    (void)scheduler.Submit(Labelled(4, 8), 4, greedy, {}, false,
+                           ClassMetadata(0));
+  } catch (const TextGenerationError& error) {
+    refused = error.code() == TextGenerationErrorCode::kQueueFull ||
+              error.code() == TextGenerationErrorCode::kClientQueueFull;
+  }
+  assert(refused);
+  // ...which leaves the idle sub class's own place free for the same client.
+  auto sub = scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false,
+                              ClassMetadata(1));
+  assert(sub.Wait().completion_tokens == 4);
+  runner->Release();
+  (void)first.Wait();
+  assert(queued.Wait().completion_tokens == 4);
 }
 void SchedulerLimitsAndBatchesEachClassAtItsContext() {
   auto runner = std::make_shared<ClassRunner>();
+  runner->held = 2;
   auto pool = std::make_shared<TextRunnerPool>(
       runner, std::vector<TextSessionClass>{
                   {.name = "main", .count = 1, .max_context = 512},
@@ -2049,21 +2117,35 @@ void SchedulerLimitsAndBatchesEachClassAtItsContext() {
     (void)scheduler.Submit(Labelled(1, 64), 4, greedy, {}, false,
                            ClassMetadata(1));
   } catch (const std::length_error& error) {
-    refused = std::string(error.what()).find("'sub'") != std::string::npos;
+    // The advice names the class whose context fits the prompt.
+    const std::string message = error.what();
+    refused = message.find("'sub'") != std::string::npos &&
+              message.find("'main'") != std::string::npos;
   }
   assert(refused);
-  // Without a limit each class generates until its own context is full.
-  // Both requests decode together, so their advances share batches.
+  refused = false;
+  try {
+    (void)scheduler.Submit(Labelled(1, 512), 4, greedy, {}, false,
+                           ClassMetadata(0));
+  } catch (const std::length_error& error) {
+    // No class fits, so none is suggested.
+    refused = std::string(error.what()).find("use model") == std::string::npos;
+  }
+  assert(refused);
+  // Without a limit the sub request generates until its context is full,
+  // decoding alongside the held main request in shared batches.
   auto main = scheduler.Submit(Labelled(2, 10), 0, greedy, {}, false,
                                ClassMetadata(0));
+  AwaitDecoding(*runner);
   auto sub = scheduler.Submit(Labelled(3, 10), 0, greedy, {}, false,
                               ClassMetadata(1));
   assert(sub.Wait().completion_tokens == 54);
-  assert(main.Wait().completion_tokens == 502);
   const auto states = scheduler.SessionStates();
   assert(states.size() == 2 && states[0].model == "main" &&
          states[0].context == 512 && states[1].model == "sub" &&
          states[1].context == 64);
+  runner->Release();
+  assert(main.Wait().completion_tokens <= 502);
   const std::lock_guard lock(runner->mutex);
   assert(std::ranges::any_of(runner->batches, [](const auto& batch) {
     return std::ranges::find(batch, 512u) != batch.end() &&
@@ -2115,5 +2197,6 @@ int main() {
   SessionClassesNeverShareCachedState();
   SessionClassesNeedNamesAndFittingContexts();
   SchedulerAdmitsOnlyIntoTheRequestClass();
+  SchedulerQueueLimitsApplyPerClass();
   SchedulerLimitsAndBatchesEachClassAtItsContext();
 }

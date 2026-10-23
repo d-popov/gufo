@@ -2419,14 +2419,23 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
           ? impl_->runner_pool->runner().Descriptor().max_context
           : session_class.max_context;
   if (prompt.size() >= context) {
-    throw std::length_error(
-        "prompt has " + std::to_string(prompt.size()) +
-        " tokens but the context is " + std::to_string(context) +
-        (session_class.name.empty()
-             ? "; increase --context or shorten the conversation"
-             : " for model '" + session_class.name +
-                   "'; use a model with a larger context or shorten the "
-                   "conversation"));
+    std::string advice = "; increase --context or shorten the conversation";
+    if (!session_class.name.empty()) {
+      // Name the smallest other class whose context fits this prompt.
+      const TextSessionClass* fits = nullptr;
+      for (const auto& other : classes)
+        if (other.max_context > prompt.size() &&
+            (fits == nullptr || other.max_context < fits->max_context))
+          fits = &other;
+      advice = " for model '" + session_class.name + "'; " +
+               (fits != nullptr ? "use model '" + fits->name + "' (" +
+                                      std::to_string(fits->max_context) +
+                                      " tokens) or shorten the conversation"
+                                : std::string("shorten the conversation"));
+    }
+    throw std::length_error("prompt has " + std::to_string(prompt.size()) +
+                            " tokens but the context is " +
+                            std::to_string(context) + advice);
   }
   const std::size_t available = context - prompt.size();
   sampling.Validate();
@@ -2512,27 +2521,40 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       throw TextGenerationError(TextGenerationErrorCode::kDeviceLost,
                                 kDeviceLostMessage);
     }
-    if (impl_->queued_count >= impl_->scheduler_policy.max_pending_requests) {
+    // Both pending limits apply within the request's session class, so a
+    // backlog in one class never refuses a class whose sessions are idle.
+    const auto same_class = [&](const auto& queued) {
+      return queued->session_class == request->session_class;
+    };
+    std::size_t class_queued = 0;
+    for (const auto& pending : impl_->queued_clients)
+      class_queued += static_cast<std::size_t>(
+          std::ranges::count_if(pending.requests, same_class));
+    if (class_queued >= impl_->scheduler_policy.max_pending_requests) {
       refused = true;
       refusal_code = TextGenerationErrorCode::kQueueFull;
       refusal_message = "text generation pending queue is full";
       refusal_reason = "queue_full";
-      decision_queued = impl_->queued_count;
+      decision_queued = class_queued;
     } else {
       auto client = std::find_if(
           impl_->queued_clients.begin(), impl_->queued_clients.end(),
           [&](const PendingClient& pending) {
             return pending.client_id == request->client_id;
           });
-      if (client != impl_->queued_clients.end() &&
-          client->requests.size() >=
-              impl_->scheduler_policy.max_pending_requests_per_client) {
+      const auto client_queued =
+          client == impl_->queued_clients.end()
+              ? std::size_t{0}
+              : static_cast<std::size_t>(
+                    std::ranges::count_if(client->requests, same_class));
+      if (client_queued >=
+          impl_->scheduler_policy.max_pending_requests_per_client) {
         refused = true;
         refusal_code = TextGenerationErrorCode::kClientQueueFull;
         refusal_message = "text generation client pending queue is full";
         refusal_reason = "client_quota";
-        decision_queued = impl_->queued_count;
-        decision_client_queued = client->requests.size();
+        decision_queued = class_queued;
+        decision_client_queued = client_queued;
       } else {
         if (client == impl_->queued_clients.end()) {
           impl_->queued_clients.push_back({
@@ -2541,8 +2563,8 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
           });
           client = std::prev(impl_->queued_clients.end());
         }
-        decision_queued = impl_->queued_count + 1;
-        decision_client_queued = client->requests.size() + 1;
+        decision_queued = class_queued + 1;
+        decision_client_queued = client_queued + 1;
         request->result.queue_depth_at_submit = decision_queued;
         request->result.client_queue_depth_at_submit = decision_client_queued;
         admitted_prompt_tokens = request->prompt.size();
