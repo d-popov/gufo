@@ -2380,34 +2380,20 @@ public:
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {
+        max_draft_tokens_(max_draft_tokens),
+        artifact_fingerprint_(std::move(artifact_fingerprint)),
+        mtp_fingerprint_(std::move(mtp_fingerprint)) {
     // The typed in-process API owns an immutable loaded model but need not
     // supply file fingerprints when disk caching is disabled. Its model
     // lifetime is an exact process-local identity; durable caches still
     // require the validated full artifact fingerprints below.
-    if (!artifact_fingerprint.empty()) {
+    component_identity_ = ComponentIdentity(max_context_);
+    if (!artifact_fingerprint_.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
-          .compatibility_identity = QwenFlashNextCompatibilityIdentity(
-              artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
-              use_mtp_, max_context_, max_draft_tokens_,
-              model_->DecodeConcurrency(),
-              models::qwen38_flash_next::RopePositionPolicy(
-                  model_->config().rope_scaling)),
+          .compatibility_identity = component_identity_,
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
-      component_identity_ = persistence_->compatibility_identity;
-    } else {
-      std::ostringstream identity;
-      identity << "schema=gufo-process-text-continuation-v1\n"
-               << "model_instance=" << model_.get() << '\n'
-               << "context_tokens=" << max_context_ << '\n'
-               << "mtp=" << use_mtp_ << '\n'
-               << "draft_max_tokens=" << max_draft_tokens_ << '\n'
-               << "draft_cost_concurrency=" << model_->DecodeConcurrency()
-               << '\n';
-      const auto canonical = identity.str();
-      component_identity_.assign(canonical.begin(), canonical.end());
     }
   }
 
@@ -2418,11 +2404,19 @@ public:
     (void)ram;
     return CreateHipComponentCacheResources(
         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
-            model_,
-            use_mtp_ ? core::SessionMode::kSpeculative
-                     : core::SessionMode::kAutoregressive,
-            max_context_, component_identity_),
+            model_, SessionMode(), max_context_, component_identity_),
         ledger);
+  }
+  // A session class keeps its sessions, and the identity of its cached
+  // state, at its own context.
+  [[nodiscard]] std::unique_ptr<cache::Adapter> CreateSessionClassAdapter(
+      std::uint32_t max_context) const override {
+    return std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
+        model_, SessionMode(), max_context, ComponentIdentity(max_context));
+  }
+  [[nodiscard]] std::optional<std::size_t> SessionStateBytes(
+      std::uint32_t max_context) const override {
+    return model_->SessionBytes(SessionMode(), max_context);
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
@@ -2472,10 +2466,8 @@ public:
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = model_->SessionBytes(
-            use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                     : gufo::core::SessionMode::kAutoregressive,
-            max_context_),
+        .per_request_state_bytes =
+            model_->SessionBytes(SessionMode(), max_context_),
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
@@ -2695,7 +2687,7 @@ public:
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qfn = RequireQwenFlashNextState(state);
-    if (qfn.position() >= max_context_) {
+    if (qfn.position() >= qfn.session().ContextSize()) {
       return {.stop = true, .piece = {}};
     }
     const auto logits = qfn.session().Logits();
@@ -2744,7 +2736,7 @@ public:
           "Qwen3.8-Flash-Next MTP decode budget must be at least one token");
     }
     auto& qfn = RequireQwenFlashNextState(state);
-    if (qfn.position() >= max_context_) {
+    if (qfn.position() >= qfn.session().ContextSize()) {
       return {.selections = {}, .stop = true};
     }
     const auto stats_before = qfn.session().Statistics();
@@ -2883,11 +2875,40 @@ public:
   }
 
 private:
+  [[nodiscard]] core::SessionMode SessionMode() const noexcept {
+    return use_mtp_ ? core::SessionMode::kSpeculative
+                    : core::SessionMode::kAutoregressive;
+  }
+  // Restart-safe with artifact fingerprints, else bound to this process's
+  // loaded model. Both name the session context. Every class shares the
+  // model's RoPE policy, which static YaRN derives from the largest one.
+  [[nodiscard]] cache::Identity ComponentIdentity(
+      std::uint32_t context) const {
+    if (!artifact_fingerprint_.empty())
+      return QwenFlashNextCompatibilityIdentity(
+          artifact_fingerprint_, use_mtp_ ? mtp_fingerprint_ : std::string{},
+          use_mtp_, context, max_draft_tokens_, model_->DecodeConcurrency(),
+          models::qwen38_flash_next::RopePositionPolicy(
+              model_->config().rope_scaling));
+    std::ostringstream identity;
+    identity << "schema=gufo-process-text-continuation-v1\n"
+             << "model_instance=" << model_.get() << '\n'
+             << "context_tokens=" << context << '\n'
+             << "mtp=" << use_mtp_ << '\n'
+             << "draft_max_tokens=" << max_draft_tokens_ << '\n'
+             << "draft_cost_concurrency=" << model_->DecodeConcurrency()
+             << '\n';
+    const auto canonical = identity.str();
+    return {canonical.begin(), canonical.end()};
+  }
+
   mutable models::qwen::vision::ImageCache image_cache_;
   std::shared_ptr<QwenFlashNextModel> model_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  std::string artifact_fingerprint_;
+  std::string mtp_fingerprint_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
@@ -2906,6 +2927,22 @@ struct InferenceBackend::Impl {
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
+    /// Named session classes, each served under its name; empty when one
+    /// model ID serves every session.
+    std::vector<TextSessionClass> classes;
+
+    /// The session class a request's served model selects. Without classes
+    /// every request uses the one pool class; the transport has already
+    /// refused other model names.
+    [[nodiscard]] std::size_t SessionClass(std::string_view model) const {
+      if (classes.empty() || model.empty())
+        return 0;
+      const auto found = std::ranges::find(classes, model, &TextSessionClass::name);
+      if (found == classes.end())
+        throw std::invalid_argument("model '" + std::string(model) +
+                                    "' is not served by this process");
+      return static_cast<std::size_t>(found - classes.begin());
+    }
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -2966,7 +3003,8 @@ struct InferenceBackend::Impl {
       std::shared_ptr<const TextPromptContext> context = {},
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
-      InitialOutputState initial = InitialOutputState::kContent) const {
+      InitialOutputState initial = InitialOutputState::kContent,
+      std::size_t session_class = 0) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -2989,6 +3027,7 @@ struct InferenceBackend::Impl {
             .cache_prompt = cache_prompt,
             .cache_prefix_tokens = cache_prefix_tokens,
             .stop_sequences = stop_sequences,
+            .session_class = session_class,
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -3013,7 +3052,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn) {
+                            bool enable_yarn,
+                            std::vector<TextSessionClass> session_classes) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3034,6 +3074,23 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       architecture == "qwen4exp"
           ? reader->GetMetadataUint32("qwen4exp.context_length").value_or(0)
           : 0;
+  if (!session_classes.empty()) {
+    // Only the Flash-Next runner creates sessions of unequal context.
+    if (architecture != "qwen4exp") {
+      SetError(error,
+               "--session-class requires a Qwen3.8-Flash-Next model; this "
+               "GGUF's architecture is '" +
+                   std::string(architecture) + "'");
+      return false;
+    }
+    // The model and its shared scratch are sized for the largest class.
+    max_context = 0;
+    session_count = 0;
+    for (const auto& session_class : session_classes) {
+      max_context = std::max(max_context, session_class.max_context);
+      session_count += session_class.count;
+    }
+  }
   if (max_context == 0) {
     const std::uint64_t native =
         architecture == "qwen4exp"
@@ -3193,7 +3250,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), ram_cache_config);
+                std::move(resolved_disk_cache_config), ram_cache_config,
+                std::move(session_classes));
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3237,6 +3295,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)vision_model_path;
   (void)ram_cache_config;
   (void)enable_yarn;
+  (void)session_classes;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3480,10 +3539,26 @@ bool InferenceBackend::load(
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
-    TextRunnerRamCacheOptions ram_cache_config) {
+    TextRunnerRamCacheOptions ram_cache_config,
+    std::vector<TextSessionClass> session_classes) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
+  }
+  if (!session_classes.empty()) {
+    // The runner and its pool reach the largest class; each class's
+    // sessions are created at its own context.
+    max_context = 0;
+    session_count = 0;
+    for (const auto& session_class : session_classes) {
+      if (session_class.max_context == 0) {
+        SetError(error, "session class '" + session_class.name +
+                            "' needs a nonzero context");
+        return false;
+      }
+      max_context = std::max(max_context, session_class.max_context);
+      session_count += session_class.count;
+    }
   }
   if (max_context == 0)
     max_context = model->MaxContext();
@@ -3529,14 +3604,39 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
+    if (!session_classes.empty()) {
+      // Device state is claimed per session at its class's context.
+      const auto mode = speculative_config.backend == TextSpeculativeBackend::kMtp
+                            ? core::SessionMode::kSpeculative
+                            : core::SessionMode::kAutoregressive;
+      std::ostringstream line;
+      std::size_t context_tokens = 0, state_bytes = 0;
+      line << "event=session_classes classes=";
+      for (std::size_t i = 0; i < session_classes.size(); ++i) {
+        const auto& c = session_classes[i];
+        line << (i ? "," : "") << c.name << ':' << c.count << 'x'
+             << c.max_context;
+        context_tokens += c.count * c.max_context;
+        state_bytes += c.count * model->SessionBytes(mode, c.max_context);
+      }
+      line << " sessions=" << session_count
+           << " context_tokens=" << context_tokens
+           << " session_state_bytes=" << state_bytes
+           << " model_context=" << max_context;
+      Logger::Info("loader", line.str());
+    }
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
-    new_state->model_id = runner->Descriptor().model_id;
-    new_state->max_context = max_context;
+    new_state->model_id = session_classes.empty()
+                              ? runner->Descriptor().model_id
+                              : session_classes.front().name;
+    new_state->max_context = session_classes.empty()
+                                 ? max_context
+                                 : session_classes.front().max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
       runner_disk_cache = TextRunnerDiskCacheOptions{
@@ -3545,9 +3645,15 @@ bool InferenceBackend::load(
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
+    auto runner_pool =
+        session_classes.empty()
+            ? std::make_shared<TextRunnerPool>(
+                  std::move(runner), session_count,
+                  std::move(runner_disk_cache), ram_cache_config)
+            : std::make_shared<TextRunnerPool>(
+                  std::move(runner), session_classes,
+                  std::move(runner_disk_cache), ram_cache_config);
+    new_state->classes = std::move(session_classes);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3603,6 +3709,22 @@ std::uint32_t InferenceBackend::max_context() const {
   return state != nullptr ? state->max_context : 0;
 #else
   return 0;
+#endif
+}
+
+std::vector<InferenceBackend::ServedModel> InferenceBackend::served_models()
+    const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->classes.empty())
+    return TextGenerationBackend::served_models();
+  std::vector<ServedModel> models;
+  models.reserve(state->classes.size());
+  for (const auto& session_class : state->classes)
+    models.push_back({session_class.name, session_class.max_context});
+  return models;
+#else
+  return TextGenerationBackend::served_models();
 #endif
 }
 
@@ -3689,7 +3811,8 @@ void InferenceBackend::set_model_id(const std::string& model_id) {
     return;
   }
   const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-  if (impl_->state == nullptr) {
+  // Session classes are served under their own names.
+  if (impl_->state == nullptr || !impl_->state->classes.empty()) {
     return;
   }
   auto updated = std::make_shared<Impl::State>(*impl_->state);
@@ -3741,19 +3864,22 @@ InferenceBackend::Result InferenceBackend::complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool cache_prompt) {
+    bool cache_prompt, std::string_view model) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
     return {};
   }
+  const auto session_class = state->SessionClass(model);
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   return impl_->GenerateScheduled(
       state, std::move(prompt_tokens), request_start, max_tokens,
       sampling_config, is_cancelled, on_token, std::string(client_id), {},
-      cache_prompt, 0, stop_sequences);
+      cache_prompt, 0, stop_sequences, InitialOutputState::kContent,
+      session_class);
 #else
+  (void)model;
   (void)cache_prompt;
   (void)client_id;
   (void)stop_sequences;
@@ -3776,6 +3902,7 @@ InferenceBackend::Result InferenceBackend::chat(
   if (state == nullptr) {
     return {};
   }
+  const auto session_class = state->SessionClass(request.model);
   auto effective_sampling = sampling_config;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling);
@@ -3795,7 +3922,8 @@ InferenceBackend::Result InferenceBackend::chat(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens, request.stop_sequences, initial);
+      prompt->cache_prefix_tokens, request.stop_sequences, initial,
+      session_class);
 #else
   (void)request;
   (void)max_tokens;
@@ -3812,15 +3940,17 @@ InferenceBackend::start_complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool return_progress, bool cache_prompt) {
+    bool return_progress, bool cache_prompt, std::string_view model) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
     return TextGenerationBackend::start_complete(
         prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
+        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
+        model);
   }
+  const auto session_class = state->SessionClass(model);
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt_tokens), max_tokens, sampling_config, is_cancelled,
@@ -3835,13 +3965,15 @@ InferenceBackend::start_complete(
           .stop_at_eos = !ignore_eos,
           .stop_sequences = stop_sequences,
           .return_progress = return_progress,
+          .session_class = session_class,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request));
 #else
   return TextGenerationBackend::start_complete(
       prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
+      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
+      model);
 #endif
 }
 
@@ -3858,6 +3990,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
+  const auto session_class = state->SessionClass(request.model);
   auto effective_sampling = sampling_config;
   std::optional<sampling::JsonConstraint::ToolFormat> tool_format;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
@@ -3890,6 +4023,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
+          .session_class = session_class,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format);

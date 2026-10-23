@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
@@ -16,6 +18,7 @@
 
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "tests/cache/fake_adapter.hpp"
 
@@ -1870,6 +1873,203 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   assert(log.find("event=capture_failed") == std::string::npos);
   std::filesystem::remove_all(directory);
 }
+// Session classes over the component fixture. Each class adapter keeps the
+// capacity its sessions were created with; executions past it fail, as a
+// native session past its context does. Events record each work unit by the
+// first token of the request's prompt.
+class ClassRunner final : public Runner {
+public:
+  struct Event {
+    bool advance;
+    TextRunnerToken label;
+  };
+  std::unique_ptr<cache::Adapter> CreateSessionClassAdapter(
+      std::uint32_t max_context) const override {
+    auto adapter = std::make_unique<FakeAdapter>();
+    const std::lock_guard lock(mutex);
+    capacities[adapter.get()] = max_context;
+    return adapter;
+  }
+  TextPrefillStep Prefill(TextRunnerState& state,
+                          std::span<const TextRunnerToken> prompt,
+                          std::size_t offset,
+                          std::size_t budget) const override {
+    {
+      const std::lock_guard lock(mutex);
+      labels[&state] = prompt.front();
+      events.push_back({false, prompt.front()});
+      Require(state, prompt.size());
+    }
+    return Runner::Prefill(state, prompt, offset, budget);
+  }
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    {
+      const std::lock_guard lock(mutex);
+      events.push_back({true, labels.at(&state)});
+      Require(state, CheckpointPosition(state) + 1);
+    }
+    Runner::Advance(state, token);
+  }
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    {
+      const std::lock_guard lock(mutex);
+      std::vector<std::uint32_t> batch;
+      for (const auto& advance : advances)
+        batch.push_back(Capacity(advance.state.get()));
+      batches.push_back(std::move(batch));
+    }
+    TextModelRunner::AdvanceBatch(advances);
+  }
+  mutable std::mutex mutex;
+  mutable std::map<const cache::Adapter*, std::uint32_t> capacities;
+  mutable std::map<const TextRunnerState*, TextRunnerToken> labels;
+  mutable std::vector<Event> events;
+  mutable std::vector<std::vector<std::uint32_t>> batches;
+
+private:
+  std::uint32_t Capacity(const TextRunnerState& state) const {
+    return capacities.at(&dynamic_cast<const State&>(state).adapter);
+  }
+  void Require(const TextRunnerState& state, std::size_t rows) const {
+    if (rows > Capacity(state))
+      throw std::length_error("fake session context exceeded");
+  }
+};
+std::vector<TextRunnerToken> Labelled(TextRunnerToken label,
+                                      std::size_t size) {
+  std::vector<TextRunnerToken> prompt(size);
+  std::iota(prompt.begin(), prompt.end(), label * 1000);
+  prompt.front() = label;
+  return prompt;
+}
+void SessionClassesNeverShareCachedState() {
+  auto runner = std::make_shared<ClassRunner>();
+  TextRunnerPool pool(runner,
+                      std::vector<TextSessionClass>{
+                          {.name = "large", .count = 1, .max_context = 4096},
+                          {.name = "small", .count = 1, .max_context = 64}});
+  assert(pool.capacity() == 2);
+  const auto prompt = Labelled(1, 40);
+  {
+    auto request = pool.Acquire(prompt);
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  // The large class's frontier and checkpoints serve only the large class.
+  assert(pool.CachedPrefixTokens(prompt, nullptr, 0) > 0);
+  assert(pool.CachedPrefixTokens(prompt, nullptr, 1) == 0);
+  {
+    auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, true, 1);
+    assert(!request.cache_hit());
+    Prefill(request);
+    (void)request.Commit();
+  }
+  auto again = pool.Acquire(prompt, {}, {}, {}, true, 0, true, 0);
+  assert(again.cache_hit());
+  again.Invalidate();
+  // A prompt beyond the small class is refused before any slot is leased,
+  // even though the large class retains its prefix.
+  const auto deep = Labelled(1, 100);
+  bool refused = false;
+  try {
+    (void)pool.Acquire(deep, {}, {}, {}, true, 0, true, 1);
+  } catch (const std::length_error&) {
+    refused = true;
+  }
+  assert(refused);
+}
+void SessionClassesNeedNamesAndFittingContexts() {
+  const auto refuses = [](std::vector<TextSessionClass> classes) {
+    try {
+      TextRunnerPool pool(std::make_shared<ClassRunner>(), std::move(classes));
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  assert(refuses({{.name = "", .count = 1, .max_context = 64}}));
+  assert(refuses({{.name = "a", .count = 1, .max_context = 8192}}));
+  assert(refuses({{.name = "a", .count = 1, .max_context = 64},
+                  {.name = "a", .count = 1, .max_context = 64}}));
+}
+TextRequestMetadata ClassMetadata(std::size_t session_class) {
+  TextRequestMetadata metadata;
+  metadata.session_class = session_class;
+  return metadata;
+}
+void SchedulerAdmitsOnlyIntoTheRequestClass() {
+  auto runner = std::make_shared<ClassRunner>();
+  auto pool = std::make_shared<TextRunnerPool>(
+      runner, std::vector<TextSessionClass>{
+                  {.name = "main", .count = 1, .max_context = 4096},
+                  {.name = "sub", .count = 1, .max_context = 4096}});
+  TextGenerationScheduler scheduler(pool);
+  const sampling::SamplingConfig greedy{.temperature = 0.0F};
+  // One client queues a long main request, a second main request and a sub
+  // request. The busy main class must hold back only its own second request.
+  auto first = scheduler.Submit(Labelled(1, 8), 500, greedy, {}, false,
+                                ClassMetadata(0));
+  auto second = scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false,
+                                 ClassMetadata(0));
+  auto sub = scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false,
+                              ClassMetadata(1));
+  assert(first.Wait().completion_tokens == 500);
+  assert(second.Wait().completion_tokens == 4);
+  assert(sub.Wait().completion_tokens == 4);
+  const std::lock_guard lock(runner->mutex);
+  const auto& events = runner->events;
+  const auto index = [&](bool advance, TextRunnerToken label, bool last) {
+    std::size_t found = events.size();
+    for (std::size_t i = 0; i < events.size(); ++i)
+      if (events[i].advance == advance && events[i].label == label) {
+        found = i;
+        if (!last)
+          break;
+      }
+    return found;
+  };
+  const auto first_done = index(true, 1, true);
+  // The sub class ran while the main class was busy...
+  assert(index(true, 3, true) < first_done);
+  // ...and the second main request waited for the main session.
+  assert(index(false, 2, false) > first_done);
+}
+void SchedulerLimitsAndBatchesEachClassAtItsContext() {
+  auto runner = std::make_shared<ClassRunner>();
+  auto pool = std::make_shared<TextRunnerPool>(
+      runner, std::vector<TextSessionClass>{
+                  {.name = "main", .count = 1, .max_context = 512},
+                  {.name = "sub", .count = 1, .max_context = 64}});
+  TextGenerationScheduler scheduler(pool);
+  const sampling::SamplingConfig greedy{.temperature = 0.0F};
+  bool refused = false;
+  try {
+    (void)scheduler.Submit(Labelled(1, 64), 4, greedy, {}, false,
+                           ClassMetadata(1));
+  } catch (const std::length_error& error) {
+    refused = std::string(error.what()).find("'sub'") != std::string::npos;
+  }
+  assert(refused);
+  // Without a limit each class generates until its own context is full.
+  // Both requests decode together, so their advances share batches.
+  auto main = scheduler.Submit(Labelled(2, 10), 0, greedy, {}, false,
+                               ClassMetadata(0));
+  auto sub = scheduler.Submit(Labelled(3, 10), 0, greedy, {}, false,
+                              ClassMetadata(1));
+  assert(sub.Wait().completion_tokens == 54);
+  assert(main.Wait().completion_tokens == 502);
+  const auto states = scheduler.SessionStates();
+  assert(states.size() == 2 && states[0].model == "main" &&
+         states[0].context == 512 && states[1].model == "sub" &&
+         states[1].context == 64);
+  const std::lock_guard lock(runner->mutex);
+  assert(std::ranges::any_of(runner->batches, [](const auto& batch) {
+    return std::ranges::find(batch, 512u) != batch.end() &&
+           std::ranges::find(batch, 64u) != batch.end();
+  }));
+}
 }  // namespace
 int main() {
   PublishedResidentCheckpointKeepsDiskStep();
@@ -1912,4 +2112,8 @@ int main() {
   UnbackedDeepRowsSurviveDiskRestart();
   OverRamCaptureStagesPrivateStateUnderPressure(false);
   OverRamCaptureStagesPrivateStateUnderPressure(true);
+  SessionClassesNeverShareCachedState();
+  SessionClassesNeedNamesAndFittingContexts();
+  SchedulerAdmitsOnlyIntoTheRequestClass();
+  SchedulerLimitsAndBatchesEachClassAtItsContext();
 }

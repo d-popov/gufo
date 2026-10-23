@@ -114,7 +114,7 @@ public:
                   const gufo::sampling::SamplingConfig&,
                   const CancellationCheck&, const TokenCallback&,
                   std::string_view, const std::vector<std::string>&,
-                  bool) override {
+                  bool, std::string_view) override {
     return {};
   }
 

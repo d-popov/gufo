@@ -824,11 +824,12 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   if (output->model.empty()) {
     return Error(400, "Bad Request", "'model' is required", "missing_model");
   }
-  if (output->model != backend.model_id()) {
+  if (!ResolveServedModel(backend, std::string_view(output->model))) {
     return Error(404, "Not Found",
                  "model '" + output->model + "' is not served by this process",
                  "model_not_found");
   }
+  output->chat.model = output->model;
 
   try {
     output->chat.response_format =
@@ -2855,7 +2856,7 @@ private:
 };
 
 HttpResponse NonStreamingResponse(
-    const ParsedChatRequest& request, TextGenerationBackend& backend,
+    const ParsedChatRequest& request,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const auto result = generation->Wait();
@@ -2884,7 +2885,7 @@ HttpResponse NonStreamingResponse(
   response["id"] = RandomId("chatcmpl-");
   response["object"] = "chat.completion";
   response["created"] = Now();
-  response["model"] = backend.model_id();
+  response["model"] = request.model;
   json::Value choices = json::Value::array();
   json::Value choice = json::Value::object();
   choice["index"] = 0;
@@ -2925,12 +2926,12 @@ HttpResponse NonStreamingResponse(
 }
 
 HttpResponse StreamingResponse(
-    const ParsedChatRequest& request, TextGenerationBackend& backend,
+    const ParsedChatRequest& request,
     std::shared_ptr<TextGenerationBackend::GenerationRequest> generation,
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
-  const std::string model = backend.model_id();
+  const std::string model = request.model;
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
@@ -3740,7 +3741,9 @@ HttpResponse CreateCompatibilityResponse(
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
   const auto run = [generation, initial, chat, markers, closers,
-                    model = backend.model_id(), stream_log,
+                    model = chat.model.empty() ? backend.model_id()
+                                               : chat.model,
+                    stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
     bool started = false;
@@ -3907,11 +3910,10 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);
     if (parsed.stream) {
-      return StreamingResponse(parsed, backend, std::move(generation),
+      return StreamingResponse(parsed, std::move(generation),
                                initial_output_state);
     }
-    return NonStreamingResponse(parsed, backend, generation,
-                                initial_output_state);
+    return NonStreamingResponse(parsed, generation, initial_output_state);
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);
   } catch (const std::invalid_argument& exception) {

@@ -76,6 +76,10 @@ public:
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
   /// `enable_yarn` opts Flash-Next into static YaRN, required for (and only
   /// accepted with) a `max_context` above its native context.
+  ///
+  /// Nonempty session_classes replace max_context and session_count: one
+  /// loaded Qwen3.8-Flash-Next model serves each class under its own name,
+  /// with sessions of its own context. Other models refuse them.
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
@@ -84,7 +88,8 @@ public:
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
-            bool enable_yarn = false);
+            bool enable_yarn = false,
+            std::vector<TextSessionClass> session_classes = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -108,7 +113,8 @@ public:
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
   /// request-owned sessions, the model's tokenizer, and host-memory
-  /// continuation snapshots.
+  /// continuation snapshots. Nonempty session_classes replace max_context
+  /// and session_count; their contexts must fit the loaded model's.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
             std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,
@@ -116,10 +122,12 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            std::vector<TextSessionClass> session_classes = {});
 #endif
 
-  /// Stable model identifier used in API responses.
+  /// Stable model identifier used in API responses; with session classes,
+  /// the first class's name.
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
@@ -128,6 +136,7 @@ public:
   [[nodiscard]] std::string build_info() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   [[nodiscard]] std::uint32_t max_context() const override;
+  [[nodiscard]] std::vector<ServedModel> served_models() const override;
   [[nodiscard]] std::vector<SessionState> session_states() const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
@@ -148,7 +157,8 @@ public:
                   const TokenCallback& on_token = {},
                   std::string_view client_id = "anonymous",
                   const std::vector<std::string>& stop_sequences = {},
-                  bool cache_prompt = true) override;
+                  bool cache_prompt = true,
+                  std::string_view model = {}) override;
 
   /// Framed chat conversation; returns the assistant reply.
   Result chat(const ChatRequest& request, std::size_t max_tokens,
@@ -168,7 +178,8 @@ public:
       const CancellationCheck& is_cancelled = {}, bool stream_output = false,
       bool ignore_eos = false, std::string_view client_id = "anonymous",
       const std::vector<std::string>& stop_sequences = {},
-      bool return_progress = false, bool cache_prompt = true) override;
+      bool return_progress = false, bool cache_prompt = true,
+      std::string_view model = {}) override;
 
   Result chat(const std::vector<tokenization::ChatMessage>& messages,
               std::size_t max_tokens, const sampling::SamplingConfig& sampling,

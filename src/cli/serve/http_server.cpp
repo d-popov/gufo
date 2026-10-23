@@ -668,21 +668,27 @@ struct CompatibilityAllowances {
 };
 
 // Validate the text subset before dispatch so a client never gets an answer
-// to a different request. Responses also supports streamed output.
+// to a different request. Responses also supports streamed output. A request
+// without `model` runs on the first served model; `served_model` names it.
 std::optional<HttpResponse> ReadCompatibilityOptions(
     const json::Value& body, TextGenerationBackend& backend,
-    std::string_view token_field, std::size_t* max_tokens,
-    sampling::SamplingConfig* sampling_config, std::optional<bool> thinking,
+    std::string* served_model, std::string_view token_field,
+    std::size_t* max_tokens, sampling::SamplingConfig* sampling_config,
+    std::optional<bool> thinking,
     const CompatibilityAllowances& allowances = {}) {
   if (!body.is_object())
     return InvalidCompatibilityRequest("request body must be an object");
+  std::optional<std::string> requested;
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (model->str() != backend.model_id())
-      return Err(404, "Not Found", "requested model is not loaded",
-                 "invalid_request_error", "model_not_found");
+    requested = model->str();
   }
+  const auto served = ResolveServedModel(backend, requested);
+  if (!served)
+    return Err(404, "Not Found", "requested model is not loaded",
+               "invalid_request_error", "model_not_found");
+  *served_model = served->id;
   for (const std::string field : {"stream", "echo", "store", "background"}) {
     const auto* value = body.find(field);
     if (value == nullptr)
@@ -779,22 +785,25 @@ HttpResponse ListModels(TextGenerationBackend* backend,
   resp["object"] = "list";
   json::Value data = json::Value::array();
   if (backend != nullptr) {
-    json::Value model = json::Value::object();
-    model["id"] = backend->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "gufo";
-    if (backend->max_context() > 0)
-      model["context_length"] =
-          static_cast<std::size_t>(backend->max_context());
-    json::Value input_modalities = json::Value::array();
-    input_modalities.push_back("text");
-    if (backend->supports_images())
-      input_modalities.push_back("image");
-    json::Value architecture = json::Value::object();
-    architecture["input_modalities"] = std::move(input_modalities);
-    model["architecture"] = std::move(architecture);
-    data.push_back(std::move(model));
+    // One entry per served model, each with its own request context.
+    for (const auto& served : backend->served_models()) {
+      json::Value model = json::Value::object();
+      model["id"] = served.id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "gufo";
+      if (served.context_length > 0)
+        model["context_length"] =
+            static_cast<std::size_t>(served.context_length);
+      json::Value input_modalities = json::Value::array();
+      input_modalities.push_back("text");
+      if (backend->supports_images())
+        input_modalities.push_back("image");
+      json::Value architecture = json::Value::object();
+      architecture["input_modalities"] = std::move(input_modalities);
+      model["architecture"] = std::move(architecture);
+      data.push_back(std::move(model));
+    }
   }
   if (video_jobs != nullptr && video_jobs->ready()) {
     json::Value root_model = json::Value::object();
@@ -869,8 +878,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
 
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
-  if (auto error = ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
-                                            &sampling_config,
+  std::string model;
+  if (auto error = ReadCompatibilityOptions(body, b, &model, "max_tokens",
+                                            &max_tokens, &sampling_config,
                                             b.reasoning_defaults().enabled,
                                             {
                                                 .stop_field = "stop",
@@ -931,10 +941,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
 
   auto generation = b.start_complete(
       prompt, max_tokens, sampling_config, req.is_cancelled, stream, ignore_eos,
-      req.client_id, stop_sequences, return_progress, cache_prompt);
+      req.client_id, stop_sequences, return_progress, cache_prompt, model);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
-  const std::string model = b.model_id();
   if (stream) {
     auto stream_log = std::make_shared<HttpResponse::StreamLog>();
     return {
@@ -1110,7 +1119,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
   if (auto error = ReadCompatibilityOptions(
-          body, b, "max_output_tokens", &max_tokens, &sampling_config,
+          body, b, &chat.model, "max_output_tokens", &max_tokens,
+          &sampling_config,
           chat.reasoning.enabled,
           {.stream = true, .response_controls = true})) {
     return std::move(*error);
@@ -1228,7 +1238,8 @@ std::optional<HttpResponse> ReadAnthropicChat(
       return error;
   }
   if (auto error =
-          ReadCompatibilityOptions(body, b, "max_tokens", max_tokens,
+          ReadCompatibilityOptions(body, b, &chat->model, "max_tokens",
+                                   max_tokens,
                                    sampling_config, chat->reasoning.enabled,
                                    {.stop_field = "stop_sequences",
                                     .stream = true,
@@ -1338,8 +1349,9 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
 
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
+  std::string model;
   if (auto error = ReadCompatibilityOptions(
-          body, b, "n_predict", &max_tokens, &sampling_config,
+          body, b, &model, "n_predict", &max_tokens, &sampling_config,
           b.reasoning_defaults().enabled, {.stop_field = "stop"})) {
     return std::move(*error);
   }
@@ -1363,7 +1375,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
 
   const auto res =
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt);
+                 req.client_id, stop_sequences, cache_prompt, model);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -1432,7 +1444,13 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   params["max_tokens"] = n_predict;
   params["n_predict"] = n_predict;
   json::Value generation = json::Value::object();
-  if (const std::size_t context = b.max_context(); context > 0) {
+  // A served model named by `?model=` reports its own context.
+  const auto served = requested.empty()
+                          ? std::nullopt
+                          : ResolveServedModel(b, std::string_view(requested));
+  if (const std::size_t context =
+          served ? served->context_length : b.max_context();
+      context > 0) {
     generation["n_ctx"] = context;
   }
   generation["params"] = std::move(params);
@@ -1469,7 +1487,8 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
     next_token["n_decoded"] = session.generated_tokens;
     json::Value slot = json::Value::object();
     slot["id"] = index;
-    slot["n_ctx"] = context;
+    // Sessions of a class report its model and context.
+    slot["n_ctx"] = session.context > 0 ? std::size_t{session.context} : context;
     slot["speculative"] = session.speculative;
     slot["is_processing"] = session.processing;
     slot["id_task"] = task;
@@ -1481,22 +1500,25 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
     slot["prompt"] = "";
     slot["next_token"] = json::Value::array();
     slot["next_token"].push_back(std::move(next_token));
-    slot["model"] = model;
+    slot["model"] = session.model.empty() ? model : session.model;
     resp.push_back(std::move(slot));
   }
   return Ok(resp);
 }
 
-/// Context held by in-flight requests across all sessions.
+/// Context held by in-flight requests across all sessions, over the sum of
+/// their capacities.
 double KvCacheUsageRatio(const TextGenerationBackend& b) {
   const auto sessions = b.session_states();
-  const std::size_t capacity = sessions.size() * b.max_context();
-  if (capacity == 0) {
-    return 0.0;
-  }
+  const std::size_t fallback = b.max_context();
+  std::size_t capacity = 0;
   std::size_t used = 0;
   for (const auto& session : sessions) {
+    capacity += session.context > 0 ? session.context : fallback;
     used += session.prompt_tokens + session.generated_tokens;
+  }
+  if (capacity == 0) {
+    return 0.0;
   }
   return static_cast<double>(used) / static_cast<double>(capacity);
 }

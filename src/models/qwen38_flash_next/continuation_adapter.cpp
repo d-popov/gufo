@@ -393,11 +393,15 @@ void ContinuationAdapter::BeginRestore(
     ordered.push_back(*std::ranges::find(positions, descriptor.id,
                                          &cache::ComponentPosition::id));
   }
+  // Refuse before any transfer a snapshot deeper than the destination
+  // session can hold.
+  const auto capacity = state.session->ContextSize();
   const auto frontier = [&](ContinuationPart part) -> std::uint32_t {
     for (std::size_t i = 0; i < ordered.size(); ++i)
       if (layout_.Components()[i].part == part) {
-        if (ordered[i].valid_rows > context_)
-          throw std::invalid_argument("Flash-Next frontier exceeds context");
+        if (ordered[i].valid_rows > capacity)
+          throw std::invalid_argument(
+              "Flash-Next frontier exceeds the session context");
         return static_cast<std::uint32_t>(ordered[i].valid_rows);
       }
     return 0;

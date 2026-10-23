@@ -84,6 +84,7 @@ public:
     std::string client_id;
     std::vector<std::string> stop_sequences;
     std::string trace_request;
+    std::string model;
   };
   Call LastCall() {
     const std::lock_guard lock(mutex_);
@@ -99,6 +100,11 @@ public:
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
   std::uint32_t max_context() const override { return 65536; }
+  // Session classes; empty serves model_id() alone.
+  std::vector<ServedModel> served;
+  std::vector<ServedModel> served_models() const override {
+    return served.empty() ? TextGenerationBackend::served_models() : served;
+  }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;
   std::string model_path() const override { return served_path; }
@@ -111,12 +117,12 @@ public:
       const CancellationCheck& cancellation, bool stream, bool ignore_eos,
       std::string_view client_id,
       const std::vector<std::string>& stop_sequences, bool return_progress,
-      bool cache_prompt) override {
+      bool cache_prompt, std::string_view model) override {
     last_ignore_eos = ignore_eos;
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_complete(
             prompt, max_tokens, sampling, cancellation, stream, false,
-            client_id, stop_sequences, return_progress, cache_prompt),
+            client_id, stop_sequences, return_progress, cache_prompt, model),
         progress, admit.load());
   }
   std::shared_ptr<GenerationRequest> start_chat(
@@ -155,9 +161,15 @@ public:
                   const CancellationCheck& cancel, const TokenCallback& token,
                   std::string_view client_id = "anonymous",
                   const std::vector<std::string>& stop_sequences = {},
-                  bool cache_prompt = true) override {
+                  bool cache_prompt = true,
+                  std::string_view model = {}) override {
     ++calls;
     last_cache_prompt = cache_prompt;
+    // Like the scheduler, each served model limits prompts to its context.
+    for (const auto& model_class : served)
+      if (model_class.id == model && prompt.size() >= model_class.context_length)
+        throw std::length_error("prompt exceeds the context of " +
+                                model_class.id);
     if (failure == 1)
       throw std::length_error("context exceeded");
     if (failure == 2)
@@ -193,7 +205,8 @@ public:
                .sampling = sampling,
                .client_id = std::string(client_id),
                .stop_sequences = stop_sequences,
-               .trace_request = gufo::server::Trace::CurrentRequest()};
+               .trace_request = gufo::server::Trace::CurrentRequest(),
+               .model = std::string(model)};
       result.text = output_;
     }
     result.prompt_tokens = 10;
@@ -2113,6 +2126,72 @@ void TestModelInputModalities() {
   }
 }
 
+// One backend serving two session classes: each name is listed with its own
+// context, selects its class, and is limited by that class's context.
+void TestSessionClassRouting() {
+  RunningServer server;
+  using gufo::json::parse;
+  const auto body = [](const std::string& response) {
+    return parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  server.backend->served = {{"main", 1000}, {"sub", 32}};
+  const auto listing = body(server.Send("GET /v1/models HTTP/1.1\r\n\r\n"));
+  const auto& models = listing.find("data")->items();
+  assert(models.size() == 2);
+  assert(models[0].member_str("id") == "main" &&
+         models[0].member_size("context_length") == 1000);
+  assert(models[1].member_str("id") == "sub" &&
+         models[1].member_size("context_length") == 32);
+
+  auto response = server.Post("/v1/completions",
+                              R"({"model":"sub","prompt":"hello"})");
+  ExpectStatus(response, 200);
+  assert(server.backend->LastCall().model == "sub");
+  assert(body(response).member_str("model") == "sub");
+  // A request without a model runs on the first class.
+  ExpectStatus(server.Post("/v1/completions", R"({"prompt":"hello"})"), 200);
+  assert(server.backend->LastCall().model == "main");
+
+  response = server.Post("/v1/completions",
+                         R"({"model":"test","prompt":"hello"})");
+  ExpectStatus(response, 404);
+  assert(response.find("model_not_found") != std::string::npos);
+
+  const std::string long_prompt(40, 'x');
+  response = server.Post(
+      "/v1/completions",
+      R"({"model":"sub","prompt":")" + long_prompt + R"("})");
+  ExpectStatus(response, 400);
+  assert(response.find("context_length_exceeded") != std::string::npos);
+  ExpectStatus(server.Post("/v1/completions", R"({"model":"main","prompt":")" +
+                                                  long_prompt + R"("})"),
+               200);
+
+  response = server.Post(
+      "/v1/chat/completions",
+      R"({"model":"sub","messages":[{"role":"user","content":"hi"}]})");
+  ExpectStatus(response, 200);
+  assert(server.backend->LastCall().chat.model == "sub");
+  assert(body(response).member_str("model") == "sub");
+  ExpectStatus(
+      server.Post("/v1/chat/completions",
+                  R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"),
+      404);
+
+  server.backend->sessions.resize(2);
+  server.backend->sessions[0].model = "main";
+  server.backend->sessions[0].context = 1000;
+  server.backend->sessions[1].model = "sub";
+  server.backend->sessions[1].context = 32;
+  const auto slots = body(server.Send("GET /slots HTTP/1.1\r\n\r\n"));
+  assert(slots.items()[0].member_str("model") == "main" &&
+         slots.items()[0].member_size("n_ctx") == 1000);
+  assert(slots.items()[1].member_str("model") == "sub" &&
+         slots.items()[1].member_size("n_ctx") == 32);
+  server.backend->sessions.clear();
+  server.backend->served.clear();
+}
+
 void TestRawCompletionStreaming() {
   RunningServer server;
   using gufo::json::parse;
@@ -3283,6 +3362,7 @@ int main() {
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestResponsesToolImages();
   TestModelInputModalities();
+  TestSessionClassRouting();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();
   TestDeviceLoss();

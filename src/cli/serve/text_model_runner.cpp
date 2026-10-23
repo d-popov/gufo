@@ -6,6 +6,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -225,10 +226,13 @@ std::optional<std::size_t> PerStateReservationBytes(
 }
 
 ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
-                               std::size_t state_count) {
+                               std::span<const TextSessionClass> classes) {
   if (runner == nullptr) {
     throw std::invalid_argument("text model runner must not be null");
   }
+  std::size_t state_count = 0;
+  for (const auto& session_class : classes)
+    state_count += session_class.count;
   if (state_count == 0) {
     throw std::invalid_argument("text runner state count must be at least one");
   }
@@ -262,16 +266,53 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
           "text runner persistence payload version must be nonzero");
     }
   }
+  const bool named = !classes.front().name.empty();
+  if (named) {
+    if (!runner->UsesComponentCache())
+      throw std::invalid_argument(
+          "session classes require a component-cache text runner");
+    for (std::size_t i = 0; i < classes.size(); ++i) {
+      const auto& session_class = classes[i];
+      if (session_class.name.empty() || session_class.count == 0 ||
+          session_class.max_context == 0 ||
+          session_class.max_context > descriptor.max_context)
+        throw std::invalid_argument(
+            "session class '" + session_class.name +
+            "' needs a name, at least one session and a context within the "
+            "runner's " +
+            std::to_string(descriptor.max_context) + " tokens");
+      for (std::size_t previous = 0; previous < i; ++previous)
+        if (classes[previous].name == session_class.name)
+          throw std::invalid_argument("session class '" + session_class.name +
+                                      "' is defined twice");
+    }
+  }
 
   auto resources = runner->ResourceClaim();
   const auto per_state_reservation = PerStateReservationBytes(resources);
   if (resources.state_capacity_bytes.has_value() &&
       per_state_reservation.has_value()) {
-    const std::size_t per_request = *per_state_reservation;
     const std::size_t capacity = *resources.state_capacity_bytes;
-    if (per_request != 0 && state_count > capacity / per_request) {
-      throw std::invalid_argument(
-          "text runner request-state claim exceeds state capacity");
+    if (named) {
+      // Sessions take the bytes of their own class's context.
+      std::size_t claimed = 0;
+      for (const auto& session_class : classes) {
+        auto claim = resources;
+        claim.per_request_state_bytes =
+            runner->SessionStateBytes(session_class.max_context);
+        const auto per_request = PerStateReservationBytes(claim).value_or(0);
+        if (per_request != 0 &&
+            (session_class.count > (capacity - claimed) / per_request))
+          throw std::invalid_argument(
+              "text runner request-state claim exceeds state capacity");
+        claimed += session_class.count * per_request;
+      }
+    } else {
+      const std::size_t per_request = *per_state_reservation;
+      if (per_request != 0 && state_count > capacity / per_request) {
+        throw std::invalid_argument(
+            "text runner request-state claim exceeds state capacity");
+      }
     }
   }
 
@@ -621,6 +662,10 @@ std::unique_ptr<TextRunnerState> TextModelRunner::BindComponentState(
     cache::Adapter&, cache::Slot&) const {
   throw std::logic_error("text runner has no component execution facade");
 }
+std::unique_ptr<cache::Adapter> TextModelRunner::CreateSessionClassAdapter(
+    std::uint32_t) const {
+  throw std::invalid_argument("text runner does not support session classes");
+}
 void TextModelRunner::ReconcileComponentState(TextRunnerState&,
                                               std::size_t) const {
   throw std::logic_error("text runner has no component position binding");
@@ -628,10 +673,18 @@ void TextModelRunner::ReconcileComponentState(TextRunnerState&,
 
 struct TextRunnerPool::Impl {
   static constexpr std::size_t kIntermediateCheckpoints = 4;
-  Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count,
+  Impl(std::shared_ptr<TextModelRunner> model_runner,
+       std::vector<TextSessionClass> session_classes,
        std::optional<TextRunnerDiskCacheOptions> disk_cache_options,
        TextRunnerRamCacheOptions ram_cache_options)
-      : validated(ValidateRunner(std::move(model_runner), state_count)) {
+      : validated(ValidateRunner(std::move(model_runner), session_classes)),
+        classes(std::move(session_classes)) {
+    const bool named = !classes.front().name.empty();
+    if (!named)
+      classes.front().max_context = validated.descriptor.max_context;
+    const std::size_t state_count = std::accumulate(
+        classes.begin(), classes.end(), std::size_t{0},
+        [](std::size_t sum, const auto& c) { return sum + c.count; });
     if (validated.runner->UsesComponentCache()) {
       const auto resources = validated.runner->ResourceClaim();
       const auto automatic =
@@ -648,9 +701,15 @@ struct TextRunnerPool::Impl {
       // allocate under the ceiling; what they pin is charged on top of this.
       // The state claim includes lazy image/rollback storage, not startup
       // usage.
-      component_cache = std::make_unique<ComponentTextCache>(
-          validated.runner, state_count, std::min(requested, ceiling),
-          disk_cache_options, !ram_cache_options.capacity_bytes, ceiling);
+      component_cache =
+          named ? std::make_unique<ComponentTextCache>(
+                      validated.runner, classes, std::min(requested, ceiling),
+                      disk_cache_options, !ram_cache_options.capacity_bytes,
+                      ceiling)
+                : std::make_unique<ComponentTextCache>(
+                      validated.runner, state_count,
+                      std::min(requested, ceiling), disk_cache_options,
+                      !ram_cache_options.capacity_bytes, ceiling);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
@@ -709,6 +768,7 @@ struct TextRunnerPool::Impl {
   }
 
   ValidatedRunner validated;
+  std::vector<TextSessionClass> classes;
   std::unique_ptr<ContinuationCache> cache;
   std::unique_ptr<ComponentTextCache> component_cache;
   // Publish a live checkpoint before another admission can fall back to the
@@ -1848,8 +1908,24 @@ TextRunnerPool::TextRunnerPool(
     std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
     std::optional<TextRunnerDiskCacheOptions> disk_cache,
     TextRunnerRamCacheOptions ram_cache)
-    : impl_(std::make_unique<Impl>(std::move(runner), state_count,
-                                   std::move(disk_cache), ram_cache)) {}
+    : impl_(std::make_unique<Impl>(
+          std::move(runner),
+          std::vector<TextSessionClass>{{.name = {}, .count = state_count}},
+          std::move(disk_cache), ram_cache)) {}
+
+TextRunnerPool::TextRunnerPool(
+    std::shared_ptr<TextModelRunner> runner,
+    std::vector<TextSessionClass> classes,
+    std::optional<TextRunnerDiskCacheOptions> disk_cache,
+    TextRunnerRamCacheOptions ram_cache)
+    : impl_(std::make_unique<Impl>(
+          std::move(runner),
+          [&] {
+            if (classes.empty() || classes.front().name.empty())
+              throw std::invalid_argument("session classes must be named");
+            return std::move(classes);
+          }(),
+          std::move(disk_cache), ram_cache)) {}
 
 TextRunnerPool::~TextRunnerPool() = default;
 
@@ -1860,6 +1936,10 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->component_cache ? impl_->component_cache->capacity()
                                 : impl_->cache->capacity();
+}
+
+const std::vector<TextSessionClass>& TextRunnerPool::classes() const noexcept {
+  return impl_->classes;
 }
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(
@@ -2036,12 +2116,17 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos) {
+    std::size_t cache_prefix_tokens, bool stop_at_eos,
+    std::size_t session_class) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
   }
-  if (prompt.size() > impl_->validated.descriptor.max_context) {
+  if (session_class >= impl_->classes.size())
+    throw std::invalid_argument("unknown text runner session class");
+  // Sessions of a class hold at most its own context, which the
+  // unnamed class takes from the runner.
+  if (prompt.size() > impl_->classes[session_class].max_context) {
     throw std::length_error("text runner prompt exceeds model context");
   }
   if (cache_prefix_tokens > prompt.size())
@@ -2056,7 +2141,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   if (impl_->component_cache) {
     auto lease = impl_->component_cache->Acquire(
         prompt, is_cancelled, context, reuse_prompt, cache_prefix_tokens,
-        stop_at_eos);
+        stop_at_eos, session_class);
     if (!lease)
       return {};
     Request request(std::make_unique<Request::Impl>(
@@ -2066,7 +2151,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     request.impl_->cancelled = is_cancelled;
     if (reuse_prompt) {
       const auto common = impl_->component_cache->CachedPrefixTokens(
-          request.prompt(), request.impl_->context.get(), true);
+          request.prompt(), request.impl_->context.get(), true, session_class);
       if (common >=
               request.prefill_position() + Request::kSharedPrefixMinTokens &&
           (common + Request::kSharedCheckpointSlack < request.prompt_tokens() ||
@@ -2235,17 +2320,19 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
 
 std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
     std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
-    std::uint64_t checkpoint_id) const {
-  return impl_->component_cache ? impl_->component_cache->PendingPublication(
-                                      prompt, context, checkpoint_id)
-                                : std::nullopt;
+    std::uint64_t checkpoint_id, std::size_t session_class) const {
+  return impl_->component_cache
+             ? impl_->component_cache->PendingPublication(
+                   prompt, context, checkpoint_id, session_class)
+             : std::nullopt;
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(
-    std::span<const TextRunnerToken> prompt,
-    const TextPromptContext* context) const {
+    std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+    std::size_t session_class) const {
   if (impl_->component_cache)
-    return impl_->component_cache->CachedPrefixTokens(prompt, context);
+    return impl_->component_cache->CachedPrefixTokens(prompt, context, false,
+                                                      session_class);
   if (context == nullptr)
     return impl_->cache->CachedPrefixTokens(prompt);
   return impl_->cache->CachedPrefixTokens(prompt, context->cache_identity,

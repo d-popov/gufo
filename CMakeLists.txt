@@ -548,7 +548,8 @@ if (BUILD_TESTING)
     src/cli/serve/component_text_cache.cpp
     src/cli/serve/continuation_cache.cpp
     src/cli/serve/continuation_disk_store.cpp
-    src/cli/serve/text_model_runner.cpp)
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/text_generation_scheduler.cpp)
   target_link_libraries(component_text_cache_test PRIVATE gufo_cache_fake gufo_core gufo_logging)
   add_test(NAME component_text_cache_test COMMAND component_text_cache_test)
   set_tests_properties(component_text_cache_test PROPERTIES LABELS "cpu;server;cache;state;lifecycle")

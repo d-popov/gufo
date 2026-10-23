@@ -10,6 +10,7 @@
 #include <exception>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -82,6 +83,8 @@ struct SessionTable {
 struct ScheduledRequest {
   std::uint64_t id{0};
   std::string client_id{"anonymous"};
+  // Index into the pool's session classes; admission uses only its slots.
+  std::size_t session_class{0};
   std::vector<TextRunnerToken> prompt;
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
@@ -519,6 +522,11 @@ struct TextGenerationScheduler::Impl {
           "text generation scheduler runner pool must not be null");
     }
     sessions = std::make_shared<SessionTable>(runner_pool->capacity());
+    // `/slots` lists each class's sessions together, in class order.
+    for (std::size_t first = 0; const auto& c : runner_pool->classes()) {
+      class_first.push_back(first);
+      first += c.count;
+    }
     if (prefill_policy.decode_active_tokens == 0) {
       throw std::invalid_argument(
           "active-decode prefill budget must be at least one token");
@@ -669,35 +677,83 @@ struct TextGenerationScheduler::Impl {
     queued_count = count;
   }
 
-  [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued() {
+  [[nodiscard]] std::size_t ClassCapacity(std::size_t session_class) const {
+    return runner_pool->classes()[session_class].count;
+  }
+
+  /// Sessions each class holds or reserves across the given request lists.
+  /// Reuses one scheduler-thread buffer; valid until the next call.
+  [[nodiscard]] std::span<std::size_t> Occupancy(
+      std::initializer_list<const std::deque<std::shared_ptr<ScheduledRequest>>*>
+          lists) {
+    held_sessions.assign(runner_pool->classes().size(), 0);
+    for (const auto* list : lists)
+      for (const auto& request : *list)
+        ++held_sessions[request->session_class];
+    return held_sessions;
+  }
+
+  /// Whether a queued request's class has a free session. Requires
+  /// queue_mutex.
+  [[nodiscard]] bool AdmissibleQueuedLocked(
+      std::span<const std::size_t> held) const {
+    for (const auto& client : queued_clients)
+      for (const auto& request : client.requests)
+        if (held[request->session_class] < ClassCapacity(request->session_class))
+          return true;
+    return false;
+  }
+
+  /// Takes the next request whose class has a session free beyond `held`.
+  /// Clients keep their round-robin order; each yields its oldest request of
+  /// such a class, so a full class holds back neither other classes nor the
+  /// same client's requests for them.
+  [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued(
+      std::span<const std::size_t> held) {
     const std::lock_guard<std::mutex> lock(queue_mutex);
-    if (queued_clients.empty()) {
-      return {};
-    }
-    auto client = std::move(queued_clients.front());
-    queued_clients.pop_front();
-    auto request = std::move(client.requests.front());
-    client.requests.pop_front();
-    // Admission reserves a session before potentially slow cache preparation.
-    // Publish the transfer before removing it from the deferred count. Admit
-    // holds fewer than capacity requests here, so a session is always free.
-    {
-      const std::lock_guard<std::mutex> sessions_lock(sessions->mutex);
-      const auto free = std::find(sessions->requests.begin(),
-                                  sessions->requests.end(), nullptr);
-      if (free != sessions->requests.end()) {
-        request->session =
-            static_cast<std::size_t>(free - sessions->requests.begin());
-        *free = request;
+    for (auto client = queued_clients.begin(); client != queued_clients.end();
+         ++client) {
+      const auto queued =
+          std::ranges::find_if(client->requests, [&](const auto& request) {
+            return held[request->session_class] <
+                   ClassCapacity(request->session_class);
+          });
+      if (queued == client->requests.end())
+        continue;
+      auto request = std::move(*queued);
+      client->requests.erase(queued);
+      // Admission reserves a session of the request's class before
+      // potentially slow cache preparation. Publish the transfer before
+      // removing it from the deferred count. The class holds fewer than its
+      // count of requests here, so one of its sessions is always free.
+      {
+        const std::lock_guard<std::mutex> sessions_lock(sessions->mutex);
+        const auto first = sessions->requests.begin() +
+                           static_cast<std::ptrdiff_t>(
+                               class_first[request->session_class]);
+        const auto free = std::find(
+            first,
+            first + static_cast<std::ptrdiff_t>(
+                        ClassCapacity(request->session_class)),
+            nullptr);
+        if (free != first + static_cast<std::ptrdiff_t>(
+                                ClassCapacity(request->session_class))) {
+          request->session =
+              static_cast<std::size_t>(free - sessions->requests.begin());
+          *free = request;
+        }
       }
+      request->counted_processing = true;
+      detail::RequestsProcessing().fetch_add(1, std::memory_order_relaxed);
+      SetQueuedCountLocked(queued_count - 1);
+      auto served = std::move(*client);
+      queued_clients.erase(client);
+      if (!served.requests.empty()) {
+        queued_clients.push_back(std::move(served));
+      }
+      return request;
     }
-    request->counted_processing = true;
-    detail::RequestsProcessing().fetch_add(1, std::memory_order_relaxed);
-    SetQueuedCountLocked(queued_count - 1);
-    if (!client.requests.empty()) {
-      queued_clients.push_back(std::move(client));
-    }
-    return request;
+    return {};
   }
 
   [[nodiscard]] bool RemoveQueued(
@@ -724,6 +780,12 @@ struct TextGenerationScheduler::Impl {
   SessionSnapshot() const {
     std::vector<TextGenerationBackend::SessionState> states(
         runner_pool->capacity());
+    const auto& classes = runner_pool->classes();
+    for (std::size_t c = 0; c < classes.size(); ++c)
+      for (std::size_t i = 0; i < classes[c].count; ++i) {
+        states[class_first[c] + i].model = classes[c].name;
+        states[class_first[c] + i].context = classes[c].max_context;
+      }
     const std::lock_guard<std::mutex> lock(sessions->mutex);
     for (std::size_t index = 0; index < states.size(); ++index) {
       auto& state = states[index];
@@ -1003,10 +1065,11 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
-  /// Parks a cold request behind a resident one that is still prefilling the
-  /// longest prefix both prompts share. That request publishes a checkpoint
-  /// there, so this one restores it instead of prefilling the same tokens in
-  /// lockstep. Prefill runs one request at a time, so waiting costs nothing.
+  /// Parks a cold request behind a resident one of its class that is still
+  /// prefilling the longest prefix both prompts share. That request publishes
+  /// a checkpoint there, so this one restores it instead of prefilling the
+  /// same tokens in lockstep. Prefill runs one request at a time, so waiting
+  /// costs nothing. `waiting` counts parked requests of the same class.
   [[nodiscard]] bool WaitForSharedPrefix(
       const std::shared_ptr<ScheduledRequest>& request,
       std::span<const std::deque<std::shared_ptr<ScheduledRequest>>* const>
@@ -1016,14 +1079,17 @@ struct TextGenerationScheduler::Impl {
         !request->cache_prompt ||
         // Parked requests hold no runner lease; bound their reservations like
         // admitted ones.
-        waiting + 1 >= runner_pool->capacity())
+        waiting + 1 >= ClassCapacity(request->session_class))
       return false;
     std::shared_ptr<ScheduledRequest> leader;
     std::size_t common = 0;
     const std::span<const TextRunnerToken> prompt(request->prompt);
     for (const auto* list : residents) {
       for (const auto& resident : *list) {
+        // Checkpoints stay within their class, so only a peer of the same
+        // class can publish one this request restores.
         if (IsTerminal(resident) || !resident->runner_request ||
+            resident->session_class != request->session_class ||
             resident->runner_request.prefill_complete())
           continue;
         const auto other = resident->runner_request.prompt();
@@ -1047,8 +1113,8 @@ struct TextGenerationScheduler::Impl {
       return false;
     // A longer retained prefix, such as this conversation's previous turn,
     // already beats waiting for a peer.
-    const auto cached =
-        runner_pool->CachedPrefixTokens(prompt, request->prompt_context.get());
+    const auto cached = runner_pool->CachedPrefixTokens(
+        prompt, request->prompt_context.get(), request->session_class);
     // A leader may have leased a deeper native frontier than a sibling can
     // restore. Share its next planned checkpoint even for a short suffix:
     // replaying generated tokens through prefill can change recurrent state.
@@ -1087,7 +1153,8 @@ struct TextGenerationScheduler::Impl {
     return leader->runner_request.prefill_position() ==
                request->prefix_position &&
            runner_pool->CachedPrefixTokens(request->prompt,
-                                           request->prompt_context.get()) >=
+                                           request->prompt_context.get(),
+                                           request->session_class) >=
                request->prefix_position;
   }
 
@@ -1118,7 +1185,7 @@ struct TextGenerationScheduler::Impl {
       if (request->publication_waiting) {
         const auto pending = runner_pool->PendingPublication(
             request->prompt, request->prompt_context.get(),
-            request->publication.checkpoint_id);
+            request->publication.checkpoint_id, request->session_class);
         if (!pending) {
           // Published, failed or superseded: the matching job is no longer
           // pending. Its completion log carries this same checkpoint ID.
@@ -1150,12 +1217,17 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
-  [[nodiscard]] static std::shared_ptr<ScheduledRequest> PopReleased(
-      std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
+  /// The oldest settled parked request whose class has a session free
+  /// beyond `held`.
+  [[nodiscard]] std::shared_ptr<ScheduledRequest> PopReleased(
+      std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
+      std::span<const std::size_t> held) const {
     const auto released =
-        std::ranges::find_if(waiting, [](const auto& request) {
+        std::ranges::find_if(waiting, [&](const auto& request) {
           return request->prefix_leader == nullptr &&
-                 !request->publication_waiting;
+                 !request->publication_waiting &&
+                 held[request->session_class] <
+                     ClassCapacity(request->session_class);
         });
     if (released == waiting.end())
       return {};
@@ -1172,20 +1244,20 @@ struct TextGenerationScheduler::Impl {
     UpdateWaiting(waiting);
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 2>
         residents{&prefilling, &capturing};
-    // Captures retain their runner lease until decoding resumes.
+    // Captures retain their runner lease until decoding resumes. Each class
+    // admits into its own sessions only.
     while (!stop_token.stop_requested() &&
            prefilling.size() + decoding.size() + capturing.size() <
                runner_pool->capacity()) {
-      auto request = PopReleased(waiting);
+      auto held = Occupancy({&prefilling, &decoding, &capturing});
+      auto request = PopReleased(waiting, held);
       if (request == nullptr) {
-        // Parked followers already reserve a visible admission session. They
-        // may resume in place, but new arrivals must respect those
-        // reservations.
-        if (prefilling.size() + decoding.size() + capturing.size() +
-                waiting.size() >=
-            runner_pool->capacity())
-          return;
-        request = PopQueued();
+        // Parked followers already reserve a visible admission session of
+        // their class. They may resume in place, but new arrivals must
+        // respect those reservations.
+        for (const auto& parked : waiting)
+          ++held[parked->session_class];
+        request = PopQueued(held);
       }
       if (request == nullptr) {
         return;
@@ -1194,13 +1266,18 @@ struct TextGenerationScheduler::Impl {
         if (CompleteIfStopped(request)) {
           continue;
         }
-        if (WaitForSharedPrefix(request, residents, waiting.size())) {
+        if (WaitForSharedPrefix(
+                request, residents,
+                static_cast<std::size_t>(
+                    std::ranges::count(waiting, request->session_class,
+                                       &ScheduledRequest::session_class)))) {
           waiting.push_back(std::move(request));
           continue;
         }
         if (request->cache_prompt && !request->publication_wait_start) {
           if (const auto pending = runner_pool->PendingPublication(
-                  request->prompt, request->prompt_context.get())) {
+                  request->prompt, request->prompt_context.get(), 0,
+                  request->session_class)) {
             request->publication = *pending;
             if (const auto limit = publication_prefill.Limit(pending->Gain())) {
               request->publication_wait_limit = *limit;
@@ -1224,7 +1301,8 @@ struct TextGenerationScheduler::Impl {
                      DeadlineExceeded(request);
             },
             std::move(request->prompt_context), request->cache_prompt,
-            request->cache_prefix_tokens, request->stop_at_eos);
+            request->cache_prefix_tokens, request->stop_at_eos,
+            request->session_class);
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
@@ -1950,11 +2028,13 @@ struct TextGenerationScheduler::Impl {
       if (device_lost.load(std::memory_order_acquire))
         break;
       if (prefilling.empty() && decoding.empty()) {
+        // Only captures and parked requests hold sessions here. A queued
+        // request wakes the loop only when its class has one free.
+        const auto held = Occupancy({&capturing, &waiting});
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
-                 (queued_count != 0 &&
-                  capturing.size() + waiting.size() < runner_pool->capacity());
+                 (queued_count != 0 && AdmissibleQueuedLocked(held));
         };
         if (capturing.empty() && waiting.empty()) {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
@@ -2092,6 +2172,10 @@ struct TextGenerationScheduler::Impl {
   detail::PublicationWaitEstimate publication_prefill;
   std::shared_ptr<OutputBudget> output_budget;
   std::shared_ptr<SessionTable> sessions;
+  // First `/slots` session of each class; a class owns the next `count`.
+  std::vector<std::size_t> class_first;
+  // Scratch for Occupancy; only the scheduler thread uses it.
+  std::vector<std::size_t> held_sessions;
   bool incremental_prefill_supported{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
@@ -2324,12 +2408,25 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   if (prompt.empty()) {
     throw std::invalid_argument("text scheduler prompt must not be empty");
   }
-  const auto context = impl_->runner_pool->runner().Descriptor().max_context;
+  const auto& classes = impl_->runner_pool->classes();
+  if (metadata.session_class >= classes.size())
+    throw std::invalid_argument("text scheduler session class is unknown");
+  const auto& session_class = classes[metadata.session_class];
+  // A named class's sessions hold its own context; the unnamed class keeps
+  // the runner's.
+  const std::size_t context =
+      session_class.name.empty()
+          ? impl_->runner_pool->runner().Descriptor().max_context
+          : session_class.max_context;
   if (prompt.size() >= context) {
-    throw std::length_error("prompt has " + std::to_string(prompt.size()) +
-                            " tokens but the context is " +
-                            std::to_string(context) +
-                            "; increase --context or shorten the conversation");
+    throw std::length_error(
+        "prompt has " + std::to_string(prompt.size()) +
+        " tokens but the context is " + std::to_string(context) +
+        (session_class.name.empty()
+             ? "; increase --context or shorten the conversation"
+             : " for model '" + session_class.name +
+                   "'; use a model with a larger context or shorten the "
+                   "conversation"));
   }
   const std::size_t available = context - prompt.size();
   sampling.Validate();
@@ -2339,6 +2436,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
         "stop sequences require exact incremental token decoding");
 
   auto request = std::make_shared<ScheduledRequest>();
+  request->session_class = metadata.session_class;
   request->stop_filter = StopSequenceFilter(std::move(metadata.stop_sequences));
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->client_id =

@@ -16,6 +16,7 @@ class TextModelRunner;
 class TextRunnerState;
 class TextRunnerSnapshot;
 struct TextRunnerDiskCacheOptions;
+struct TextSessionClass;
 struct TextPromptContext;
 
 // Model-independent serving orchestration; the model supplies physical storage
@@ -105,21 +106,31 @@ public:
                      std::size_t ram_bytes,
                      const std::optional<TextRunnerDiskCacheOptions>&,
                      bool automatic_ram = false, std::size_t ceiling_bytes = 0);
+  // Named session classes, in slot order. Each class binds its slots to its
+  // own adapter and keeps every live frontier, checkpoint and disk
+  // publication under its own compatibility identity, so a class reuses
+  // only its own work.
+  ComponentTextCache(std::shared_ptr<TextModelRunner>,
+                     std::span<const TextSessionClass>, std::size_t ram_bytes,
+                     const std::optional<TextRunnerDiskCacheOptions>&,
+                     bool automatic_ram = false, std::size_t ceiling_bytes = 0);
   ~ComponentTextCache();
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,
       const ContinuationCache::CancellationCheck&,
-      std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool);
+      std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
+      std::size_t session_class = 0);
   // A disk job is writing a prefix of the prompt much deeper than any
   // restorable boundary; admission may wait for it instead of prefilling.
   // A nonzero checkpoint ID follows that one job, even if another deeper job
   // is submitted later. Its current gain may shrink as usable cache improves.
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
       std::span<const ContinuationToken> prompt,
-      const TextPromptContext* context, std::uint64_t checkpoint_id = 0) const;
+      const TextPromptContext* context, std::uint64_t checkpoint_id = 0,
+      std::size_t session_class = 0) const;
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const ContinuationToken>, const TextPromptContext*,
-      bool common = false) const;
+      bool common = false, std::size_t session_class = 0) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
