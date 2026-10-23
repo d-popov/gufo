@@ -99,6 +99,24 @@ body.login { display: flex; min-height: 100vh; align-items: center; justify-cont
 .login-box button { font: inherit; font-weight: 600; padding: 8px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
 .login-error { color: var(--bad); margin: 0; }
 
+.keys-note { font-size: 0.8rem; margin: 6px 0 0; }
+.inline-form, .key-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-top: 14px; }
+.key-form { flex-direction: column; align-items: stretch; max-width: 420px; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.key-form h3 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+.key-form fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; margin: 0; }
+.key-form fieldset label { display: block; }
+.inline-form input, .key-form input:not([type=checkbox]), .key-form select {
+  font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text);
+}
+.inline-form button[type=submit], .key-form button[type=submit], .key-secret button:not(.link) {
+  font: inherit; font-weight: 600; padding: 6px 12px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer;
+}
+.form-actions { display: flex; gap: 14px; align-items: center; }
+button.link.danger { color: var(--bad); }
+.key-secret { margin-top: 14px; padding: 12px; border: 1px solid var(--busy); border-radius: 6px; max-width: 640px; }
+.key-secret p { margin: 0 0 8px; }
+.key-secret code { display: block; padding: 8px; margin-bottom: 8px; background: var(--panel); border-radius: 4px; word-break: break-all; user-select: all; }
+
 @media (max-width: 640px) {
   body { padding: 0 12px 16px; }
   .cards, .totals { grid-template-columns: 1fr; }

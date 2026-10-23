@@ -56,6 +56,63 @@
       <p id="requests-empty" class="muted">No completed requests yet.</p>
     </section>
 
+    <section id="keys-section" hidden>
+      <div class="section-head">
+        <h2>API keys</h2>
+        <span id="keys-reload" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="keys" class="data">
+          <thead>
+            <tr>
+              <th>Key</th><th>Access</th><th>Models</th>
+              <th class="num">Requests</th><th class="num">Prompt</th>
+              <th class="num">Cached</th><th class="num">Generated</th>
+              <th class="num">Errors</th><th>Last used</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted keys-note">Usage counts requests in the log since the monitor started.</p>
+      <p id="keys-error" class="bad" hidden></p>
+
+      <form id="admin-unlock" class="inline-form">
+        <label for="admin-token">Admin token</label>
+        <input id="admin-token" type="password" autocomplete="off" required>
+        <button type="submit">Unlock key management</button>
+      </form>
+
+      <div id="keys-admin" hidden>
+        <form id="key-form" class="key-form">
+          <h3 id="key-form-title">New key</h3>
+          <label for="key-name">Name</label>
+          <input id="key-name" required pattern="[A-Za-z0-9._\-]{1,64}" maxlength="64">
+          <label for="key-access">Access</label>
+          <select id="key-access">
+            <option value="inference">Inference</option>
+            <option value="monitor">Monitoring only (health, models, props, slots, metrics)</option>
+          </select>
+          <fieldset id="key-models">
+            <legend>Models</legend>
+            <label><input type="checkbox" id="key-all-models" checked> All models</label>
+            <div id="key-model-list"></div>
+          </fieldset>
+          <div class="form-actions">
+            <button type="submit" id="key-submit">Create key</button>
+            <button type="button" id="key-cancel" class="link" hidden>Cancel</button>
+            <button type="button" id="admin-lock" class="link">Lock</button>
+          </div>
+        </form>
+        <div id="key-secret" class="key-secret" hidden>
+          <p>Token for <strong id="key-secret-name"></strong>. Copy it now: it is shown only once.</p>
+          <code id="key-secret-token"></code>
+          <button type="button" id="key-secret-copy">Copy</button>
+          <button type="button" id="key-secret-done" class="link">Done</button>
+        </div>
+      </div>
+    </section>
+
     <section>
       <h2>Totals</h2>
       <dl id="totals" class="totals"></dl>
