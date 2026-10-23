@@ -27,6 +27,10 @@ The supported model types are LLM, image, video, audio (TTS, ASR), and text embe
 - `servedModelName` — the name the server reports to clients (for example in
   `/v1/models`). In practice: what your client's "model" field should say.
   Purely cosmetic, it does not change which weights are loaded.
+- `sessionClass` — Qwen3.8-Flash-Next only: serve several model names from
+  one copy of the weights, each with its own session count and context
+  (`NAME=COUNTxCONTEXT`, repeatable). Replaces `servedModelName`, `context`
+  and `sessions`.
 
 **Size and memory**
 

@@ -310,6 +310,45 @@ bool SplitNameValue(std::string_view spec, std::string_view flag,
   return true;
 }
 
+// `--session-class NAME=COUNTxCONTEXT`: COUNT sessions of CONTEXT tokens,
+// served under model NAME. Names are unique across the invocation.
+bool AddSessionClass(std::string_view spec,
+                     std::vector<server::TextSessionClass>* classes,
+                     std::string* error) {
+  const auto invalid = [&] {
+    *error = "--session-class expects NAME=COUNTxCONTEXT with COUNT and "
+             "CONTEXT at least 1, e.g. main=1x262144; got '" +
+             std::string(spec) + "'";
+    return false;
+  };
+  std::string name;
+  std::string shape;
+  if (!SplitNameValue(spec, "--session-class", &name, &shape, error))
+    return invalid();
+  const auto separator = shape.find('x');
+  if (separator == std::string::npos)
+    return invalid();
+  std::size_t count = 0;
+  std::uint32_t context = 0;
+  const auto* count_end = shape.data() + separator;
+  const auto* context_end = shape.data() + shape.size();
+  const auto parsed_count = std::from_chars(shape.data(), count_end, count);
+  const auto parsed_context =
+      std::from_chars(count_end + 1, context_end, context);
+  if (parsed_count.ec != std::errc{} || parsed_count.ptr != count_end ||
+      parsed_context.ec != std::errc{} || parsed_context.ptr != context_end ||
+      count == 0 || context == 0)
+    return invalid();
+  if (std::ranges::any_of(*classes,
+                          [&](const auto& c) { return c.name == name; })) {
+    *error = "--session-class name '" + name + "' is given twice";
+    return false;
+  }
+  classes->push_back(
+      {.name = std::move(name), .count = count, .max_context = context});
+  return true;
+}
+
 std::optional<std::string> ReadTextFile(const std::filesystem::path& path) {
   std::ifstream file(path);
   if (!file) {
@@ -658,6 +697,13 @@ void PrintServeHelp(std::string_view program_name,
                    "Flash-Next: static YaRN, required for --context above the "
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
+    parser.AddCustomOption(
+        "", "--session-class", "NAME=COUNTxCONTEXT",
+        "Serve COUNT sessions of CONTEXT tokens as model NAME from the same "
+        "loaded weights (repeatable; replaces --sessions, --context and "
+        "--served-model-name; Qwen3.8-Flash-Next only)",
+        "Model",
+        [](std::string_view, std::string_view, std::string*) { return true; });
 
     // Sampling Defaults
     parser.AddOption(
@@ -1261,6 +1307,17 @@ int RunServe(std::span<const char* const> args) {
                        "Flash-Next: static YaRN, required for --context above "
                        "the native 262144; it applies to every request",
                        "Model", &enable_yarn);
+    std::vector<server::TextSessionClass> session_classes;
+    llm_parser.AddCustomOption(
+        "", "--session-class", "NAME=COUNTxCONTEXT",
+        "Serve COUNT sessions of CONTEXT tokens as model NAME from the same "
+        "loaded weights (repeatable; replaces --sessions, --context and "
+        "--served-model-name; Qwen3.8-Flash-Next only)",
+        "Model",
+        [&session_classes](std::string_view, std::string_view value,
+                           std::string* err) {
+          return AddSessionClass(value, &session_classes, err);
+        });
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1381,6 +1438,17 @@ int RunServe(std::span<const char* const> args) {
     }
     if (!llm_parser.WasSupplied("--max-pending-per-client")) {
       max_pending_requests_per_client = max_pending_requests;
+    }
+    if (!session_classes.empty()) {
+      for (const std::string_view replaced :
+           {"--sessions", "--context", "--served-model-name"}) {
+        if (llm_parser.WasSupplied(replaced)) {
+          std::cerr << "Error: --session-class sets each class's sessions, "
+                       "context and model name, so it cannot combine with "
+                    << replaced << "\n";
+          return 2;
+        }
+      }
     }
     if (!prepare_server_options()) {
       return 2;
@@ -1529,7 +1597,7 @@ int RunServe(std::span<const char* const> args) {
         },
         vision_model_path,
         server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes},
-        enable_yarn);
+        enable_yarn, session_classes);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
@@ -1577,12 +1645,33 @@ int RunServe(std::span<const char* const> args) {
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? "mtp"
             : "off";
-    load_log.Complete(
-        "model=" + backend->model_id() +
-        " sessions=" + std::to_string(session_count) + " context_tokens=" +
-        std::to_string(backend->max_context()) + " speculative=" + speculation +
-        " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+    if (session_classes.empty()) {
+      load_log.Complete(
+          "model=" + backend->model_id() +
+          " sessions=" + std::to_string(session_count) + " context_tokens=" +
+          std::to_string(backend->max_context()) + " speculative=" +
+          speculation + " draft_limit=" +
+          std::to_string(speculative_config.max_draft_tokens) +
+          " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+    } else {
+      // Each class by name, and the sessions and context all of them hold.
+      std::string classes;
+      std::size_t sessions = 0;
+      std::size_t context_tokens = 0;
+      for (const auto& c : session_classes) {
+        classes += (classes.empty() ? "" : ",") + c.name + ':' +
+                   std::to_string(c.count) + 'x' +
+                   std::to_string(c.max_context);
+        sessions += c.count;
+        context_tokens += c.count * c.max_context;
+      }
+      load_log.Complete(
+          "classes=" + classes + " sessions=" + std::to_string(sessions) +
+          " context_tokens=" + std::to_string(context_tokens) +
+          " speculative=" + speculation + " draft_limit=" +
+          std::to_string(speculative_config.max_draft_tokens) +
+          " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+    }
   }
 
   // run() joins every request thread, so no hook call outlives it.

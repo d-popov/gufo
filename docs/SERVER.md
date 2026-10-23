@@ -89,6 +89,42 @@ context; exhaustion reports `length` or `incomplete`, without discarding earlier
 conversation tokens. Reduce `--context` or `--sessions` if their state exceeds
 available memory.
 
+#### Session classes
+
+Qwen3.8-Flash-Next can serve several model names from one loaded copy of the
+weights, each backed by its own group of sessions:
+
+```bash
+gufo serve llm --model models/flash-next.gguf \
+  --speculative mtp --mtp-model models/mtp-flash-next.gguf \
+  --session-class qwen3.8-flash-next=1x262144 \
+  --session-class qwen3.8-flash-next-sub=4x65536
+```
+
+`--session-class NAME=COUNTxCONTEXT` is repeatable and replaces `--sessions`,
+`--context` and `--served-model-name`, which it cannot be combined with.
+Names must be unique; COUNT and CONTEXT must be at least 1, and CONTEXT may
+not exceed the model's native context. The model and its shared scratch are
+loaded for the largest class; each session allocates state for its own
+class's context only. Other model families refuse the option at startup.
+
+- The request `model` field selects the class by exact name; a request
+  without `model` uses the first class, and unknown names return
+  `404 model_not_found`. `/v1/models` lists every class with its own
+  `context_length`, and `/props?model=NAME` reports that class's `n_ctx`.
+- The class context limits the prompt (`400 context_length_exceeded`) and the
+  default generation budget.
+- A request waits only for a session of its own class. While one class is
+  busy, requests of other classes are admitted and decoded; within a class
+  the usual per-client round-robin order applies. Requests of different
+  classes may share a decode batch.
+- Live frontiers, RAM checkpoints and `--cache-disk` publications carry the
+  class name and context in their cache identity, so a class never restores
+  another class's state, including after a restart. Renaming a class or
+  changing its context starts its disk cache afresh.
+- `/slots` reports each session's class as `model` and its context as
+  `n_ctx`; the KV usage metric divides by the sum of all session contexts.
+
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit
