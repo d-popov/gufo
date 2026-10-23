@@ -89,6 +89,47 @@ context; exhaustion reports `length` or `incomplete`, without discarding earlier
 conversation tokens. Reduce `--context` or `--sessions` if their state exceeds
 available memory.
 
+#### Session classes
+
+Qwen3.8-Flash-Next can serve several model names from one loaded copy of the
+weights, each backed by its own group of sessions:
+
+```bash
+gufo serve llm --model models/flash-next.gguf \
+  --speculative mtp --mtp-model models/mtp-flash-next.gguf \
+  --session-class qwen3.8-flash-next=1x262144 \
+  --session-class qwen3.8-flash-next-sub=4x65536
+```
+
+`--session-class NAME=COUNTxCONTEXT` is repeatable and replaces `--sessions`,
+`--context` and `--served-model-name`, which it cannot be combined with.
+Names must be unique; COUNT and CONTEXT must be at least 1, and CONTEXT may
+not exceed the model's native context. The model and its shared scratch are
+loaded for the largest class; each session allocates state for its own
+class's context only. Other model families refuse the option at startup.
+
+- The request `model` field selects the class by exact name, and unknown
+  names return `404 model_not_found`. Chat Completions requires `model`
+  (`400 missing_model`, as without classes); the other text endpoints run a
+  request without `model` on the first class. `/v1/models` lists every class
+  with its own `context_length`, and `/props?model=NAME` reports that class's
+  `model_alias`, `total_slots` and `n_ctx`.
+- Each class's queue has its own `--max-pending` and
+  `--max-pending-per-client` limits, so a backlog in one class never refuses
+  requests for another.
+- The class context limits the prompt (`400 context_length_exceeded`) and the
+  default generation budget.
+- A request waits only for a session of its own class. While one class is
+  busy, requests of other classes are admitted and decoded; within a class
+  the usual per-client round-robin order applies. Requests of different
+  classes may share a decode batch.
+- Live frontiers, RAM checkpoints and `--cache-disk` publications carry the
+  class name and context in their cache identity, so a class never restores
+  another class's state, including after a restart. Renaming a class or
+  changing its context starts its disk cache afresh.
+- `/slots` reports each session's class as `model` and its context as
+  `n_ctx`; the KV usage metric divides by the sum of all session contexts.
+
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit
@@ -1217,12 +1258,15 @@ prompt-lookup copies (`gufo_spec_lookup_tokens_total`,
 even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
-over sessions times context; retained cache entries are not counted.
+over the sum of all session contexts (sessions times context without session
+classes); retained cache entries are not counted.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 
-`GET /slots` (alias `/v1/slots`) lists one llama-server slot per `--sessions`
-entry. A session is processing from admission, including cache preparation,
+`GET /slots` (alias `/v1/slots`) lists one llama-server slot per execution
+session (`--sessions`, or every session of every `--session-class`); with
+session classes, each slot's `model` and `n_ctx` are its class's name and
+context. A session is processing from admission, including cache preparation,
 until the request ends, so the processing slots match
 `llamacpp:requests_processing`; queued requests do not appear.
 `id_task` is the request id, or -1 when idle. `n_prompt_tokens` is the whole
@@ -1240,6 +1284,8 @@ llama-server tooling can record which model, build and settings answered it.
 name, `model_path` is `--model`, `build_info`
 the version and revision `gufo --version` prints, `total_slots` the
 `--sessions` count, `default_generation_settings.n_ctx` the per-session context
+(with session classes and `?model=NAME`: that class's name, session count
+and context; without `?model=`, all sessions and the first class's context)
 and `default_generation_settings.params` the sampling a request without
 sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
 limit is set. `modalities.vision` is true only when a vision encoder

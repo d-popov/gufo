@@ -152,6 +152,18 @@ struct TextRunnerDescriptor {
   std::optional<TextRunnerPersistenceDescriptor> persistence;
 };
 
+/// A group of identical execution sessions served under one model name.
+///
+/// A pool built from named classes leases a request only to a session of the
+/// class it names, and keeps every cached continuation within its class.
+struct TextSessionClass {
+  std::string name;
+  std::size_t count{0};
+  std::uint32_t max_context{0};
+
+  bool operator==(const TextSessionClass&) const = default;
+};
+
 /// Optional byte claims made before state allocation.
 ///
 /// A missing value is an explicit "not yet measurable" claim. When both the
@@ -391,6 +403,18 @@ public:
   CreateComponentCacheResources(cache::ResourceLedger&, std::size_t) const;
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter&, cache::Slot&) const;
+  /// Continuation adapter whose slots hold sessions of max_context tokens,
+  /// for one session class of a component-cache runner. Its components must
+  /// match CreateComponentCacheResources' adapter, up to smaller payloads.
+  [[nodiscard]] virtual std::unique_ptr<cache::Adapter>
+  CreateSessionClassAdapter(std::uint32_t max_context) const;
+  /// Per-request state claim for one session of max_context tokens. Defaults
+  /// to ResourceClaim's claim, which is made for Descriptor().max_context.
+  [[nodiscard]] virtual std::optional<std::size_t> SessionStateBytes(
+      std::uint32_t max_context) const {
+    (void)max_context;
+    return ResourceClaim().per_request_state_bytes;
+  }
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const;
   /// Whether restored component state can select its next token. A boundary
   /// captured between prefill passes cannot, so it serves only longer prompts.
@@ -624,6 +648,14 @@ public:
       std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
       std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt,
       TextRunnerRamCacheOptions ram_cache = {});
+  /// One pool of named session classes over a shared runner. Each class's
+  /// sessions are created with its own capacity, which must not exceed
+  /// Descriptor().max_context; requires a component-cache runner.
+  TextRunnerPool(
+      std::shared_ptr<TextModelRunner> runner,
+      std::vector<TextSessionClass> classes,
+      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt,
+      TextRunnerRamCacheOptions ram_cache = {});
   ~TextRunnerPool();
 
   TextRunnerPool(const TextRunnerPool&) = delete;
@@ -633,6 +665,9 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// Session classes in slot order. A pool built from a state count has one
+  /// unnamed class with the runner's maximum context.
+  [[nodiscard]] const std::vector<TextSessionClass>& classes() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
@@ -646,19 +681,21 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true);
+      bool stop_at_eos = true, std::size_t session_class = 0);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
-  /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
-  /// leasing a state. An upper bound: Acquire may still prefer a shorter one.
+  /// Longest RAM-retained prefix of prompt that Acquire could reuse in this
+  /// session class, without leasing a state. An upper bound: Acquire may
+  /// still prefer a shorter one.
   [[nodiscard]] std::size_t CachedPrefixTokens(
-      std::span<const TextRunnerToken> prompt,
-      const TextPromptContext* context) const;
-  /// A disk job is still writing a prefix of prompt much deeper than any
-  /// restorable checkpoint; admission may wait for it instead of prefilling.
+      std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+      std::size_t session_class = 0) const;
+  /// A disk job of this session class is still writing a prefix of prompt
+  /// much deeper than any restorable checkpoint; admission may wait for it
+  /// instead of prefilling.
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
       std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
-      std::uint64_t checkpoint_id = 0) const;
+      std::uint64_t checkpoint_id = 0, std::size_t session_class = 0) const;
 
 private:
   struct Impl;

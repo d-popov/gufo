@@ -61,6 +61,8 @@ struct TextSchedulerPolicy {
 ///
 /// Submitters never execute model code. One scheduler thread owns admission,
 /// runner leases, prefill/decode work units, cancellation, and reclamation.
+/// Each request waits for a session of its own class; a full class never
+/// holds back requests of another class.
 class TextGenerationScheduler {
 public:
   using Clock = std::chrono::steady_clock;
@@ -81,6 +83,9 @@ public:
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
+    /// Index into the pool's classes. The request is admitted only into a
+    /// session of this class and limited by that class's context.
+    std::size_t session_class{0};
   };
 
   class Request {
