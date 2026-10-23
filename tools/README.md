@@ -11,6 +11,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `bench/` | Kernel microbenchmarks, hipBLASLt tuning, and direct speculative-corpus checks; `model-bench.py` drives per-model BENCHMARKS.md tables against each model's reference |
 | `prof/` | rocprofv3 capture, stage summaries, and ISA inspection |
 | `serving/` | HTTP serving benchmarks |
+| `monitor/` | Read-only web monitor for a running `gufo serve llm` ([README](monitor/README.md)) |
 | `ds4/` | DeepSeek-specific validation and experiments |
 | `qwen27b/` | Qwen27B/DFlash2 kernels, reference checks, and vision validation |
 | `qwen-flash/` | Flash-Next projection and MoE microbenchmarks |

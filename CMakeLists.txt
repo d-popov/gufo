@@ -681,6 +681,12 @@ if (BUILD_TESTING)
   set_tests_properties(serving_bench_test PROPERTIES
     LABELS "cpu;tools;server;benchmarks;statistics;json")
 
+  add_test(NAME monitor_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/monitor_test.py)
+  set_tests_properties(monitor_test PROPERTIES
+    LABELS "cpu;tools;server" TIMEOUT 30)
+
   add_test(NAME functional_runner_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_runner.py)
