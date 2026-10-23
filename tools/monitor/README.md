@@ -1,6 +1,6 @@
 # gufo-monitor
 
-A read-only web page that shows what a running `gufo serve llm` is doing:
+A web page that shows what a running `gufo serve llm` is doing:
 
 - the server state (Loading, Waiting, Reading prompt, Generating with its rate, Down);
 - live decode and prefill rates;
@@ -9,7 +9,9 @@ A read-only web page that shows what a running `gufo serve llm` is doing:
 - GPU busy, GTT memory, temperature and power, plus host memory and CPU;
 - one row per session, grouped by served model when sessions report one;
 - recent requests from the log;
-- token and request totals.
+- token and request totals;
+- optionally, the server's named API keys with their usage, which an admin can
+  create, edit and revoke ([API keys](#api-keys)).
 
 One Python process (standard library only, Python 3.10 or later) polls Gufo, sysfs and
 `/proc` once per second and serves the page. Any number of browsers share those polls:
@@ -40,6 +42,8 @@ does not exist, the monitor creates it on first start at
 | `--gpu-card` | `auto` | DRM card, for example `card1` |
 | `--show-clients` | | show client ids from the log |
 | `--secure-cookie` | | always mark the login cookie `Secure` |
+| `--keys-file FILE` | none | the server's `--api-key-file`; enables the API keys section |
+| `--admin-token-file FILE` | `$XDG_CONFIG_HOME/gufo-monitor/admin-token` | admin token for changing keys, created if missing |
 
 Without `--log-source`, the recent-requests table and the request counts stay empty.
 Everything else works.
@@ -78,6 +82,35 @@ WantedBy=default.target
   `mem_info_gtt_*`), its `amdgpu` hwmon (temperature, power, clock), `/proc/meminfo` and
   `/proc/stat`.
 
+## API keys
+
+With `--keys-file`, the page lists the named keys of Gufo's `--api-key-file`. For each
+key it shows its access, its models and its usage from the log: requests, prompt,
+cached and generated tokens, errors and last use. It also reports whether Gufo
+applied the latest version of the file.
+
+After unlocking with the admin token, you can:
+
+- create a key: inference or monitoring only, all models or chosen models. The page
+  shows the new token once; the file stores only its SHA-256 digest;
+- change a key's access or models;
+- revoke a key. Its clients are refused within about a second, when Gufo re-reads
+  the file. The last key cannot be removed, because Gufo refuses a file without keys.
+
+Edits keep comments and other lines, and replace the file atomically. If Gufo runs in
+a container, mount the file's directory, not the file itself, so Gufo sees the
+replaced file:
+
+```sh
+podman run ... -v ~/.config/gufo/keys:/keys:ro ... gufo serve --api-key-file /keys/api_keys llm ...
+python3 tools/monitor/gufo-monitor.py --gufo http://127.0.0.1:8080 \
+  --gufo-key-file ~/.config/gufo/monitor_key --keys-file ~/.config/gufo/keys/api_keys \
+  --log-source podman:gufo
+```
+
+The monitor's own Gufo key can be a monitoring key (`access=monitor`): it only needs
+`/ready`, `/v1/models`, `/props`, `/slots` and `/metrics`.
+
 ## Security
 
 - **Gufo API key:** it stays in the monitor process. It never appears in a response,
@@ -89,7 +122,12 @@ WantedBy=default.target
   sends `X-Forwarded-Proto: https`.
 - **Response headers:** a strict CSP (`default-src 'self'`, no inline script,
   `frame-ancestors 'none'`), plus `nosniff` and `no-referrer`.
-- **Read-only:** no route changes Gufo.
+- **Admin token:** only needed with `--keys-file`. Viewing keys and their usage takes
+  the monitor token; creating, editing or revoking keys also takes the admin token,
+  sent as `X-Admin-Token` or as an hour-long `/api/`-only cookie set by unlocking the
+  page. Changes are JSON requests, so a cross-site form cannot submit them.
+- **Gufo itself:** the monitor changes Gufo only through the keys file, and only with
+  the admin token. Every other route is read-only.
 
 To reach the monitor from elsewhere, put it behind a TLS reverse proxy or tunnel and
 keep Gufo's own port private.

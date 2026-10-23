@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CPU-only tests for tools/monitor: parsers, rates, Gufo polling and access control."""
 
+import hashlib
 import http.client
 import http.server
 import importlib.util
@@ -329,6 +330,197 @@ class TokenFileTest(unittest.TestCase):
             self.assertGreaterEqual(len(token), 40)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             self.assertEqual(gm.load_or_create_token(path), token)
+
+
+class KeyStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "keys" / "api_keys"
+        self.store = gm.KeyStore(self.path)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_create_update_delete_keep_other_lines(self):
+        self.path.parent.mkdir()
+        self.path.write_text("# managed by hand\nold sha256:" + "AB" * 32 + " access=monitor\n")
+        os.chmod(self.path, 0o640)
+        token = self.store.create("alice", "inference", ["fn-sub"])
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        text = self.path.read_text()
+        self.assertEqual(text, "# managed by hand\nold sha256:" + "AB" * 32 +
+                         " access=monitor\nalice sha256:" + digest + " models=fn-sub\n")
+        self.assertNotIn(token, text)  # only the digest is stored
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o640)
+        self.store.update("alice", "inference", [])
+        self.assertIn("alice sha256:" + digest + "\n", self.path.read_text())
+        self.assertEqual(self.store.list(), [
+            {"name": "old", "access": "monitor", "models": []},
+            {"name": "alice", "access": "inference", "models": []}])
+        self.store.delete("old")
+        self.assertEqual(self.path.read_text(), "# managed by hand\nalice sha256:" + digest + "\n")
+        with self.assertRaisesRegex(gm.KeyFileError, "last key"):
+            self.store.delete("alice")
+        with self.assertRaises(LookupError):
+            self.store.update("nobody", "inference", [])
+        self.assertEqual(os.listdir(self.path.parent), ["api_keys"])  # no temp files left
+
+    def test_creates_a_private_file(self):
+        self.store.create("first", "monitor", [])
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_rejects_what_gufo_would_reject(self):
+        self.store.create("alice", "inference", [])
+        for name, access, models, message in (
+                ("alice", "inference", [], "already exists"),
+                ("al ice", "inference", [], "key name"),
+                ("x" * 65, "inference", [], "key name"),
+                ("bob", "admin", [], "access"),
+                ("bob", "monitor", ["fn"], "monitor key"),
+                ("bob", "inference", ["a b"], "spaces or commas"),
+                ("bob", "inference", ["a,b"], "spaces or commas"),
+                ("bob", "inference", [""], "spaces or commas"),
+                ("bob", "inference", "fn", "required"),
+                (None, "inference", [], "required")):
+            with self.assertRaisesRegex(gm.KeyFileError, message):
+                self.store.create(name, access, models)
+        self.assertEqual([k["name"] for k in self.store.list()], ["alice"])
+
+    def test_parser_matches_gufo_rules(self):
+        for line in ("alice sha256:abc", "alice plain", "alice sha256:" + "a" * 64 + " models=",
+                     "alice sha256:" + "a" * 64 + " models=a,", "alice sha256:" + "a" * 64 + " x=1",
+                     "alice sha256:" + "a" * 64 + " access=monitor access=monitor"):
+            with self.assertRaises(gm.KeyFileError, msg=line):
+                gm.parse_key_line(line)
+        self.assertIsNone(gm.parse_key_line("   # comment"))
+
+
+class KeyUsageTest(unittest.TestCase):
+    def test_usage_per_key_and_reload_status(self):
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        tail = gm.LogTail("file:/dev/null", monitor, show_clients=False, log_utc=True)
+        tail.feed(REAL_LINE.replace("rss_mib=", "key=007 rss_mib="))
+        tail.feed(REAL_LINE.replace("request=r2", "request=r3").replace("status=200", "status=429")
+                  .replace("rss_mib=", "key=007 rss_mib="))
+        tail.feed("2026-10-23 20:12:30 [INFO] [server] event=api_keys_reloaded keys=4")
+        self.assertEqual(monitor.requests[0]["key"], "007")
+        usage = monitor.key_usage["007"]
+        self.assertEqual((usage["requests"], usage["errors"], usage["prompt_tokens"],
+                          usage["generated_tokens"]), (2, 1, 56, 6))
+        self.assertEqual(monitor.key_reload, {"t": 1792786350.0, "ok": True, "keys": 4})
+        tail.feed("2026-10-23 20:12:31 [ERROR] [server] event=api_keys_reload_failed "
+                  "reason=/keys/api_keys: line 2: access must be inference or monitor")
+        self.assertEqual(monitor.key_reload["reason"],
+                         "/keys/api_keys: line 2: access must be inference or monitor")
+        self.assertFalse(monitor.key_reload["ok"])
+
+
+class KeyAdminHttpTest(unittest.TestCase):
+    ADMIN = "admin-token-for-tests"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.keys = Path(self.directory.name) / "api_keys"
+        self.keys.write_text("watch sha256:" + "ab" * 32 + " access=monitor\n")
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        admin = gm.Auth(self.ADMIN, gm.ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1",
+                        "X-Admin-Token")
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.Auth(MONITOR_TOKEN),
+                                      False, gm.KeyStore(self.keys), admin))
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.directory.cleanup()
+
+    def request(self, method, path, headers=None, body=None, monitor=True):
+        headers = dict(headers or {})
+        if monitor:
+            headers["Authorization"] = "Bearer " + MONITOR_TOKEN
+        if isinstance(body, dict):
+            body = json.dumps(body)
+            headers.setdefault("Content-Type", "application/json")
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
+                                                timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response, data
+
+    def test_viewing_needs_the_monitor_token_and_changes_the_admin_token(self):
+        response, _ = self.request("GET", "/api/keys", monitor=False)
+        self.assertEqual(response.status, 401)
+        response, data = self.request("GET", "/api/keys")
+        self.assertEqual(json.loads(data), {
+            "keys": [{"name": "watch", "access": "monitor", "models": []}], "admin": False})
+        self.assertNotIn(b"abab", data)  # digests stay in the file
+        new = {"name": "alice", "access": "inference", "models": ["fn"]}
+        response, _ = self.request("POST", "/api/keys", body=new)
+        self.assertEqual(response.status, 403)
+        response, _ = self.request("DELETE", "/api/keys/watch")
+        self.assertEqual(response.status, 403)
+        # The admin token alone is not enough either.
+        response, _ = self.request("POST", "/api/keys", {"X-Admin-Token": self.ADMIN}, new,
+                                   monitor=False)
+        self.assertEqual(response.status, 401)
+        self.assertNotIn("alice", self.keys.read_text())
+
+    def test_admin_creates_edits_and_revokes(self):
+        response, _ = self.request("POST", "/api/admin/login", body={"token": "wrong"})
+        self.assertEqual(response.status, 401)
+        response, _ = self.request("POST", "/api/admin/login", body={"token": self.ADMIN})
+        self.assertEqual(response.status, 204)
+        cookie = response.getheader("Set-Cookie")
+        for part in ("Path=/api/", "HttpOnly", "SameSite=Strict", "Max-Age=3600"):
+            self.assertIn(part, cookie)
+        self.assertNotIn(self.ADMIN, cookie)
+        admin = {"Cookie": cookie.split(";")[0]}
+        _, data = self.request("GET", "/api/keys", admin)
+        self.assertTrue(json.loads(data)["admin"])
+
+        response, data = self.request("POST", "/api/keys", admin,
+                                      {"name": "alice", "models": ["fn-sub"]})
+        self.assertEqual(response.status, 201)
+        token = json.loads(data)["token"]
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        self.assertIn(f"alice sha256:{digest} models=fn-sub\n", self.keys.read_text())
+        # A form post cannot change keys: JSON is required.
+        response, _ = self.request("POST", "/api/keys",
+                                   {**admin, "Content-Type": "application/x-www-form-urlencoded"},
+                                   "name=mallory")
+        self.assertEqual(response.status, 400)
+        response, data = self.request("POST", "/api/keys", admin, {"name": "bad name"})
+        self.assertEqual(response.status, 400)
+        self.assertIn(b"key name", data)
+        response, _ = self.request("PUT", "/api/keys/alice", admin,
+                                   {"access": "monitor", "models": []})
+        self.assertEqual(response.status, 204)
+        self.assertIn(f"alice sha256:{digest} access=monitor\n", self.keys.read_text())
+        response, _ = self.request("PUT", "/api/keys/nobody", admin, {"models": []})
+        self.assertEqual(response.status, 404)
+        response, _ = self.request("DELETE", "/api/keys/alice", {"X-Admin-Token": self.ADMIN})
+        self.assertEqual(response.status, 204)
+        response, data = self.request("DELETE", "/api/keys/watch", admin)
+        self.assertEqual(response.status, 400)
+        self.assertIn(b"last key", data)
+        response, _ = self.request("POST", "/api/admin/logout", admin)
+        self.assertIn("Max-Age=0", response.getheader("Set-Cookie"))
+
+    def test_no_key_routes_without_a_keys_file(self):
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        plain = serve(gm.Server(("127.0.0.1", 0), monitor, gm.Auth(MONITOR_TOKEN), False))
+        try:
+            for method in ("GET", "POST"):
+                connection = http.client.HTTPConnection("127.0.0.1", plain.server_address[1],
+                                                        timeout=5)
+                connection.request(method, "/api/keys",
+                                   headers={"Authorization": "Bearer " + MONITOR_TOKEN})
+                self.assertEqual(connection.getresponse().status, 404)
+                connection.close()
+        finally:
+            plain.shutdown()
+            plain.server_close()
 
 
 if __name__ == "__main__":

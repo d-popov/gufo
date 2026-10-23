@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gufo-monitor: a read-only web monitor for a running `gufo serve llm`.
+"""gufo-monitor: a web monitor for a running `gufo serve llm`.
 
 One background thread polls Gufo (/ready, /metrics, /slots; /v1/models and
 /props less often) and the GPU/host telemetry in sysfs and /proc, another
@@ -9,6 +9,8 @@ Events, one event per poll), so any number of browsers cost one set of polls.
 
 The Gufo API key stays in this process: it is never sent to browsers, written
 to responses or logged. Browsers authenticate with a separate monitor token.
+With --keys-file it also lists Gufo's named API keys, and manages them for
+holders of a separate admin token; nothing else changes Gufo.
 
 Python 3.11+ standard library only.
 """
@@ -43,6 +45,9 @@ STATIC_FILES = {
 }
 COOKIE_NAME = "gufo_monitor"
 COOKIE_MAX_AGE = 30 * 24 * 3600
+# Unlocking key management lasts an hour and is sent only to /api/.
+ADMIN_COOKIE_NAME = "gufo_monitor_admin"
+ADMIN_COOKIE_MAX_AGE = 3600
 MAX_STREAMS = 32
 MAX_REQUESTS = 500
 CARD_WINDOW_S = 300.0
@@ -132,6 +137,7 @@ _LINE = re.compile(
     r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.\d+)?\s+\[(?P<level>[A-Z]+)\]\s+"
     r"\[(?P<component>[^\]]*)\]\s?(?P<message>.*)$")
 _FIELD = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_.]*)=(\S*)")
+_KEY_FIELD = re.compile(r"(?:^|\s)key=(\S+)")
 
 
 def _number(value: str):
@@ -176,7 +182,24 @@ def parse_log_line(line: str, log_utc: bool = False) -> dict | None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         t = stamp.timestamp()
     fields = {key: _number(value) for key, value in _FIELD.findall(match["message"])}
-    return {"t": t, "level": match["level"], "component": match["component"], "fields": fields}
+    return {"t": t, "level": match["level"], "component": match["component"], "fields": fields,
+            "message": match["message"]}
+
+
+def key_reload_status(entry: dict) -> dict | None:
+    """Gufo's view of its --api-key-file, from startup and reload lines."""
+    fields = entry["fields"]
+    event = fields.get("event")
+    if entry["component"] != "server":
+        return None
+    if event == "listening" and fields.get("auth") == "key_file":
+        return {"t": entry["t"], "ok": True, "keys": fields.get("keys")}
+    if event == "api_keys_reloaded":
+        return {"t": entry["t"], "ok": True, "keys": fields.get("keys")}
+    if event == "api_keys_reload_failed":
+        reason = entry["message"].partition("reason=")[2]
+        return {"t": entry["t"], "ok": False, "reason": reason[:300]}
+    return None
 
 
 def request_record(entry: dict, show_clients: bool) -> dict | None:
@@ -193,6 +216,9 @@ def request_record(entry: dict, show_clients: bool) -> dict | None:
             if key in fields:
                 record["client"] = fields[key]
                 break
+    key = _KEY_FIELD.search(entry["message"])  # raw text: names like "007" stay strings
+    if key:
+        record["key"] = key[1]
     record["t"] = entry["t"]
     return record
 
@@ -451,6 +477,8 @@ class Monitor:
         self.requests: collections.deque = collections.deque(maxlen=MAX_REQUESTS)
         self.request_seq = 0
         self.log_totals = {"requests": 0, "errors": 0}
+        self.key_usage: dict[str, dict] = {}  # per --api-key-file key, from the log
+        self.key_reload: dict | None = None
         self.counter_rates = CounterRates()
         self.slot_rates = SlotRates()
         self.status = {"state": "down", "detail": "not polled yet", "model": None}
@@ -629,8 +657,26 @@ class Monitor:
             self.requests.append(record)
             self.log_totals["requests"] += 1
             status = record.get("status")
-            if isinstance(status, int) and status >= 400:
+            failed = isinstance(status, int) and status >= 400
+            if failed:
                 self.log_totals["errors"] += 1
+            key = record.get("key")
+            if isinstance(key, str):
+                usage = self.key_usage.setdefault(key, {
+                    "requests": 0, "errors": 0, "prompt_tokens": 0, "cached_tokens": 0,
+                    "generated_tokens": 0, "last_t": None})
+                usage["requests"] += 1
+                usage["errors"] += failed
+                for field in ("prompt_tokens", "cached_tokens", "generated_tokens"):
+                    value = record.get(field)
+                    if isinstance(value, int):
+                        usage[field] += value
+                usage["last_t"] = max(usage["last_t"] or 0, record["t"] or 0) or None
+
+    def set_key_reload(self, status: dict):
+        with self.cond:
+            if self.key_reload is None or (status["t"] or 0) >= (self.key_reload["t"] or 0):
+                self.key_reload = status
 
     # -- views
 
@@ -643,6 +689,8 @@ class Monitor:
             "sample": self.sample,
             "totals": self.totals,
             "log_totals": self.log_totals,
+            "key_usage": self.key_usage,
+            "key_reload": self.key_reload,
         }
 
     def _publish(self):
@@ -746,6 +794,10 @@ class LogTail:
         entry = parse_log_line(line, self.log_utc)
         if entry is None:
             return
+        reload = key_reload_status(entry)
+        if reload is not None:
+            self.monitor.set_key_reload(reload)
+            return
         record = request_record(entry, self.show_clients)
         if record is None:
             return
@@ -817,7 +869,7 @@ class LogTail:
 
 # --------------------------------------------------------------------------- auth and HTTP
 
-def load_or_create_token(path: Path) -> str:
+def load_or_create_token(path: Path, label: str = "monitor token") -> str:
     try:
         token = path.read_text().strip()
         if token:
@@ -829,7 +881,7 @@ def load_or_create_token(path: Path) -> str:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         handle.write(token + "\n")
-    print(f"gufo-monitor: created monitor token in {path}", file=sys.stderr)
+    print(f"gufo-monitor: created {label} in {path}", file=sys.stderr)
     return token
 
 
@@ -840,22 +892,183 @@ def read_api_key(path: Path) -> str:
     return key
 
 
+# --------------------------------------------------------------------------- key file
+
+KEY_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+KEY_DIGEST = re.compile(r"sha256:([0-9a-fA-F]{64})")
+KEY_MODEL = re.compile(r"[^\s,]+")
+
+
+class KeyFileError(ValueError):
+    pass
+
+
+def parse_key_line(line: str) -> dict | None:
+    """One line of Gufo's --api-key-file, with Gufo's rules; None for blanks/comments."""
+    fields = line.split()
+    if not fields or fields[0].startswith("#"):
+        return None
+    if len(fields) < 2:
+        raise KeyFileError("expected NAME sha256:HEX [access=...] [models=...]")
+    name, credential, *options = fields
+    if not KEY_NAME.fullmatch(name):
+        raise KeyFileError("key name must be 1-64 characters of A-Z a-z 0-9 . _ -")
+    digest = KEY_DIGEST.fullmatch(credential)
+    if not digest:
+        raise KeyFileError("credential must be sha256: followed by 64 hex digits")
+    key = {"name": name, "digest": digest[1].lower(), "access": "inference", "models": []}
+    seen = set()
+    for option in options:
+        option_name, separator, value = option.partition("=")
+        if not separator or option_name not in ("access", "models") or option_name in seen:
+            raise KeyFileError(f"unknown or repeated option '{option}'")
+        seen.add(option_name)
+        if option_name == "access":
+            if value not in ("inference", "monitor"):
+                raise KeyFileError("access must be inference or monitor")
+            key["access"] = value
+        else:
+            models = value.split(",")
+            if not value or not all(models):
+                raise KeyFileError("models must list served model names")
+            key["models"] = models
+    if key["access"] == "monitor" and key["models"]:
+        raise KeyFileError("a monitor key cannot list models")
+    return key
+
+
+def format_key_line(key: dict) -> str:
+    parts = [key["name"], "sha256:" + key["digest"]]
+    if key["access"] == "monitor":
+        parts.append("access=monitor")
+    if key["models"]:
+        parts.append("models=" + ",".join(key["models"]))
+    return " ".join(parts)
+
+
+class KeyStore:
+    """Edits Gufo's --api-key-file in place: other lines and comments are kept,
+    each write replaces the file atomically, and only digests are stored.
+    Gufo re-reads the file within about a second."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _read(self) -> tuple[list[str], list[dict]]:
+        try:
+            lines = self.path.read_text().splitlines()
+        except FileNotFoundError:
+            return [], []
+        keys = []
+        for index, line in enumerate(lines):
+            try:
+                key = parse_key_line(line)
+            except KeyFileError as error:
+                raise KeyFileError(f"{self.path}: line {index + 1}: {error}") from None
+            if key is not None:
+                key["line"] = index
+                keys.append(key)
+        return lines, keys
+
+    def _write(self, lines: list[str]):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            mode = self.path.stat().st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o600
+        temporary = self.path.with_name(f".{self.path.name}.{secrets.token_hex(4)}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write("".join(line + "\n" for line in lines))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _validated(name, access, models) -> dict:
+        if not isinstance(name, str) or not isinstance(access, str) or not isinstance(
+                models, list) or not all(isinstance(m, str) for m in models):
+            raise KeyFileError("name, access and models are required")
+        if not KEY_NAME.fullmatch(name):
+            raise KeyFileError("key name must be 1-64 characters of A-Z a-z 0-9 . _ -")
+        if access not in ("inference", "monitor"):
+            raise KeyFileError("access must be inference or monitor")
+        if any(not KEY_MODEL.fullmatch(model) for model in models):
+            raise KeyFileError("model names cannot be empty or contain spaces or commas")
+        key = {"name": name, "digest": "0" * 64, "access": access, "models": models}
+        parse_key_line(format_key_line(key))  # Gufo's rules, from one place
+        return key
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            _, keys = self._read()
+        return [{"name": k["name"], "access": k["access"], "models": k["models"]} for k in keys]
+
+    def create(self, name, access, models) -> str:
+        key = self._validated(name, access, models)
+        token = secrets.token_urlsafe(32)
+        key["digest"] = hashlib.sha256(token.encode()).hexdigest()
+        with self._lock:
+            lines, keys = self._read()
+            if any(k["name"] == name for k in keys):
+                raise KeyFileError(f"key '{name}' already exists")
+            self._write([*lines, format_key_line(key)])
+        return token
+
+    def update(self, name, access, models):
+        key = self._validated(name, access, models)
+        with self._lock:
+            lines, keys = self._read()
+            current = next((k for k in keys if k["name"] == name), None)
+            if current is None:
+                raise LookupError(name)
+            key["digest"] = current["digest"]
+            lines[current["line"]] = format_key_line(key)
+            self._write(lines)
+
+    def delete(self, name):
+        with self._lock:
+            lines, keys = self._read()
+            current = next((k for k in keys if k["name"] == name), None)
+            if current is None:
+                raise LookupError(name)
+            if len(keys) == 1:
+                # Gufo refuses a file without keys and would keep this one.
+                raise KeyFileError("cannot remove the last key")
+            del lines[current["line"]]
+            self._write(lines)
+
+
 class Auth:
-    def __init__(self, token: str):
+    """A shared secret, presented as a header or as a cookie holding an HMAC of it."""
+
+    def __init__(self, token: str, cookie: str = COOKIE_NAME,
+                 context: bytes = b"gufo-monitor-session-v1", header: str | None = None):
         self._token = token.encode()
-        self.session = hmac.new(self._token, b"gufo-monitor-session-v1",
-                                hashlib.sha256).hexdigest()
+        self.cookie = cookie
+        self.header = header  # None: `Authorization: Bearer`
+        self.session = hmac.new(self._token, context, hashlib.sha256).hexdigest()
 
     def check_token(self, candidate: str) -> bool:
         return hmac.compare_digest(candidate.encode(), self._token)
 
     def check_request(self, headers) -> bool:
-        authorization = headers.get("Authorization", "")
-        if authorization.startswith("Bearer ") and self.check_token(authorization[7:].strip()):
+        if self.header is None:
+            authorization = headers.get("Authorization", "")
+            if authorization.startswith("Bearer ") and self.check_token(
+                    authorization[7:].strip()):
+                return True
+        elif self.check_token(headers.get(self.header, "").strip() or "\0"):
             return True
         for part in headers.get("Cookie", "").split(";"):
             name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and hmac.compare_digest(value.encode(), self.session.encode()):
+            if name == self.cookie and hmac.compare_digest(value.encode(),
+                                                           self.session.encode()):
                 return True
         return False
 
@@ -864,11 +1077,14 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, monitor: Monitor, auth: Auth, secure_cookie: bool):
+    def __init__(self, address, monitor: Monitor, auth: Auth, secure_cookie: bool,
+                 keys: KeyStore | None = None, admin: Auth | None = None):
         super().__init__(address, Handler)
         self.monitor = monitor
         self.auth = auth
         self.secure_cookie = secure_cookie
+        self.keys = keys  # None: no --keys-file, the key routes answer 404
+        self.admin = admin
         self.streams = threading.BoundedSemaphore(MAX_STREAMS)
         self.stop = threading.Event()
 
@@ -914,10 +1130,109 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _secure(self) -> bool:
         return self.server.secure_cookie or self.headers.get("X-Forwarded-Proto", "") == "https"
 
-    def _cookie(self, value: str, max_age: int) -> tuple[str, str]:
-        cookie = (f"{COOKIE_NAME}={value}; Path=/; Max-Age={max_age}; HttpOnly; "
+    def _cookie(self, value: str, max_age: int, name: str = COOKIE_NAME,
+                path: str = "/") -> tuple[str, str]:
+        cookie = (f"{name}={value}; Path={path}; Max-Age={max_age}; HttpOnly; "
                   "SameSite=Strict")
         return ("Set-Cookie", cookie + ("; Secure" if self._secure() else ""))
+
+    def _read_json(self, limit: int = 16 << 10):
+        """The request's JSON object body, or None. JSON is required so a
+        cross-site form cannot submit it without a CORS preflight."""
+        if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length <= 0 or length > limit:
+            return None
+        try:
+            body = json.loads(self.rfile.read(length))
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
+    def _error(self, status: int, message: str):
+        self._json(status, json.dumps({"error": message}).encode())
+
+    # -- API keys (Gufo's --api-key-file): view with the monitor token, change
+    # with the admin token as well
+
+    def _keys_route(self, path: str) -> str | None:
+        """The key name of /api/keys/NAME, "" for /api/keys, None otherwise."""
+        if path == "/api/keys":
+            return ""
+        if path.startswith("/api/keys/"):
+            return urllib.parse.unquote(path[len("/api/keys/"):])
+        return None
+
+    def _admin(self) -> bool:
+        return self.server.admin is not None and self.server.admin.check_request(self.headers)
+
+    def _keys_get(self):
+        try:
+            keys = self.server.keys.list()
+        except KeyFileError as error:
+            return self._error(500, str(error))
+        self._json(200, json.dumps({"keys": keys, "admin": self._admin()}).encode())
+
+    def _keys_change(self, method: str, name: str):
+        if not self._admin():
+            return self._error(403, "admin token required")
+        store = self.server.keys
+        try:
+            if method == "DELETE" and name:
+                store.delete(name)
+                return self._send(204, b"", "text/plain")
+            body = self._read_json()
+            if body is None:
+                return self._error(400, "expected a JSON object")
+            access = body.get("access", "inference")
+            models = body.get("models", [])
+            if method == "POST" and not name:
+                token = store.create(body.get("name"), access, models)
+                payload = {"name": body["name"], "token": token}
+                return self._json(201, json.dumps(payload).encode())
+            if method == "PUT" and name:
+                store.update(name, access, models)
+                return self._send(204, b"", "text/plain")
+        except LookupError:
+            return self._error(404, f"no key named '{name}'")
+        except KeyFileError as error:
+            return self._error(400, str(error))
+        self._error(405, "method not allowed")
+
+    def _admin_login(self):
+        if self.server.admin is None:
+            return self._error(404, "not_found")
+        body = self._read_json(4096)
+        token = body.get("token") if body else None
+        if not isinstance(token, str) or not self.server.admin.check_token(token.strip()):
+            time.sleep(0.5)
+            return self._error(401, "wrong admin token")
+        self._send(204, b"", "text/plain", (self._cookie(
+            self.server.admin.session, ADMIN_COOKIE_MAX_AGE, ADMIN_COOKIE_NAME, "/api/"),))
+
+    def _mutation(self, method: str):
+        path = urllib.parse.urlsplit(self.path).path
+        if not self._authorized():
+            return self._error(401, "unauthorized")
+        if path == "/api/admin/login":
+            return self._admin_login()
+        if path == "/api/admin/logout":
+            return self._send(204, b"", "text/plain",
+                              (self._cookie("", 0, ADMIN_COOKIE_NAME, "/api/"),))
+        name = self._keys_route(path)
+        if name is None or self.server.keys is None:
+            return self._error(404, "not_found")
+        self._keys_change(method, name)
+
+    def do_PUT(self):
+        self._mutation("PUT")
+
+    def do_DELETE(self):
+        self._mutation("DELETE")
 
     # -- routes
 
@@ -939,6 +1254,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
             return self._stream()
+        if self._keys_route(path) == "" and self.server.keys is not None:
+            return self._keys_get()
         self._json(404, b'{"error":"not_found"}')
 
     def do_POST(self):
@@ -946,8 +1263,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/login":
             return self._login()
         if path == "/logout":
-            return self._redirect("/login", (self._cookie("", 0),))
-        self._json(404, b'{"error":"not_found"}')
+            return self._redirect("/login", (
+                self._cookie("", 0),
+                self._cookie("", 0, ADMIN_COOKIE_NAME, "/api/")))
+        self._mutation("POST")
 
     def _file(self, name: str, content_type: str, cache: str = "no-store"):
         try:
@@ -1040,6 +1359,12 @@ def parse_args(argv=None):
                         help="show client ids from the log")
     parser.add_argument("--secure-cookie", action="store_true",
                         help="always mark the login cookie Secure (served over https)")
+    parser.add_argument("--keys-file", type=Path,
+                        help="Gufo's --api-key-file: view keys and usage, and manage them "
+                             "with the admin token")
+    parser.add_argument("--admin-token-file", type=Path,
+                        default=config / "gufo-monitor" / "admin-token",
+                        help="admin token for managing keys; created (mode 0600) if missing")
     args = parser.parse_args(argv)
     if args.poll < 0.2:
         parser.error("--poll must be at least 0.2 s")
@@ -1056,7 +1381,18 @@ def main(argv=None) -> int:
         return 2
     monitor = Monitor(GufoClient(args.gufo, api_key), Telemetry(args.gpu_card),
                       poll_s=args.poll, history_s=args.history)
-    server = Server((args.bind, args.port), monitor, Auth(token), args.secure_cookie)
+    keys = admin = None
+    if args.keys_file:
+        keys = KeyStore(args.keys_file)
+        try:
+            keys.list()
+        except (OSError, KeyFileError) as error:
+            print(f"gufo-monitor: --keys-file: {error}", file=sys.stderr)
+            return 2
+        admin = Auth(load_or_create_token(args.admin_token_file, "admin token"),
+                     ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1", "X-Admin-Token")
+    server = Server((args.bind, args.port), monitor, Auth(token), args.secure_cookie,
+                    keys, admin)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":

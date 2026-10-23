@@ -25,6 +25,7 @@ const REQUEST_COLUMNS = [
   { title: 'Time', cell: (r) => fmtTime(r.t) },
   { title: 'Model', key: 'model', optional: true, cell: (r) => r.model ?? '' },
   { title: 'Client', key: 'client', optional: true, cell: (r) => r.client ?? '' },
+  { title: 'Key', key: 'key', optional: true, cell: (r) => r.key ?? '' },
   { title: 'Path', cell: (r) => r.path ?? '' },
   { title: 'Result', cell: (r) => [r.status, r.outcome !== 'completed' ? r.outcome : null, r.finish]
       .filter((x) => x != null && x !== '').join(' · '),
@@ -309,6 +310,7 @@ function render() {
   renderSessions();
   renderRequests();
   renderTotals();
+  renderKeys();
 }
 
 function scheduleRender() {
@@ -345,7 +347,8 @@ function applyTick(tick) {
     if (requests.length > 500) requests.splice(0, requests.length - 500);
     requestsDirty = true;
   }
-  for (const key of ['status', 'models', 'props', 'slots', 'sample', 'totals', 'log_totals', 'seq']) {
+  for (const key of ['status', 'models', 'props', 'slots', 'sample', 'totals', 'log_totals',
+                     'key_usage', 'key_reload', 'seq']) {
     state[key] = tick[key];
   }
   const history = state.history;
@@ -375,11 +378,213 @@ function connect() {
   });
 }
 
+// ---------------------------------------------------------------- API keys
+// The list comes from Gufo's key file (GET /api/keys, monitor token); usage
+// and reload status arrive with every tick. Changes need the admin token.
+
+let keys = null;  // null: the monitor has no --keys-file
+let keysAdmin = false;
+let editingKey = null;
+
+async function keysRequest(method, path, body) {
+  const options = { method, credentials: 'same-origin', cache: 'no-store', headers: {} };
+  if (body !== undefined) {
+    options.headers['Content-Type'] = 'application/json';
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+  return data;
+}
+
+function showKeysError(error) {
+  const node = $('keys-error');
+  node.textContent = error ? String(error.message ?? error) : '';
+  node.hidden = !error;
+}
+
+async function loadKeys() {
+  const response = await fetch('/api/keys', { credentials: 'same-origin', cache: 'no-store' });
+  if (response.status === 404) return;  // key management not configured
+  try {
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+    keys = data.keys;
+    keysAdmin = data.admin;
+    showKeysError(null);
+  } catch (error) {
+    keys = keys ?? [];
+    showKeysError(error);
+  }
+  $('keys-section').hidden = false;
+  $('admin-unlock').hidden = keysAdmin;
+  $('keys-admin').hidden = !keysAdmin;
+  renderModelChoices();
+  renderKeys();
+}
+
+function renderModelChoices() {
+  const list = $('key-model-list');
+  const checked = new Set([...list.querySelectorAll('input:checked')].map((i) => i.value));
+  const names = new Set((state?.models ?? []).map((m) => m.id));
+  for (const key of keys ?? []) for (const model of key.models) names.add(model);
+  list.replaceChildren(...[...names].sort().map((name) => {
+    const box = el('input', { type: 'checkbox', value: name });
+    box.checked = checked.has(name);
+    return el('label', {}, box, ` ${name}`);
+  }));
+  syncModelControls();
+}
+
+function syncModelControls() {
+  const monitor = $('key-access').value === 'monitor';
+  $('key-models').disabled = monitor;
+  const all = $('key-all-models').checked;
+  for (const box of $('key-model-list').querySelectorAll('input')) box.disabled = all || monitor;
+}
+
+function renderKeys() {
+  if (keys === null) return;
+  const usage = state?.key_usage ?? {};
+  const reload = state?.key_reload;
+  $('keys-reload').textContent = !reload ? ''
+    : reload.ok ? `Gufo loaded ${fmt(reload.keys, 0)} keys · ${fmtTime(reload.t)}`
+      : `Gufo kept its previous keys: ${reload.reason} · ${fmtTime(reload.t)}`;
+  $('keys-reload').className = reload && !reload.ok ? 'bad' : 'muted';
+  const rows = keys.map((key) => {
+    const used = usage[key.name] ?? {};
+    const actions = el('td');
+    if (keysAdmin) {
+      const edit = el('button', { type: 'button', class: 'link' }, 'Edit');
+      edit.addEventListener('click', () => startEdit(key));
+      const revoke = el('button', { type: 'button', class: 'link danger' }, 'Revoke');
+      revoke.addEventListener('click', () => revokeKey(key.name));
+      actions.append(edit, ' ', revoke);
+    }
+    return el('tr', {},
+      el('td', {}, key.name),
+      el('td', {}, key.access === 'monitor' ? 'Monitoring' : 'Inference'),
+      el('td', {}, key.access === 'monitor' ? '—' : key.models.length ? key.models.join(', ') : 'All'),
+      el('td', { class: 'num' }, fmt(used.requests ?? 0, 0)),
+      el('td', { class: 'num' }, fmt(used.prompt_tokens ?? 0, 0)),
+      el('td', { class: 'num' }, fmt(used.cached_tokens ?? 0, 0)),
+      el('td', { class: 'num' }, fmt(used.generated_tokens ?? 0, 0)),
+      el('td', { class: used.errors ? 'num bad' : 'num' }, fmt(used.errors ?? 0, 0)),
+      el('td', {}, used.last_t ? fmtTime(used.last_t) : '—'),
+      actions);
+  });
+  if (!rows.length) {
+    rows.push(el('tr', {}, el('td', { colspan: '10', class: 'muted' }, 'No keys in the file.')));
+  }
+  $('keys').tBodies[0].replaceChildren(...rows);
+}
+
+function resetKeyForm() {
+  editingKey = null;
+  $('key-form').reset();
+  $('key-name').disabled = false;
+  $('key-form-title').textContent = 'New key';
+  $('key-submit').textContent = 'Create key';
+  $('key-cancel').hidden = true;
+  for (const box of $('key-model-list').querySelectorAll('input')) box.checked = false;
+  syncModelControls();
+}
+
+function startEdit(key) {
+  editingKey = key.name;
+  $('key-name').value = key.name;
+  $('key-name').disabled = true;
+  $('key-access').value = key.access;
+  $('key-all-models').checked = key.models.length === 0;
+  for (const box of $('key-model-list').querySelectorAll('input')) {
+    box.checked = key.models.includes(box.value);
+  }
+  $('key-form-title').textContent = `Edit ${key.name}`;
+  $('key-submit').textContent = 'Save';
+  $('key-cancel').hidden = false;
+  syncModelControls();
+  $('key-form').scrollIntoView({ block: 'nearest' });
+}
+
+async function submitKey(event) {
+  event.preventDefault();
+  const access = $('key-access').value;
+  const models = access === 'monitor' || $('key-all-models').checked ? []
+    : [...$('key-model-list').querySelectorAll('input:checked')].map((box) => box.value);
+  if (access === 'inference' && !$('key-all-models').checked && !models.length) {
+    showKeysError('Choose at least one model, or All models.');
+    return;
+  }
+  try {
+    if (editingKey) {
+      await keysRequest('PUT', `/api/keys/${encodeURIComponent(editingKey)}`, { access, models });
+    } else {
+      const created = await keysRequest('POST', '/api/keys', { name: $('key-name').value, access, models });
+      $('key-secret-name').textContent = created.name;
+      $('key-secret-token').textContent = created.token;
+      $('key-secret').hidden = false;
+    }
+    resetKeyForm();
+    showKeysError(null);
+  } catch (error) {
+    showKeysError(error);
+  }
+  await loadKeys();
+}
+
+async function revokeKey(name) {
+  if (!window.confirm(`Revoke key "${name}"? Clients using it are refused within seconds.`)) return;
+  try {
+    await keysRequest('DELETE', `/api/keys/${encodeURIComponent(name)}`);
+    if (editingKey === name) resetKeyForm();
+    showKeysError(null);
+  } catch (error) {
+    showKeysError(error);
+  }
+  await loadKeys();
+}
+
+function setUpKeys() {
+  $('admin-unlock').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      await keysRequest('POST', '/api/admin/login', { token: $('admin-token').value });
+      $('admin-token').value = '';
+      showKeysError(null);
+    } catch (error) {
+      showKeysError(error);
+    }
+    await loadKeys();
+  });
+  $('admin-lock').addEventListener('click', async () => {
+    await keysRequest('POST', '/api/admin/logout').catch(() => {});
+    resetKeyForm();
+    await loadKeys();
+  });
+  $('key-form').addEventListener('submit', submitKey);
+  $('key-cancel').addEventListener('click', resetKeyForm);
+  $('key-access').addEventListener('change', syncModelControls);
+  $('key-all-models').addEventListener('change', syncModelControls);
+  $('key-secret-copy').addEventListener('click', () => {
+    navigator.clipboard?.writeText($('key-secret-token').textContent).catch(() => {});
+  });
+  $('key-secret-done').addEventListener('click', () => {
+    $('key-secret-token').textContent = '';
+    $('key-secret').hidden = true;
+  });
+  loadKeys().catch(() => {});
+  // Picks up edits made outside the page and the hour-long admin unlock ending.
+  setInterval(() => loadKeys().catch(() => {}), 30000);
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   buildCards();
   $('show-all').addEventListener('change', () => {
     requestsDirty = true;
     scheduleRender();
   });
-  loadState().then((ok) => ok && connect()).catch(() => connect());
+  // Keys need the state's model list for their choices.
+  loadState().then((ok) => ok && connect()).catch(() => connect()).finally(setUpKeys);
 });
