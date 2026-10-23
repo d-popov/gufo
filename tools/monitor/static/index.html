@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Gufo monitor</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="title">
+      <h1>Gufo monitor</h1>
+      <span id="model" class="muted"></span>
+    </div>
+    <span id="pill" class="pill pill-down">Connecting</span>
+    <form method="post" action="/logout" class="logout">
+      <button type="submit" class="link">Log out</button>
+    </form>
+  </header>
+  <p id="detail" class="detail" hidden></p>
+
+  <main>
+    <section aria-label="Live metrics">
+      <div id="cards" class="cards"></div>
+    </section>
+
+    <section>
+      <h2>Sessions</h2>
+      <div class="table-wrap">
+        <table id="sessions" class="data">
+          <thead>
+            <tr>
+              <th>Session</th><th>State</th><th class="fill-col">Context</th>
+              <th class="num">Prompt</th><th class="num">Cached</th>
+              <th class="num">Generated</th><th class="num">tok/s</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>Recent requests</h2>
+        <label class="toggle"><input type="checkbox" id="show-all"> Show all</label>
+      </div>
+      <div class="table-wrap">
+        <table id="requests" class="data">
+          <thead><tr></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="requests-empty" class="muted">No completed requests yet.</p>
+    </section>
+
+    <section>
+      <h2>Totals</h2>
+      <dl id="totals" class="totals"></dl>
+    </section>
+  </main>
+
+  <footer id="footer" class="muted"></footer>
+</body>
+</html>
