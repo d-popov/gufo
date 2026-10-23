@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -505,6 +506,45 @@ void TestApiKeyFileParsing() {
   }
 }
 
+// With session classes the text service serves several models; a key's
+// models are checked against the class the request runs on.
+void TestApiKeyFileSessionClasses() {
+  using gufo::server::ApiKeyDigest;
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("gufo-class-keys-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "keys";
+  std::ofstream(path) << "sub sha256:" << ApiKeyDigest("sub-secret")
+                      << " models=sub\nowner sha256:"
+                      << ApiKeyDigest("owner-secret") << "\n";
+  {
+    RunningServer server({.api_key_file = path});
+    server.backend->served = {{"main", 1000}, {"sub", 32}};
+    const auto send = [&](const std::string& key, const std::string& body) {
+      return server.Send(
+          "POST /v1/completions HTTP/1.1\r\nAuthorization: Bearer " + key +
+          "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+          body);
+    };
+    const auto body = [](const std::string& model) {
+      return (model.empty() ? std::string("{")
+                            : R"({"model":")" + model + "\",") +
+             R"("prompt":"hi","max_tokens":1})";
+    };
+    ExpectStatus(send("sub-secret", body("sub")), 200);
+    // The first class runs a request without a model.
+    for (const std::string model : {"main", "", "nope"}) {
+      const auto response = send("sub-secret", body(model));
+      ExpectStatus(response, 403);
+      assert(response.find("model_not_allowed") != std::string::npos);
+    }
+    ExpectStatus(send("owner-secret", body("main")), 200);
+    ExpectStatus(send("owner-secret", body("nope")), 404);
+    assert(server.backend->calls == 2);
+  }
+  std::filesystem::remove_all(directory);
+}
+
 void TestApiKeyFile() {
   using gufo::server::ApiKeyDigest;
   const auto directory = std::filesystem::temp_directory_path() /
@@ -558,23 +598,27 @@ void TestApiKeyFile() {
                  200);
     assert(server.backend->calls == 1);
 
-    // bob may only use `other`. Naming `other` in the body or the query does
-    // not change which model the route reaches, so every text route refuses.
+    // bob may only use `other`, which this server does not serve. A request
+    // naming no model runs on `test` and is refused; one naming `other` passes
+    // the key check and the route reports the model is not loaded. A query
+    // `?model=` does not select the model and cannot steer the check.
     for (
-        const auto& [target, body] :
-        std::vector<std::pair<std::string, std::string>>{
-            {"/v1/completions", completion},
+        const auto& [target, body, status] :
+        std::vector<std::tuple<std::string, std::string, int>>{
+            {"/v1/completions", completion, 403},
             {"/v1/completions",
-             R"({"model":"other","prompt":"hi","max_tokens":1})"},
-            {"/v1/completions?model=other", completion},
-            {"/completion", R"({"model":"other","prompt":"hi"})"},
+             R"({"model":"other","prompt":"hi","max_tokens":1})", 404},
+            {"/v1/completions?model=other", completion, 403},
+            {"/completion", R"({"model":"other","prompt":"hi"})", 404},
             {"/v1/chat/completions",
-             R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"},
-            {"/peer", ""}}) {
+             R"({"model":"other","messages":[{"role":"user","content":"hi"}]})",
+             404},
+            {"/peer", "", 403}}) {
       const auto response =
           send("bob-secret", body.empty() ? "GET" : "POST", target, body);
-      ExpectStatus(response, 403);
-      assert(response.find("model_not_allowed") != std::string::npos);
+      ExpectStatus(response, status);
+      if (status == 403)
+        assert(response.find("model_not_allowed") != std::string::npos);
     }
     assert(server.backend->calls == 1);
     // A monitoring key reads status routes and nothing else.
@@ -3545,6 +3589,7 @@ int main() {
   TestAuthorization();
   TestApiKeyFileParsing();
   TestApiKeyFile();
+  TestApiKeyFileSessionClasses();
   TestFramingAndMetrics();
   TestExpectContinue();
   TestFallbackBackendMetrics();

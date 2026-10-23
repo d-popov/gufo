@@ -2340,7 +2340,24 @@ std::string HttpServer::route_model_id(const HttpRequest& req) const {
     return video_jobs_ != nullptr ? "minimax-h3" : "";
   if (embeddings_ != nullptr && IsEmbeddingsApiPath(req.path))
     return embeddings_->model_id();
-  return backend_ != nullptr ? backend_->model_id() : "";
+  if (backend_ == nullptr)
+    return "";
+  // Text routes run on the served model their JSON body names (session
+  // classes), or on the first one: ResolveServedModel is the dispatch rule.
+  // A name no class serves is returned as is; the route answers 404.
+  std::optional<std::string> requested;
+  try {
+    const auto body = json::parse(req.body);
+    if (const auto* model = body.is_object() ? body.find("model") : nullptr;
+        model != nullptr && model->is_string())
+      requested = model->str();
+  } catch (const std::exception&) {
+    // No JSON body: the first served model.
+  }
+  const auto served = ResolveServedModel(
+      *backend_,
+      requested ? std::optional<std::string_view>(*requested) : std::nullopt);
+  return served ? served->id : requested.value_or("");
 }
 
 void HttpServer::handle_connection(int client_fd) {
