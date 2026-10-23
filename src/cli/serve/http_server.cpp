@@ -1120,8 +1120,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   sampling::SamplingConfig sampling_config;
   if (auto error = ReadCompatibilityOptions(
           body, b, &chat.model, "max_output_tokens", &max_tokens,
-          &sampling_config,
-          chat.reasoning.enabled,
+          &sampling_config, chat.reasoning.enabled,
           {.stream = true, .response_controls = true})) {
     return std::move(*error);
   }
@@ -1237,15 +1236,14 @@ std::optional<HttpResponse> ReadAnthropicChat(
     if (auto error = ReadMessagesOutputConfig(body, &chat->reasoning))
       return error;
   }
-  if (auto error =
-          ReadCompatibilityOptions(body, b, &chat->model, "max_tokens",
-                                   max_tokens,
-                                   sampling_config, chat->reasoning.enabled,
-                                   {.stop_field = "stop_sequences",
-                                    .stream = true,
-                                    .thinking = true,
-                                    .output_config = true,
-                                    .tools = true})) {
+  if (auto error = ReadCompatibilityOptions(body, b, &chat->model, "max_tokens",
+                                            max_tokens, sampling_config,
+                                            chat->reasoning.enabled,
+                                            {.stop_field = "stop_sequences",
+                                             .stream = true,
+                                             .thinking = true,
+                                             .output_config = true,
+                                             .tools = true})) {
     return error;
   }
   if (auto error = ParseAnthropicToolControls(body, chat))
@@ -1495,7 +1493,8 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
     json::Value slot = json::Value::object();
     slot["id"] = index;
     // Sessions of a class report its model and context.
-    slot["n_ctx"] = session.context > 0 ? std::size_t{session.context} : context;
+    slot["n_ctx"] =
+        session.context > 0 ? std::size_t{session.context} : context;
     slot["speculative"] = session.speculative;
     slot["is_processing"] = session.processing;
     slot["id_task"] = task;

@@ -9,8 +9,8 @@
 #include <deque>
 #include <exception>
 #include <fstream>
-#include <iomanip>
 #include <initializer_list>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -684,8 +684,8 @@ struct TextGenerationScheduler::Impl {
   /// Sessions each class holds or reserves across the given request lists.
   /// Reuses one scheduler-thread buffer; valid until the next call.
   [[nodiscard]] std::span<std::size_t> Occupancy(
-      std::initializer_list<const std::deque<std::shared_ptr<ScheduledRequest>>*>
-          lists) {
+      std::initializer_list<
+          const std::deque<std::shared_ptr<ScheduledRequest>>*> lists) {
     held_sessions.assign(runner_pool->classes().size(), 0);
     for (const auto* list : lists)
       for (const auto& request : *list)
@@ -699,7 +699,8 @@ struct TextGenerationScheduler::Impl {
       std::span<const std::size_t> held) const {
     for (const auto& client : queued_clients)
       for (const auto& request : client.requests)
-        if (held[request->session_class] < ClassCapacity(request->session_class))
+        if (held[request->session_class] <
+            ClassCapacity(request->session_class))
           return true;
     return false;
   }
@@ -728,14 +729,14 @@ struct TextGenerationScheduler::Impl {
       // count of requests here, so one of its sessions is always free.
       {
         const std::lock_guard<std::mutex> sessions_lock(sessions->mutex);
-        const auto first = sessions->requests.begin() +
-                           static_cast<std::ptrdiff_t>(
-                               class_first[request->session_class]);
-        const auto free = std::find(
-            first,
-            first + static_cast<std::ptrdiff_t>(
-                        ClassCapacity(request->session_class)),
-            nullptr);
+        const auto first =
+            sessions->requests.begin() +
+            static_cast<std::ptrdiff_t>(class_first[request->session_class]);
+        const auto free =
+            std::find(first,
+                      first + static_cast<std::ptrdiff_t>(
+                                  ClassCapacity(request->session_class)),
+                      nullptr);
         if (free != first + static_cast<std::ptrdiff_t>(
                                 ClassCapacity(request->session_class))) {
           request->session =
@@ -1152,10 +1153,9 @@ struct TextGenerationScheduler::Impl {
       return true;
     return leader->runner_request.prefill_position() ==
                request->prefix_position &&
-           runner_pool->CachedPrefixTokens(request->prompt,
-                                           request->prompt_context.get(),
-                                           request->session_class) >=
-               request->prefix_position;
+           runner_pool->CachedPrefixTokens(
+               request->prompt, request->prompt_context.get(),
+               request->session_class) >= request->prefix_position;
   }
 
   /// Drops stopped parked requests and releases settled ones in arrival
@@ -1266,11 +1266,10 @@ struct TextGenerationScheduler::Impl {
         if (CompleteIfStopped(request)) {
           continue;
         }
-        if (WaitForSharedPrefix(
-                request, residents,
-                static_cast<std::size_t>(
-                    std::ranges::count(waiting, request->session_class,
-                                       &ScheduledRequest::session_class)))) {
+        if (WaitForSharedPrefix(request, residents,
+                                static_cast<std::size_t>(std::ranges::count(
+                                    waiting, request->session_class,
+                                    &ScheduledRequest::session_class)))) {
           waiting.push_back(std::move(request));
           continue;
         }

@@ -3741,8 +3741,8 @@ HttpResponse CreateCompatibilityResponse(
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
   const auto run = [generation, initial, chat, markers, closers,
-                    model = chat.model.empty() ? backend.model_id()
-                                               : chat.model,
+                    model =
+                        chat.model.empty() ? backend.model_id() : chat.model,
                     stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);

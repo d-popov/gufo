@@ -253,13 +253,14 @@ struct ComponentTextCache::Impl {
         klass.adapter = klass.owned.get();
         klass.identity = klass.adapter->CompatibilityIdentity();
         // Classes never share state, even at an equal context.
-        const auto suffix = "\nsession_class=" + session_class.name +
-                            "\nsession_context=" +
-                            std::to_string(session_class.max_context) + '\n';
+        const auto suffix =
+            "\nsession_class=" + session_class.name +
+            "\nsession_context=" + std::to_string(session_class.max_context) +
+            '\n';
         klass.identity.insert(klass.identity.end(), suffix.begin(),
                               suffix.end());
-        described += (described.empty() ? "" : ",") + session_class.name +
-                     ':' + std::to_string(session_class.count) + 'x' +
+        described += (described.empty() ? "" : ",") + session_class.name + ':' +
+                     std::to_string(session_class.count) + 'x' +
                      std::to_string(session_class.max_context);
       } else {
         klass.adapter = resources->adapter.get();
@@ -268,8 +269,7 @@ struct ComponentTextCache::Impl {
       crypto::Sha256Hasher hash;
       hash.Update(klass.identity);
       klass.digest = hash.Finish();
-      index.Register(klass.identity, klass.adapter->Components(),
-                     klass.digest);
+      index.Register(klass.identity, klass.adapter->Components(), klass.digest);
       count += session_class.count;
       classes.push_back(std::move(klass));
     }
@@ -307,9 +307,8 @@ struct ComponentTextCache::Impl {
                                    [this] {
                                      const std::lock_guard lock(mutex);
                                      return std::ranges::none_of(
-                                         entries, [](const auto& e) {
-                                           return e->busy;
-                                         });
+                                         entries,
+                                         [](const auto& e) { return e->busy; });
                                    },
                                    resources->reassignment_batch_size});
         entries.push_back(std::move(entry));
@@ -429,9 +428,8 @@ struct ComponentTextCache::Impl {
                       FindClass(description->Manifest().compatibility)) {
                 auto found = index.Lookup(
                     {klass->identity, description->Manifest().tokens,
-                     cache::InputIdentity(
-                         description->Manifest().tokens.size(),
-                         description->Manifest().input)});
+                     cache::InputIdentity(description->Manifest().tokens.size(),
+                                          description->Manifest().input)});
                 bool attached = false;
                 for (const auto& candidate : found.candidates) {
                   if (candidate.checkpoint &&
@@ -764,23 +762,21 @@ struct ComponentTextCache::Lease::Impl {
   cache::RetentionRequest Retain(
       std::span<const cache::Token> tokens,
       std::optional<std::size_t> new_payload_bytes = {}) const {
-    return {
-        .tokens = tokens,
-        .compatibility = klass().identity,
-        .input = At(input, std::min(tokens.size(), prompt.size())),
-        .purpose = Purpose(purpose),
-        .stable = std::min(stable, tokens.size()),
-        .source = source,
-        .preserve_source = preserve_source,
-        .new_payload_bytes =
-            new_payload_bytes
-                ? *new_payload_bytes
-                : entry->history->NewPayloadBytes(
-                      adapter().Positions(slot.Execution())),
-        .protected_checkpoints =
-            std::span(edit_boundaries).first(edit_boundary_count),
-        .reused = cached != 0,
-        .reused_tokens = cached};
+    return {.tokens = tokens,
+            .compatibility = klass().identity,
+            .input = At(input, std::min(tokens.size(), prompt.size())),
+            .purpose = Purpose(purpose),
+            .stable = std::min(stable, tokens.size()),
+            .source = source,
+            .preserve_source = preserve_source,
+            .new_payload_bytes =
+                new_payload_bytes ? *new_payload_bytes
+                                  : entry->history->NewPayloadBytes(
+                                        adapter().Positions(slot.Execution())),
+            .protected_checkpoints =
+                std::span(edit_boundaries).first(edit_boundary_count),
+            .reused = cached != 0,
+            .reused_tokens = cached};
   }
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
 };
@@ -881,8 +877,8 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     std::shared_ptr<cache::BorrowedRows> rows;
     if (completed) {
       if (inherited != completed) {
-        auto view = adapter().BorrowRowsView(
-            slot.Execution(), d.id, inherited, completed);
+        auto view = adapter().BorrowRowsView(slot.Execution(), d.id, inherited,
+                                             completed);
         if (!view.empty())
           rows = slot.Observe(d.id, inherited, completed, view);
       }
@@ -1019,13 +1015,10 @@ ComponentTextCache::ComponentTextCache(
     std::shared_ptr<TextModelRunner> runner, std::size_t count, std::size_t ram,
     const std::optional<TextRunnerDiskCacheOptions>& disk, bool automatic_ram,
     std::size_t ceiling)
-    : ComponentTextCache(
-          runner,
-          std::array{TextSessionClass{
-              .name = {},
-              .count = count,
-              .max_context = 0}},
-          ram, disk, automatic_ram, ceiling) {}
+    : ComponentTextCache(runner,
+                         std::array{TextSessionClass{
+                             .name = {}, .count = count, .max_context = 0}},
+                         ram, disk, automatic_ram, ceiling) {}
 ComponentTextCache::ComponentTextCache(
     std::shared_ptr<TextModelRunner> runner,
     std::span<const TextSessionClass> classes, std::size_t ram,
@@ -1056,8 +1049,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     const std::lock_guard lock(impl_->mutex);
     if (impl_->catalog)
       impl_->catalog->Reconcile();
-    found =
-        impl_->index.Lookup({klass.identity, prompt, input, stable, reuse});
+    found = impl_->index.Lookup({klass.identity, prompt, input, stable, reuse});
     // A miss reports how far a stored prompt agreed, so an empty cache can
     // be told apart from one holding only incompatible boundaries.
     if (reuse && !found.selected)
@@ -1252,18 +1244,18 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                 throw std::logic_error("RAM source has no readable view");
               const std::span<const std::byte> buffer(pin.Bytes().data(),
                                                       bytes);
-              transfers.Add(
-                  [&] { return impl_->resources->stream(); },
-                  [&](cache::Stream& stream) {
-                    return c.descriptor.kind ==
-                                   cache::ComponentKind::kPrivateState
-                               ? klass.adapter->LoadPrivate(
-                                     request.slot.Execution(), c.descriptor.id,
-                                     buffer, stream)
-                               : klass.adapter->CopyRowsIn(
-                                     request.slot.Execution(), c.descriptor.id,
-                                     first, end, buffer, stream);
-                  });
+              transfers.Add([&] { return impl_->resources->stream(); },
+                            [&](cache::Stream& stream) {
+                              return c.descriptor.kind ==
+                                             cache::ComponentKind::kPrivateState
+                                         ? klass.adapter->LoadPrivate(
+                                               request.slot.Execution(),
+                                               c.descriptor.id, buffer, stream)
+                                         : klass.adapter->CopyRowsIn(
+                                               request.slot.Execution(),
+                                               c.descriptor.id, first, end,
+                                               buffer, stream);
+                            });
               request.restored += bytes;
             };
             if (c.private_state)
@@ -1328,8 +1320,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           cache::TransferTiming timing;
           const auto id = candidate.durable->Manifest().checkpoint;
           restored = impl_->streaming->Restore(
-              id, klass.digest, *klass.adapter,
-              request.slot.Execution(), timing, {}, {},
+              id, klass.digest, *klass.adapter, request.slot.Execution(),
+              timing, {}, {},
               [this](bool private_file, cache::DiskFileId file) {
                 const std::lock_guard lock(impl_->mutex);
                 impl_->catalog->Invalidate(private_file, file);
@@ -1557,14 +1549,13 @@ std::size_t ComponentTextCache::Lease::CaptureBytes() const {
 std::size_t ComponentTextCache::Lease::CaptureBytes(
     std::size_t boundary) const {
   return impl_->entry->history->NewPayloadBytes(
-      impl_->adapter().PrefillCheckpointPositions(
-          impl_->slot.Execution(), boundary));
+      impl_->adapter().PrefillCheckpointPositions(impl_->slot.Execution(),
+                                                  boundary));
 }
 std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   auto& request = *impl_;
   auto& cache = *request.cache;
-  auto positions =
-      request.adapter().Positions(request.slot.Execution());
+  auto positions = request.adapter().Positions(request.slot.Execution());
   const auto bytes = request.entry->history->NewPayloadBytes(positions);
   const auto retain = request.Retain(request.capture_tokens, bytes);
   const auto refused = [&] {
@@ -1807,8 +1798,7 @@ std::size_t ComponentTextCache::Lease::Commit(
     Invalidate();
     return bytes;
   }
-  auto positions =
-      impl_->adapter().Positions(impl_->slot.Execution());
+  auto positions = impl_->adapter().Positions(impl_->slot.Execution());
   const auto location = impl_->slot.Location();
   impl_->slot.Commit();
   {

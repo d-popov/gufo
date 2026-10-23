@@ -316,9 +316,10 @@ bool AddSessionClass(std::string_view spec,
                      std::vector<server::TextSessionClass>* classes,
                      std::string* error) {
   const auto invalid = [&] {
-    *error = "--session-class expects NAME=COUNTxCONTEXT with COUNT and "
-             "CONTEXT at least 1, e.g. main=1x262144; got '" +
-             std::string(spec) + "'";
+    *error =
+        "--session-class expects NAME=COUNTxCONTEXT with COUNT and "
+        "CONTEXT at least 1, e.g. main=1x262144; got '" +
+        std::string(spec) + "'";
     return false;
   };
   std::string name;
@@ -1648,9 +1649,9 @@ int RunServe(std::span<const char* const> args) {
     if (session_classes.empty()) {
       load_log.Complete(
           "model=" + backend->model_id() +
-          " sessions=" + std::to_string(session_count) + " context_tokens=" +
-          std::to_string(backend->max_context()) + " speculative=" +
-          speculation + " draft_limit=" +
+          " sessions=" + std::to_string(session_count) +
+          " context_tokens=" + std::to_string(backend->max_context()) +
+          " speculative=" + speculation + " draft_limit=" +
           std::to_string(speculative_config.max_draft_tokens) +
           " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
     } else {

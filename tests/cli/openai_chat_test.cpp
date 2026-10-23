@@ -113,8 +113,8 @@ public:
   Result complete(std::string_view, std::size_t,
                   const gufo::sampling::SamplingConfig&,
                   const CancellationCheck&, const TokenCallback&,
-                  std::string_view, const std::vector<std::string>&,
-                  bool, std::string_view) override {
+                  std::string_view, const std::vector<std::string>&, bool,
+                  std::string_view) override {
     return {};
   }
 

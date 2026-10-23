@@ -1905,8 +1905,8 @@ public:
   // The held request decodes slowly, without blocking the scheduler, and
   // stops at its next selection once the test releases it. Other requests
   // therefore run while it is provably still decoding.
-  TextDecodeSelection SelectNext(TextRunnerState& state,
-                                 sampling::SamplerState& sampler) const override {
+  TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
     {
       const std::lock_guard lock(mutex);
       const auto label = labels.find(&state);
@@ -1959,8 +1959,7 @@ private:
       throw std::length_error("fake session context exceeded");
   }
 };
-std::vector<TextRunnerToken> Labelled(TextRunnerToken label,
-                                      std::size_t size) {
+std::vector<TextRunnerToken> Labelled(TextRunnerToken label, std::size_t size) {
   std::vector<TextRunnerToken> prompt(size);
   std::iota(prompt.begin(), prompt.end(), label * 1000);
   prompt.front() = label;
@@ -2049,20 +2048,19 @@ void SchedulerAdmitsOnlyIntoTheRequestClass() {
   const sampling::SamplingConfig greedy{.temperature = 0.0F};
   // One client queues a held main request, a second main request and a sub
   // request. The busy main class must hold back only its own second request.
-  auto first = scheduler.Submit(Labelled(1, 8), 0, greedy, {}, false,
-                                ClassMetadata(0));
-  auto second = scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false,
-                                 ClassMetadata(0));
-  auto sub = scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false,
-                              ClassMetadata(1));
+  auto first =
+      scheduler.Submit(Labelled(1, 8), 0, greedy, {}, false, ClassMetadata(0));
+  auto second =
+      scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false, ClassMetadata(0));
+  auto sub =
+      scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false, ClassMetadata(1));
   // The sub class finishes while the main class is still held...
   assert(sub.Wait().completion_tokens == 4);
   {
     const std::lock_guard lock(runner->mutex);
     // ...and the second main request has not started.
-    assert(std::ranges::none_of(runner->events, [](const auto& event) {
-      return event.label == 2;
-    }));
+    assert(std::ranges::none_of(
+        runner->events, [](const auto& event) { return event.label == 2; }));
   }
   runner->Release();
   assert(first.Wait().finish_reason ==
@@ -2080,12 +2078,12 @@ void SchedulerQueueLimitsApplyPerClass() {
       pool, {},
       {.max_pending_requests = 1, .max_pending_requests_per_client = 1});
   const sampling::SamplingConfig greedy{.temperature = 0.0F};
-  auto first = scheduler.Submit(Labelled(1, 8), 0, greedy, {}, false,
-                                ClassMetadata(0));
+  auto first =
+      scheduler.Submit(Labelled(1, 8), 0, greedy, {}, false, ClassMetadata(0));
   AwaitDecoding(*runner);
   // The main class's one pending place is taken...
-  auto queued = scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false,
-                                 ClassMetadata(0));
+  auto queued =
+      scheduler.Submit(Labelled(2, 8), 4, greedy, {}, false, ClassMetadata(0));
   bool refused = false;
   try {
     (void)scheduler.Submit(Labelled(4, 8), 4, greedy, {}, false,
@@ -2096,8 +2094,8 @@ void SchedulerQueueLimitsApplyPerClass() {
   }
   assert(refused);
   // ...which leaves the idle sub class's own place free for the same client.
-  auto sub = scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false,
-                              ClassMetadata(1));
+  auto sub =
+      scheduler.Submit(Labelled(3, 8), 4, greedy, {}, false, ClassMetadata(1));
   assert(sub.Wait().completion_tokens == 4);
   runner->Release();
   (void)first.Wait();
@@ -2134,11 +2132,11 @@ void SchedulerLimitsAndBatchesEachClassAtItsContext() {
   assert(refused);
   // Without a limit the sub request generates until its context is full,
   // decoding alongside the held main request in shared batches.
-  auto main = scheduler.Submit(Labelled(2, 10), 0, greedy, {}, false,
-                               ClassMetadata(0));
+  auto main =
+      scheduler.Submit(Labelled(2, 10), 0, greedy, {}, false, ClassMetadata(0));
   AwaitDecoding(*runner);
-  auto sub = scheduler.Submit(Labelled(3, 10), 0, greedy, {}, false,
-                              ClassMetadata(1));
+  auto sub =
+      scheduler.Submit(Labelled(3, 10), 0, greedy, {}, false, ClassMetadata(1));
   assert(sub.Wait().completion_tokens == 54);
   const auto states = scheduler.SessionStates();
   assert(states.size() == 2 && states[0].model == "main" &&

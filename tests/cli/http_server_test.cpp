@@ -167,7 +167,8 @@ public:
     last_cache_prompt = cache_prompt;
     // Like the scheduler, each served model limits prompts to its context.
     for (const auto& model_class : served)
-      if (model_class.id == model && prompt.size() >= model_class.context_length)
+      if (model_class.id == model &&
+          prompt.size() >= model_class.context_length)
         throw std::length_error("prompt exceeds the context of " +
                                 model_class.id);
     if (failure == 1)
@@ -2143,8 +2144,8 @@ void TestSessionClassRouting() {
   assert(models[1].member_str("id") == "sub" &&
          models[1].member_size("context_length") == 32);
 
-  auto response = server.Post("/v1/completions",
-                              R"({"model":"sub","prompt":"hello"})");
+  auto response =
+      server.Post("/v1/completions", R"({"model":"sub","prompt":"hello"})");
   ExpectStatus(response, 200);
   assert(server.backend->LastCall().model == "sub");
   assert(body(response).member_str("model") == "sub");
@@ -2152,15 +2153,14 @@ void TestSessionClassRouting() {
   ExpectStatus(server.Post("/v1/completions", R"({"prompt":"hello"})"), 200);
   assert(server.backend->LastCall().model == "main");
 
-  response = server.Post("/v1/completions",
-                         R"({"model":"test","prompt":"hello"})");
+  response =
+      server.Post("/v1/completions", R"({"model":"test","prompt":"hello"})");
   ExpectStatus(response, 404);
   assert(response.find("model_not_found") != std::string::npos);
 
   const std::string long_prompt(40, 'x');
-  response = server.Post(
-      "/v1/completions",
-      R"({"model":"sub","prompt":")" + long_prompt + R"("})");
+  response = server.Post("/v1/completions", R"({"model":"sub","prompt":")" +
+                                                long_prompt + R"("})");
   ExpectStatus(response, 400);
   assert(response.find("context_length_exceeded") != std::string::npos);
   ExpectStatus(server.Post("/v1/completions", R"({"model":"main","prompt":")" +
@@ -2174,8 +2174,9 @@ void TestSessionClassRouting() {
   assert(server.backend->LastCall().chat.model == "sub");
   assert(body(response).member_str("model") == "sub");
   ExpectStatus(
-      server.Post("/v1/chat/completions",
-                  R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"),
+      server.Post(
+          "/v1/chat/completions",
+          R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"),
       404);
 
   server.backend->sessions.resize(2);
@@ -2188,12 +2189,10 @@ void TestSessionClassRouting() {
          slots.items()[0].member_size("n_ctx") == 1000);
   assert(slots.items()[1].member_str("model") == "sub" &&
          slots.items()[1].member_size("n_ctx") == 32);
-  const auto props =
-      body(server.Send("GET /props?model=sub HTTP/1.1\r\n\r\n"));
+  const auto props = body(server.Send("GET /props?model=sub HTTP/1.1\r\n\r\n"));
   assert(props.member_str("model_alias") == "sub" &&
          props.member_size("total_slots") == 1 &&
-         props.find("default_generation_settings")->member_size("n_ctx") ==
-             32);
+         props.find("default_generation_settings")->member_size("n_ctx") == 32);
   const auto all = body(server.Send("GET /props HTTP/1.1\r\n\r\n"));
   assert(all.member_str("model_alias") == "test" &&
          all.member_size("total_slots") == 2);

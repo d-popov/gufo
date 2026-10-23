@@ -2882,8 +2882,7 @@ private:
   // Restart-safe with artifact fingerprints, else bound to this process's
   // loaded model. Both name the session context. Every class shares the
   // model's RoPE policy, which static YaRN derives from the largest one.
-  [[nodiscard]] cache::Identity ComponentIdentity(
-      std::uint32_t context) const {
+  [[nodiscard]] cache::Identity ComponentIdentity(std::uint32_t context) const {
     if (!artifact_fingerprint_.empty())
       return QwenFlashNextCompatibilityIdentity(
           artifact_fingerprint_, use_mtp_ ? mtp_fingerprint_ : std::string{},
@@ -2937,7 +2936,8 @@ struct InferenceBackend::Impl {
     [[nodiscard]] std::size_t SessionClass(std::string_view model) const {
       if (classes.empty() || model.empty())
         return 0;
-      const auto found = std::ranges::find(classes, model, &TextSessionClass::name);
+      const auto found =
+          std::ranges::find(classes, model, &TextSessionClass::name);
       if (found == classes.end())
         throw std::invalid_argument("model '" + std::string(model) +
                                     "' is not served by this process");
@@ -3606,9 +3606,10 @@ bool InferenceBackend::load(
     new_state->supports_images = model->VisionEncoder() != nullptr;
     if (!session_classes.empty()) {
       // Device state is claimed per session at its class's context.
-      const auto mode = speculative_config.backend == TextSpeculativeBackend::kMtp
-                            ? core::SessionMode::kSpeculative
-                            : core::SessionMode::kAutoregressive;
+      const auto mode =
+          speculative_config.backend == TextSpeculativeBackend::kMtp
+              ? core::SessionMode::kSpeculative
+              : core::SessionMode::kAutoregressive;
       std::ostringstream line;
       std::size_t context_tokens = 0, state_bytes = 0;
       line << "event=session_classes classes=";
@@ -3647,9 +3648,9 @@ bool InferenceBackend::load(
     }
     auto runner_pool =
         session_classes.empty()
-            ? std::make_shared<TextRunnerPool>(
-                  std::move(runner), session_count,
-                  std::move(runner_disk_cache), ram_cache_config)
+            ? std::make_shared<TextRunnerPool>(std::move(runner), session_count,
+                                               std::move(runner_disk_cache),
+                                               ram_cache_config)
             : std::make_shared<TextRunnerPool>(
                   std::move(runner), session_classes,
                   std::move(runner_disk_cache), ram_cache_config);
