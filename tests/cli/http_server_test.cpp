@@ -475,6 +475,8 @@ void TestApiKeyFileParsing() {
            {"alice" + good + " models=a models=b",
             "line 1: unknown or repeated"},
            {"alice" + good + " models=a,,b", "line 1: models"},
+           {"alice" + good + " models=", "line 1: models"},
+           {"alice" + good + " models=a,", "line 1: models"},
            {"alice" + good + " access=monitor models=a", "line 1: a monitor"},
            {"alice" + good + "\nalice sha256:" + ApiKeyDigest("x"),
             "line 2: duplicate key name"},
@@ -537,26 +539,30 @@ void TestApiKeyFile() {
     const auto peer = send("alice-secret", "GET", "/peer");
     ExpectStatus(peer, 200);
     assert(peer.ends_with("\r\n\r\nalice"));
-    // Without a model the request gets the default model, which alice may use.
+    // The text service's model is `test`, which alice may use.
     ExpectStatus(send("alice-secret", "POST", "/v1/completions", completion),
                  200);
     assert(server.backend->calls == 1);
 
-    // bob may only use `other`; this server's default model is `test`.
-    const auto refused =
-        send("bob-secret", "POST", "/v1/completions", completion);
-    ExpectStatus(refused, 403);
-    assert(refused.find("model_not_allowed") != std::string::npos);
-    ExpectStatus(send("bob-secret", "POST", "/v1/completions",
-                      R"({"model":"test","prompt":"hi","max_tokens":1})"),
-                 403);
-    // A permitted name passes the key check; the route then reports that the
-    // model is not loaded.
-    ExpectStatus(send("bob-secret", "POST", "/v1/completions",
-                      R"({"model":"other","prompt":"hi","max_tokens":1})"),
-                 404);
+    // bob may only use `other`. Naming `other` in the body or the query does
+    // not change which model the route reaches, so every text route refuses.
+    for (
+        const auto& [target, body] :
+        std::vector<std::pair<std::string, std::string>>{
+            {"/v1/completions", completion},
+            {"/v1/completions",
+             R"({"model":"other","prompt":"hi","max_tokens":1})"},
+            {"/v1/completions?model=other", completion},
+            {"/completion", R"({"model":"other","prompt":"hi"})"},
+            {"/v1/chat/completions",
+             R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"},
+            {"/peer", ""}}) {
+      const auto response =
+          send("bob-secret", body.empty() ? "GET" : "POST", target, body);
+      ExpectStatus(response, 403);
+      assert(response.find("model_not_allowed") != std::string::npos);
+    }
     assert(server.backend->calls == 1);
-
     // A monitoring key reads status routes and nothing else.
     for (const std::string target :
          {"/health", "/ready", "/v1/models", "/props", "/slots", "/metrics"}) {

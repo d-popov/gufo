@@ -2283,18 +2283,13 @@ std::optional<HttpResponse> HttpServer::authorize(HttpRequest& req) const {
                "metrics",
                "permission_error", "permission_denied");
   }
-  if (!key->models.empty() && req.method == "POST") {
-    // The model a request names, or the default model it would get. A body
-    // that is not a JSON object leaves model validation to the route.
-    std::string model = default_model_id();
-    try {
-      const auto body = json::parse(req.body);
-      if (const auto* named = body.is_object() ? body.find("model") : nullptr;
-          named != nullptr && named->is_string())
-        model = named->str();
-    } catch (const std::exception&) {
-    }
-    if (!key->allows_model(model)) {
+  if (!key->models.empty() && !IsMonitoringRoute(req)) {
+    // Every other route reaches a model, WebSocket upgrades included. Each
+    // service serves one model, so check the model of the service the route
+    // dispatches to; a model a client names in its body or query cannot
+    // steer this check.
+    const std::string model = route_model_id(req);
+    if (!model.empty() && !key->allows_model(model)) {
       const std::string message =
           "this API key may not use model '" + model + "'";
       return Err(403, "Forbidden", message.c_str(), "permission_error",
@@ -2302,6 +2297,22 @@ std::optional<HttpResponse> HttpServer::authorize(HttpRequest& req) const {
     }
   }
   return std::nullopt;
+}
+
+std::string HttpServer::route_model_id(const HttpRequest& req) const {
+  // Mirrors handle_request's dispatch. An unconfigured service yields "": its
+  // route answers 503 without reaching any model.
+  if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits")
+    return images_ != nullptr ? images_->model_id() : "";
+  if (req.path == "/v1/audio/speech/stream" || IsAudioTtsApiPath(req.path))
+    return tts_ != nullptr ? tts_->model_id() : "";
+  if (req.path == "/v1/realtime" || IsAudioAsrApiPath(req.path))
+    return asr_ != nullptr ? asr_->model_id() : "";
+  if (IsVideoApiPath(req.path))
+    return video_jobs_ != nullptr ? "minimax-h3" : "";
+  if (embeddings_ != nullptr && IsEmbeddingsApiPath(req.path))
+    return embeddings_->model_id();
+  return backend_ != nullptr ? backend_->model_id() : "";
 }
 
 void HttpServer::handle_connection(int client_fd) {

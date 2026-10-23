@@ -126,6 +126,9 @@ std::optional<ApiKeyTable> ApiKeyTable::Parse(std::string_view text,
         }
       } else if (option.starts_with("models=") && !models_seen) {
         models_seen = true;
+        // An empty list must not read as "no restriction".
+        if (option.size() == 7)
+          return fail("models must list served model names");
         for (const auto part : std::views::split(option.substr(7), ',')) {
           const std::string_view model(part.begin(), part.end());
           if (model.empty())

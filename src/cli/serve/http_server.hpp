@@ -159,6 +159,9 @@ private:
   [[nodiscard]] std::shared_ptr<const ApiKeyTable> api_keys() const;
   void reload_api_key_file();
   [[nodiscard]] std::string default_model_id() const;
+  /// The served model of the service `req`'s route dispatches to, or "" when
+  /// that service is not configured.
+  [[nodiscard]] std::string route_model_id(const HttpRequest& req) const;
   bool device_lost();
   void handle_connection(int client_fd);
   void reap_workers();

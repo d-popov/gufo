@@ -1099,9 +1099,11 @@ monitor  sha256:fcde2b...  access=monitor
   `/props`, `/slots` and `/metrics`. Every other route answers
   `403 permission_denied`. The default is `access=inference`, which allows
   every route.
-- **`models=A,B`** allows only the listed served model names. The check uses the
-  `model` field of a JSON `POST` body; a request that names no model gets the
-  server's default model, which must be listed. Other models answer
+- **`models=A,B`** allows only the listed served model names, on every route
+  except the monitoring ones above, WebSocket upgrades included. The check
+  uses the model of the service the route reaches (text, speech,
+  transcription, image, embedding, or `minimax-h3` for video), not a name the
+  request supplies. An empty list is an error. Other models answer
   `403 model_not_allowed`.
 
 Names and credentials must be unique, and a file with no keys is an error.
