@@ -27,7 +27,8 @@ python3 tools/monitor/gufo-monitor.py --gufo http://127.0.0.1:8080
 Open `http://127.0.0.1:8099/` and log in with the monitor token. If the token file
 does not exist, the monitor creates it on first start at
 `$XDG_CONFIG_HOME/gufo-monitor/token` with mode 0600. Scripts can send the token as
-`Authorization: Bearer <token>`.
+`Authorization: Bearer <token>`. With `--trust-localhost`, browsers on the monitor's
+own host skip the login.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -44,6 +45,7 @@ does not exist, the monitor creates it on first start at
 | `--secure-cookie` | | always mark the login cookie `Secure` |
 | `--keys-file FILE` | none | the server's `--api-key-file`; enables the API keys section |
 | `--admin-token-file FILE` | `$XDG_CONFIG_HOME/gufo-monitor/admin-token` | admin token for changing keys, created if missing |
+| `--trust-localhost` | | browsers on this host need no monitor token ([Security](#security)) |
 
 Without `--log-source`, the recent-requests table and the request counts stay empty.
 Everything else works.
@@ -117,6 +119,13 @@ The monitor's own Gufo key can be a monitoring key (`access=monitor`): it only n
   the page or the monitor's own log.
 - **Monitor token:** every route except `/login` and `/static/*` requires it. Without
   it, API routes answer `401` and pages redirect to `/login`.
+- **`--trust-localhost`:** a request needs no monitor token when it comes from a
+  loopback address, its `Host` is `localhost` or a loopback address, and it carries no
+  proxy header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`,
+  `CF-Connecting-IP`). The `Host` check stops DNS rebinding; the proxy headers keep a
+  tunnel or reverse proxy on the same host from passing remote clients through. Every
+  local user and process can then read the page. Changing keys still takes the admin
+  token.
 - **Login cookie:** it holds an HMAC of the token, not the token itself. It is `HttpOnly`
   and `SameSite=Strict`, and also `Secure` with `--secure-cookie` or behind a proxy that
   sends `X-Forwarded-Proto: https`.

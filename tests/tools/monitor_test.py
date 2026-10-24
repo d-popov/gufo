@@ -523,5 +523,56 @@ class KeyAdminHttpTest(unittest.TestCase):
             plain.server_close()
 
 
+class TrustLocalhostTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.keys = Path(self.directory.name) / "api_keys"
+        self.keys.write_text("watch sha256:" + "ab" * 32 + " access=monitor\n")
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        admin = gm.Auth("admin", gm.ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1", "X-Admin-Token")
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.Auth(MONITOR_TOKEN), False,
+                                      gm.KeyStore(self.keys), admin, trust_localhost=True))
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.directory.cleanup()
+
+    def request(self, method, path, headers=None, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
+                                                timeout=5)
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response, data
+
+    def test_browser_on_this_host_needs_no_token(self):
+        port = self.server.server_address[1]
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", "LOCALHOST", f"[::1]:{port}"):
+            response, _ = self.request("GET", "/api/state", {"Host": host})
+            self.assertEqual(response.status, 200, host)
+        response, data = self.request("GET", "/")
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'id="logout" hidden', data)
+        response, _ = self.request("GET", "/login")
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
+
+    def test_rebound_names_and_relayed_clients_still_need_the_token(self):
+        for headers in ({"Host": "evil.example"}, {"Host": "ai.d-popov.com:8099"},
+                        {"Host": "127.0.0.1.evil.example"}, {"X-Forwarded-For": "203.0.113.9"},
+                        {"CF-Connecting-IP": "203.0.113.9"}, {"Forwarded": "for=203.0.113.9"}):
+            response, _ = self.request("GET", "/api/state", headers)
+            self.assertEqual(response.status, 401, headers)
+        response, _ = self.request("GET", "/", {"Host": "evil.example"})
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/login"))
+
+    def test_changing_keys_still_needs_the_admin_token(self):
+        response, _ = self.request("POST", "/api/keys", {"Content-Type": "application/json"},
+                                   json.dumps({"name": "alice"}))
+        self.assertEqual(response.status, 403)
+        self.assertNotIn("alice", self.keys.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

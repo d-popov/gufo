@@ -22,6 +22,7 @@ import collections
 import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
 import math
 import os
@@ -45,6 +46,9 @@ STATIC_FILES = {
 }
 COOKIE_NAME = "gufo_monitor"
 COOKIE_MAX_AGE = 30 * 24 * 3600
+# Set by reverse proxies and tunnels: a loopback peer sending one relays another client.
+FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP",
+                      "CF-Connecting-IP")
 # Unlocking key management lasts an hour and is sent only to /api/.
 ADMIN_COOKIE_NAME = "gufo_monitor_admin"
 ADMIN_COOKIE_MAX_AGE = 3600
@@ -1073,18 +1077,31 @@ class Auth:
         return False
 
 
+def is_loopback(host: str | None) -> bool:
+    """Whether HOST (an address or host name, without port) names this host's loopback."""
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host or "")
+    except ValueError:
+        return False
+    return (getattr(address, "ipv4_mapped", None) or address).is_loopback
+
+
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, address, monitor: Monitor, auth: Auth, secure_cookie: bool,
-                 keys: KeyStore | None = None, admin: Auth | None = None):
+                 keys: KeyStore | None = None, admin: Auth | None = None,
+                 trust_localhost: bool = False):
         super().__init__(address, Handler)
         self.monitor = monitor
         self.auth = auth
         self.secure_cookie = secure_cookie
         self.keys = keys  # None: no --keys-file, the key routes answer 404
         self.admin = admin
+        self.trust_localhost = trust_localhost  # browsers on this host skip the monitor token
         self.streams = threading.BoundedSemaphore(MAX_STREAMS)
         self.stop = threading.Event()
 
@@ -1124,8 +1141,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _redirect(self, location: str, headers: tuple[tuple[str, str], ...] = ()):
         self._send(303, b"", "text/plain", (("Location", location), *headers))
 
+    def _from_this_host(self) -> bool:
+        """With --trust-localhost, a direct request from a browser on this host: a loopback
+        peer asking for a loopback name. The Host check stops DNS rebinding; forwarding
+        headers mark a local proxy or tunnel relaying another client."""
+        if not self.server.trust_localhost:
+            return False
+        if any(name in self.headers for name in FORWARDING_HEADERS):
+            return False
+        try:
+            host = urllib.parse.urlsplit("//" + self.headers.get("Host", "")).hostname
+        except ValueError:
+            return False
+        return is_loopback(self.client_address[0]) and is_loopback(host)
+
     def _authorized(self) -> bool:
-        return self.server.auth.check_request(self.headers)
+        return self._from_this_host() or self.server.auth.check_request(self.headers)
 
     def _secure(self) -> bool:
         return self.server.secure_cookie or self.headers.get("X-Forwarded-Proto", "") == "https"
@@ -1241,6 +1272,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
         if path == "/login":
+            if self._from_this_host():
+                return self._redirect("/")
             return self._login_page(error=False)
         if path == "/favicon.ico":
             return self._send(204, b"", "text/plain")
@@ -1249,7 +1282,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(401, b'{"error":"unauthorized"}')
             return self._redirect("/login")
         if path in ("/", "/index.html"):
-            return self._file("index.html", "text/html; charset=utf-8")
+            return self._index()
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
@@ -1280,6 +1313,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if content_type is None:
             return self._json(404, b'{"error":"not_found"}')
         self._file(name, content_type, cache="no-cache")
+
+    def _index(self):
+        try:
+            body = (STATIC_DIR / "index.html").read_bytes()
+        except OSError:
+            return self._json(404, b'{"error":"not_found"}')
+        if self._from_this_host():  # no login, so nothing to log out of
+            body = body.replace(b'id="logout"', b'id="logout" hidden', 1)
+        self._send(200, body, "text/html; charset=utf-8")
 
     def _login_page(self, error: bool, status: int = 200):
         try:
@@ -1365,6 +1407,9 @@ def parse_args(argv=None):
     parser.add_argument("--admin-token-file", type=Path,
                         default=config / "gufo-monitor" / "admin-token",
                         help="admin token for managing keys; created (mode 0600) if missing")
+    parser.add_argument("--trust-localhost", action="store_true",
+                        help="browsers on this host need no monitor token; changing keys "
+                             "still takes the admin token")
     args = parser.parse_args(argv)
     if args.poll < 0.2:
         parser.error("--poll must be at least 0.2 s")
@@ -1392,7 +1437,7 @@ def main(argv=None) -> int:
         admin = Auth(load_or_create_token(args.admin_token_file, "admin token"),
                      ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1", "X-Admin-Token")
     server = Server((args.bind, args.port), monitor, Auth(token), args.secure_cookie,
-                    keys, admin)
+                    keys, admin, args.trust_localhost)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":
