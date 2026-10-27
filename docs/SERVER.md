@@ -227,6 +227,18 @@ cost.
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
+`--decode-rounds N` runs every active decoder N rounds after each prefill chunk
+instead of one. On Flash-Next MTP, one decoding stream beside a cold 37.6K-token
+prefill gave (solo prefill 22.8 s, solo decode about 170 characters/s):
+
+| `--prefill-chunk` | `--decode-rounds` | Prefill | Decode during prefill |
+| --- | --- | --- | --- |
+| 512 | 1 | 41.4 s | 10.9 characters/s |
+| 1024 | 8 | 40.5 s | 50.6 characters/s |
+| 2048 | 16 | 36.3 s | 52.4 characters/s |
+
+One run each, MTP only. Decode still pauses for one chunk between bursts (0.8 s
+at 1024, 1.7 s at 2048).
 
 Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
 hash and exact encoded-byte comparison under the preprocessing version and

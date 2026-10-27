@@ -1998,6 +1998,8 @@ struct TextGenerationScheduler::Impl {
     std::deque<std::shared_ptr<ScheduledRequest>> capturing;
     // Cold requests waiting for a resident prefill of their shared prefix.
     std::deque<std::shared_ptr<ScheduledRequest>> waiting;
+    // Rounds still owed to decoders before the next prefill chunk.
+    std::size_t decode_burst_left = 0;
     while (!stop_token.stop_requested()) {
       if (device_lost.load(std::memory_order_acquire))
         break;
@@ -2105,6 +2107,8 @@ struct TextGenerationScheduler::Impl {
             prefilling.push_back(std::move(request));
           }
         }
+        decode_burst_left =
+            std::max<std::size_t>(prefill_policy.decode_rounds, 1) - 1;
         MarkAllDecodersDue(decoding);
         continue;
       }
@@ -2136,6 +2140,11 @@ struct TextGenerationScheduler::Impl {
             else
               decoding.push_back(std::move(request));
           }
+        }
+        if (decode_burst_left > 0 && !prefilling.empty() &&
+            !HasDueDecoder(decoding)) {
+          --decode_burst_left;
+          MarkAllDecodersDue(decoding);
         }
         continue;
       }
