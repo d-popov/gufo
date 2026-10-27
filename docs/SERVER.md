@@ -229,16 +229,22 @@ Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 `--decode-rounds N` runs every active decoder N rounds after each prefill chunk
 instead of one. On Flash-Next MTP, one decoding stream beside a cold 37.6K-token
-prefill gave (solo prefill 22.8 s, solo decode about 170 characters/s):
+prefill gave (solo prefill 22.8 s = 1649 tok/s, solo decode about 170
+characters/s):
 
-| `--prefill-chunk` | `--decode-rounds` | Prefill | Decode during prefill |
-| --- | --- | --- | --- |
-| 512 | 1 | 41.4 s | 10.9 characters/s |
-| 1024 | 8 | 40.5 s | 50.6 characters/s |
-| 2048 | 16 | 36.3 s | 52.4 characters/s |
+| `--prefill-chunk` | `--decode-rounds` | Prefill | Prefill tok/s | Decode during prefill | Longest decode gap |
+| --- | --- | --- | --- | --- | --- |
+| 512 (default) | 1 (default) | 41.4 s | 909 | 10.9 characters/s | 0.75 s |
+| 1024 | 4 | 34.0 s | 1108 | 27.5 characters/s | 0.82 s |
+| 1024 | 8 | 40.5 s | 930 | 50.6 characters/s | 0.83 s |
+| 2048 | 8 | 30.4 s | 1238 | 29.1 characters/s | 1.70 s |
+| 2048 | 16 | 36.3 s | 1039 | 52.4 characters/s | 1.65 s |
 
-One run each, MTP only. Decode still pauses for one chunk between bursts (0.8 s
-at 1024, 1.7 s at 2048).
+Choose 1024/8 for prefill speed equal to the default with about 4.6 times its
+decode speed beside a prefill, or 2048/16 for about 14% faster prefill and the
+same decode speed at the cost of longer pauses. 1024/4 and 2048/8 favor prefill,
+for code agents that mostly read. One run each, Flash-Next MTP only; the
+defaults stay 512/1 for models not measured.
 
 Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
 hash and exact encoded-byte comparison under the preprocessing version and

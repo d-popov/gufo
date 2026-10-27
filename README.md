@@ -123,6 +123,12 @@ EOS or the context is full. `--context N` sets context capacity per session;
 `--max-tokens N` sets a default response limit that clients can override.
 Reasoning tokens count toward that response limit.
 
+Prompt processing beside active decoding: `--prefill-chunk` and
+`--decode-rounds` trade prefill speed against decode speed. On Flash-Next MTP,
+`--prefill-chunk 1024 --decode-rounds 8` keeps default prefill speed with about
+4.6 times the decode speed; `--prefill-chunk 2048 --decode-rounds 16` prefills
+about 14% faster. Measurements are in [docs/SERVER.md](docs/SERVER.md).
+
 ## Harness notes
 
 - **Qwen with Codex:** Codex sends developer messages mid-conversation, after
