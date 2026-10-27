@@ -3,10 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # ROCm 10.1.0 evaluation set from nixpkgs PR 573885 (not yet merged).
+    # ROCm 10.1.0 as rocmPackages_10, on nixos-unstable (gufo-org/nixpkgs
+    # rocm-10.1). Binaries for gfx1151 are on gufo.cachix.org.
     # Only the rocm10 package and shell use it; the default stays on the
     # nixpkgs ROCm release.
-    nixpkgs-rocm10.url = "github:randomizedcoder/nixpkgs/925eadb600eb3ee8f2d5d79f9d3796bf161893ce";
+    nixpkgs-rocm10.url = "github:gufo-org/nixpkgs/1a6ba8bc6f744f7a843d025e46bc9911b4b6c37d";
     # Reference ASR/TTS runtime for benchmark comparisons; exposes a
     # ROCm gfx1151 package tuned for Strix Halo.
     audio-cpp = {
@@ -47,15 +48,15 @@
       );
 
       # Evaluation build against ROCm 10.1.0. The whole package set comes from
-      # the PR so glibc, stdenv and the ROCm compiler stay consistent.
+      # nixpkgs-rocm10 so glibc, stdenv and the ROCm compiler stay consistent.
       gufoRocm10 = forAllSystems (
         system:
         let
           pkgsRocm10 = import nixpkgs-rocm10 { inherit system; };
         in
         (pkgsRocm10.callPackage ./.devops/nix/scope.nix { inherit revision; }).gufo.override {
-          # Kernel libraries built for gfx1151 only; there is no binary cache.
-          rocmPackages = pkgsRocm10.rocmPackages.gfx1151;
+          # Kernel libraries built for gfx1151 only, cached on gufo.cachix.org.
+          rocmPackages = pkgsRocm10.rocmPackages_10.gfx1151;
         }
       );
 
@@ -111,6 +112,7 @@
             ps.jsonschema # independent structured-output schema oracle
             lpipsRocm
             ps.numpy
+            ps.librosa # pinned official EmbeddingGemma audio decoder oracle
             ps.scipy
             ps.matplotlib # benchmark charts (tools/bench/model-bench.py render)
           ]
@@ -156,6 +158,15 @@
           release = base.override { inherit releaseVersion; };
           # ROCm 10.1.0 evaluation build; not a release or check input.
           rocm10 = gufoRocm10.${system};
+          # Windows test binaries of the platform leaves and the CPU cache,
+          # cross-built here and run on a Windows CI host.
+          windows-platform-tests =
+            pkgs.${system}.pkgsCross.mingwW64.callPackage ./.devops/nix/windows-platform-tests.nix
+              {
+                # The build-host ccache from the main package set, which the
+                # binary cache already holds.
+                inherit (pkgs.${system}) ccache;
+              };
           # Optional benchmark packages: excluded from Gufo, the default
           # development shell and hosted checks.
           ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
@@ -368,6 +379,8 @@
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
+              pkgsSys.libsndfile
+              pkgsSys.soxr
               pkgsSys.openssl
             ];
             src = staticAnalysisSource;
@@ -485,6 +498,8 @@
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
+              pkgsSys.libsndfile
+              pkgsSys.soxr
               pkgsSys.openssl
             ];
             src = testSource;

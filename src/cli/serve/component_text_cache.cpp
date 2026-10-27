@@ -1,7 +1,5 @@
 #include "src/cli/serve/component_text_cache.hpp"
 
-#include <sys/random.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -17,6 +15,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::server {
 namespace {
@@ -273,8 +272,7 @@ struct ComponentTextCache::Impl {
       count += session_class.count;
       classes.push_back(std::move(klass));
     }
-    if (getrandom(nonce.data(), nonce.size(), 0) !=
-        static_cast<ssize_t>(nonce.size()))
+    if (!platform::FillRandomBytes(nonce))
       throw std::runtime_error("cannot obtain cache publication nonce");
     if (options) {
       const auto row_bytes =

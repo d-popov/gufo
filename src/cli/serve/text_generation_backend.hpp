@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 #define GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -302,6 +303,14 @@ public:
   TextGenerationBackend& operator=(TextGenerationBackend&&) = delete;
 
   [[nodiscard]] virtual std::string model_id() const = 0;
+  /// Every name requests may select this model by, model_id() first.
+  [[nodiscard]] virtual std::vector<std::string> model_ids() const {
+    return {model_id()};
+  }
+  [[nodiscard]] bool serves_model(std::string_view name) const {
+    const auto names = model_ids();
+    return std::ranges::find(names, name) != names.end();
+  }
   [[nodiscard]] virtual bool ready() const = 0;
   /// True once a failed generation showed that the execution device can no
   /// longer run work, for example after a GPU reset. The loss is permanent.
@@ -310,9 +319,13 @@ public:
   /// Zero when no text model is loaded.
   [[nodiscard]] virtual std::uint32_t max_context() const { return 0; }
   /// Every model name requests may select, the first being the default.
-  /// Backends with session classes list one per class.
+  /// Backends with session classes list one per class; otherwise one per
+  /// model_ids() name, all at max_context().
   [[nodiscard]] virtual std::vector<ServedModel> served_models() const {
-    return {{model_id(), max_context()}};
+    std::vector<ServedModel> models;
+    for (auto& id : model_ids())
+      models.push_back({std::move(id), max_context()});
+    return models;
   }
   /// Live execution sessions; empty when the backend has no session pool.
   [[nodiscard]] virtual std::vector<SessionState> session_states() const {
@@ -403,6 +416,13 @@ public:
   /// Prompt tokens a chat request would use after template rendering, without
   /// generating. Empty when the backend cannot tell.
   [[nodiscard]] virtual std::optional<std::size_t> count_chat_tokens(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
+
+  /// The prompt text a chat request renders to through the model's chat
+  /// template, before tokenization. Empty when the backend cannot tell.
+  [[nodiscard]] virtual std::optional<std::string> render_chat_prompt(
       const ChatRequest&) const {
     return std::nullopt;
   }

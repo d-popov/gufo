@@ -6,17 +6,18 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <cstring>
 #include <exception>
 #include <map>
-#include <mutex>
 #include <string>
 #include <utility>
 
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/embedding_gemma2/batch_scheduler.hpp"
+#include "src/models/embedding_gemma2/hip/audio_runtime.hpp"
 #include "src/models/embedding_gemma2/hip/blas.hpp"
 #include "src/models/embedding_gemma2/hip/ops.hpp"
+#include "src/models/embedding_gemma2/hip/vision_ops.hpp"
 #include "src/models/embedding_gemma2/loader.hpp"
 
 namespace gufo::models::embedding_gemma2::hip {
@@ -96,6 +97,9 @@ DeviceBuffer UploadConcatenated(const TensorStore& store,
 /// bounds the float32 scratch. Unchunked, the gate/up buffer for 8,192 tokens
 /// would be 8,192 x 4,096 x 4 bytes = 134 MB and the QKV buffer about 100 MB.
 constexpr std::size_t kChunkTokens = 1024;
+// Gemm pads a chunk up to a row bucket, so the scratch behind every chunk must
+// hold a full chunk.
+static_assert(kMaxSequenceTokens % kChunkTokens == 0);
 
 /// Rotary cos/sin for every position up to the context limit, one pair of
 /// [position][head_dim / 2] tables per head width and base. The code computes
@@ -138,8 +142,18 @@ struct LayerWeights {
 
 struct EncoderRuntime::Impl {
   LoadResult loaded;
+  std::string model_dir;
+  struct Vision {
+    DeviceBuffer input, position_table, projection;
+    std::vector<LayerWeights> layers;
+    DeviceBuffer pixels, pixels_bf16, state, normed, qkv, query, key, value,
+        context, temp, gate_up, act, pooled, features;
+  };
+  std::unique_ptr<Vision> vision;
+  std::unique_ptr<AudioRuntime> audio;
   hipStream_t stream{nullptr};
   hipblasHandle_t blas{nullptr};
+  GemmLt gemm_lt;
 
   // Host staging for the per-batch index uploads. Asynchronous copies read
   // these until the stream is synchronized, so they outlive RunBatch.
@@ -154,44 +168,23 @@ struct EncoderRuntime::Impl {
   // Scratch, sized for kMaxSequenceTokens.
   DeviceBuffer token_ids, positions, sequence_begin, sequence_end, offsets;
   DeviceBuffer state, embeddings_bf16, normed_bf16, qkv_f32, query_bf16,
-      key_bf16, value_bf16, context_bf16, temp_f32, gate_up_f32, act_bf16,
-      ple_f32, gate_f32, projected_f32, pooled_f32;
+      key_bf16, value_bf16, value_t_bf16, context_bf16, temp_f32, gate_up_f32,
+      act_bf16, ple_f32, gate_f32, projected_f32, pooled_f32;
   // Target of the device probe that runs after a failed batch.
   DeviceBuffer probe;
   std::atomic<bool> lost{false};
 
-  // Device turns in arrival order, one batch each. A plain mutex lets the
-  // thread that just released it take it straight back, so a long request
-  // would still starve the requests queued behind it.
-  std::mutex turn_mutex;
-  std::condition_variable turn_changed;
-  std::uint64_t next_ticket{0};
-  std::uint64_t serving{0};
-
-  class Turn {
-  public:
-    explicit Turn(Impl& impl) : impl_(impl) {
-      std::unique_lock lock(impl_.turn_mutex);
-      const std::uint64_t ticket = impl_.next_ticket++;
-      impl_.turn_changed.wait(lock, [&] { return impl_.serving == ticket; });
-    }
-    ~Turn() {
-      {
-        const std::lock_guard lock(impl_.turn_mutex);
-        ++impl_.serving;
-      }
-      impl_.turn_changed.notify_all();
-    }
-    Turn(const Turn&) = delete;
-    Turn& operator=(const Turn&) = delete;
-    Turn(Turn&&) = delete;
-    Turn& operator=(Turn&&) = delete;
-
-  private:
-    Impl& impl_;
-  };
+  // Packs concurrent text calls into shared batches, gives each call with an
+  // image a batch of its own, and runs one batch at a time.
+  BatchScheduler scheduler{
+      kMaxSequenceTokens,
+      [this](const std::vector<const EncoderSequence*>& sequences,
+             std::vector<std::vector<float>>* embeddings, std::string* error) {
+        return OnDevice([&] { RunBatch(sequences, embeddings); }, error);
+      }};
 
   ~Impl() {
+    audio.reset();
     if (blas != nullptr) {
       gufo::hip::LogCleanupError(hipblasDestroy(blas));
     }
@@ -201,14 +194,32 @@ struct EncoderRuntime::Impl {
   }
 
   void Upload();
+  void LoadVision();
+  void RunVision(const ImagePatches& image, std::size_t offset);
   void Allocate();
   // Mirrors the text server's probe: after a reset even a 4-byte memset
   // fails, while an ordinary kernel or library failure leaves it working.
   [[nodiscard]] bool DeviceUsable();
 
-  void RunBatch(const std::vector<std::vector<std::uint32_t>>& sequences,
-                std::size_t first, std::size_t last, std::size_t tokens,
+  /// Runs one sequence for every GEMM row bucket, so hipBLASLt has tuned all
+  /// of them and every kernel is loaded before the first request.
+  void Warmup();
+
+  /// Y[tokens, m] = X[tokens, k] * W[m, k]^T through the tuned hipBLASLt
+  /// plan, or rocBLAS when hipBLASLt has none for the shape.
+  void Gemm(const void* weights, const void* inputs, float* output,
+            std::size_t tokens, std::size_t m, std::size_t k) {
+    if (!gemm_lt.Run(weights, inputs, output, tokens, m, k, kChunkTokens,
+                     stream)) {
+      LaunchGemmBf16(blas, weights, inputs, output, tokens, m, k, stream);
+    }
+  }
+
+  void RunBatch(const std::vector<const EncoderSequence*>& sequences,
                 std::vector<std::vector<float>>* embeddings);
+  // Runs scheduled device work and turns a failure into an error, confirming
+  // a lost device with the probe.
+  bool OnDevice(const std::function<void()>& work, std::string* error);
 };
 
 void EncoderRuntime::Impl::Upload() {
@@ -260,6 +271,121 @@ void EncoderRuntime::Impl::Upload() {
   }
 }
 
+void EncoderRuntime::Impl::LoadVision() {
+  if (vision)
+    return;
+  std::string processor_error;
+  if (!ValidateImageProcessor(model_dir, &processor_error))
+    throw std::runtime_error(processor_error);
+  auto weights = LoadModelDirectory(model_dir, true);
+  if (!weights.ok)
+    throw std::runtime_error(weights.error);
+  auto candidate = std::make_unique<Vision>();
+  const auto upload = [&](const std::string& name) {
+    const auto* tensor = weights.store->Find(name);
+    DeviceBuffer buffer(tensor->byte_count);
+    buffer.Upload(0, tensor->data, tensor->byte_count);
+    return buffer;
+  };
+  candidate->input = upload("vision_tower.patch_embedder.input_proj.weight");
+  candidate->position_table =
+      upload("vision_tower.patch_embedder.position_embedding_table");
+  candidate->projection = upload("embed_vision.embedding_projection.weight");
+  candidate->layers.resize(16);
+  for (unsigned i = 0; i < 16; ++i) {
+    auto& layer = candidate->layers[i];
+    const std::string p =
+        "vision_tower.encoder.layers." + std::to_string(i) + ".";
+    layer.input_norm = upload(p + "input_layernorm.weight");
+    layer.post_attention_norm = upload(p + "post_attention_layernorm.weight");
+    layer.pre_feedforward_norm = upload(p + "pre_feedforward_layernorm.weight");
+    layer.post_feedforward_norm =
+        upload(p + "post_feedforward_layernorm.weight");
+    layer.qkv = UploadConcatenated(*weights.store,
+                                   {p + "self_attn.q_proj.linear.weight",
+                                    p + "self_attn.k_proj.linear.weight",
+                                    p + "self_attn.v_proj.linear.weight"});
+    layer.output = upload(p + "self_attn.o_proj.linear.weight");
+    layer.query_norm = upload(p + "self_attn.q_norm.weight");
+    layer.key_norm = upload(p + "self_attn.k_norm.weight");
+    layer.gate_up = UploadConcatenated(
+        *weights.store,
+        {p + "mlp.gate_proj.linear.weight", p + "mlp.up_proj.linear.weight"});
+    layer.down = upload(p + "mlp.down_proj.linear.weight");
+  }
+  constexpr std::size_t n = 2520, h = 768;
+  candidate->pixels = DeviceBuffer(n * h * sizeof(float));
+  candidate->pixels_bf16 = DeviceBuffer(n * h * 2);
+  candidate->state = DeviceBuffer(n * h * sizeof(float));
+  candidate->normed = DeviceBuffer(n * h * 2);
+  candidate->qkv = DeviceBuffer(n * h * 3 * sizeof(float));
+  candidate->query = DeviceBuffer(n * h * 2);
+  candidate->key = DeviceBuffer(n * h * 2);
+  candidate->value = DeviceBuffer(n * h * 2);
+  candidate->context = DeviceBuffer(n * h * 2);
+  candidate->temp = DeviceBuffer(n * h * sizeof(float));
+  candidate->gate_up =
+      DeviceBuffer(std::min(n, kChunkTokens) * 6144 * sizeof(float));
+  candidate->act = DeviceBuffer(n * 3072 * 2);
+  candidate->pooled = DeviceBuffer(280 * h * 2);
+  candidate->features = DeviceBuffer(280 * 512 * sizeof(float));
+  vision = std::move(candidate);
+}
+
+void EncoderRuntime::Impl::RunVision(const ImagePatches& image,
+                                     std::size_t offset) {
+  LoadVision();
+  auto& v = *vision;
+  const std::size_t n = std::size_t{image.rows} * image.columns;
+  v.pixels.UploadAsync(0, image.pixels.data(),
+                       image.pixels.size() * sizeof(float), stream);
+  LaunchVisionPixels(v.pixels.get<float>(), v.pixels_bf16.get(), n * 768,
+                     stream);
+  LaunchGemmBf16(blas, v.input.get(), v.pixels_bf16.get(), v.temp.get<float>(),
+                 n, 768, 768, stream);
+  LaunchVisionPositions(v.temp.get<float>(), v.position_table.get(),
+                        v.state.get<float>(), n, image.columns, stream);
+  for (const auto& layer : v.layers) {
+    LaunchRmsNormToBf16(v.state.get<float>(), layer.input_norm.get(),
+                        v.normed.get(), n, 768, 1e-6F, stream);
+    LaunchGemmBf16(blas, layer.qkv.get(), v.normed.get(), v.qkv.get<float>(), n,
+                   2304, 768, stream);
+    LaunchVisionQkv(v.qkv.get<float>(), layer.query_norm.get(),
+                    layer.key_norm.get(), v.query.get(), v.key.get(),
+                    v.value.get(), n, image.columns, stream);
+    LaunchVisionAttention(v.query.get(), v.key.get(), v.value.get(),
+                          v.context.get(), n, stream);
+    LaunchGemmBf16(blas, layer.output.get(), v.context.get(),
+                   v.temp.get<float>(), n, 768, 768, stream);
+    LaunchRmsNormResidual(v.temp.get<float>(), layer.post_attention_norm.get(),
+                          v.state.get<float>(), n, 768, 1e-6F, stream);
+    LaunchRmsNormToBf16(v.state.get<float>(), layer.pre_feedforward_norm.get(),
+                        v.normed.get(), n, 768, 1e-6F, stream);
+    for (std::size_t row = 0; row < n; row += kChunkTokens) {
+      const std::size_t count = std::min(kChunkTokens, n - row);
+      LaunchGemmBf16(blas, layer.gate_up.get(),
+                     v.normed.get<std::uint16_t>() + row * 768,
+                     v.gate_up.get<float>(), count, 6144, 768, stream);
+      LaunchGeglu(v.gate_up.get<float>(),
+                  v.act.get<std::uint16_t>() + row * 3072, count, 3072, stream);
+    }
+    LaunchGemmBf16(blas, layer.down.get(), v.act.get(), v.temp.get<float>(), n,
+                   768, 3072, stream);
+    LaunchRmsNormResidual(v.temp.get<float>(),
+                          layer.post_feedforward_norm.get(),
+                          v.state.get<float>(), n, 768, 1e-6F, stream);
+  }
+  LaunchVisionPool(v.state.get<float>(), v.pooled.get(), image.rows,
+                   image.columns, stream);
+  LaunchGemmBf16(blas, v.projection.get(), v.pooled.get(),
+                 v.features.get<float>(), image.soft_tokens(), 512, 768,
+                 stream);
+  LaunchVisionInsert(v.features.get<float>(), state.get<float>() + offset * 512,
+                     embeddings_bf16.get<std::uint16_t>() + offset * 512,
+                     image.soft_tokens(), stream);
+  HIP_CHECK(hipGetLastError());
+}
+
 void EncoderRuntime::Impl::Allocate() {
   const TextConfig& text = loaded.config.text;
   std::size_t qkv_width = 0;
@@ -287,7 +413,10 @@ void EncoderRuntime::Impl::Allocate() {
   qkv_f32 = DeviceBuffer(std::min(n, kChunkTokens) * qkv_width * sizeof(float));
   query_bf16 = DeviceBuffer(n * query_width * 2U);
   key_bf16 = DeviceBuffer(n * key_width * 2U);
+  // The transposed copy the attention kernel reads has a stride that is a
+  // multiple of 32 tokens. The transpose zero-fills the tail of each column.
   value_bf16 = DeviceBuffer(n * key_width * 2U);
+  value_t_bf16 = DeviceBuffer(ValueStride(n) * key_width * 2U);
   context_bf16 = DeviceBuffer(n * query_width * 2U);
   temp_f32 = DeviceBuffer(n * hidden * sizeof(float));
   gate_up_f32 = DeviceBuffer(std::min(n, kChunkTokens) * 2U *
@@ -299,9 +428,19 @@ void EncoderRuntime::Impl::Allocate() {
   pooled_f32 = DeviceBuffer(n * text.embedding_dim * sizeof(float));
 }
 
+void EncoderRuntime::Impl::Warmup() {
+  std::vector<std::vector<float>> unused;
+  std::size_t rows = 0;
+  do {
+    rows = GemmLt::Bucket(rows + 1, kChunkTokens);
+    const EncoderSequence filler{std::vector<std::uint32_t>(rows, 1000), {}};
+    unused.clear();
+    RunBatch({&filler}, &unused);
+  } while (rows < kChunkTokens);
+}
+
 void EncoderRuntime::Impl::RunBatch(
-    const std::vector<std::vector<std::uint32_t>>& sequences, std::size_t first,
-    std::size_t last, std::size_t tokens,
+    const std::vector<const EncoderSequence*>& sequences,
     std::vector<std::vector<float>>* embeddings) {
   const TextConfig& text = loaded.config.text;
   const std::size_t hidden = text.hidden_size;
@@ -314,18 +453,19 @@ void EncoderRuntime::Impl::RunBatch(
   host_begin.clear();
   host_end.clear();
   host_offsets.assign(1, 0);
-  host_ids.reserve(tokens);
-  for (std::size_t s = first; s < last; ++s) {
+  for (const EncoderSequence* sequence : sequences) {
     const auto begin = static_cast<std::uint32_t>(host_ids.size());
-    const auto end = begin + static_cast<std::uint32_t>(sequences[s].size());
-    for (std::size_t t = 0; t < sequences[s].size(); ++t) {
-      host_ids.push_back(sequences[s][t]);
+    const auto end =
+        begin + static_cast<std::uint32_t>(sequence->tokens.size());
+    for (std::size_t t = 0; t < sequence->tokens.size(); ++t) {
+      host_ids.push_back(sequence->tokens[t]);
       host_positions.push_back(static_cast<std::uint32_t>(t));
       host_begin.push_back(begin);
       host_end.push_back(end);
     }
     host_offsets.push_back(end);
   }
+  const std::size_t tokens = host_ids.size();
   token_ids.UploadAsync(0, host_ids.data(), tokens * sizeof(std::uint32_t),
                         stream);
   positions.UploadAsync(0, host_positions.data(),
@@ -340,6 +480,22 @@ void EncoderRuntime::Impl::RunBatch(
   LaunchEmbeddingLookup(embed_table.get(), token_ids.get<std::uint32_t>(),
                         state.get<float>(), embeddings_bf16.get(), tokens,
                         hidden, kEmbedScale, stream);
+
+  for (std::size_t s = 0; s < sequences.size(); ++s) {
+    for (const auto& clip : sequences[s]->audio) {
+      if (!audio)
+        audio = std::make_unique<AudioRuntime>(model_dir, stream);
+      const auto* features =
+          audio->Run(clip.features, sequences[s]->is_cancelled);
+      const std::size_t offset = host_offsets[s] + clip.offset;
+      LaunchVisionInsert(features, state.get<float>() + offset * 512,
+                         embeddings_bf16.get<std::uint16_t>() + offset * 512,
+                         clip.features.soft_tokens(), stream);
+    }
+    for (const auto& image : sequences[s]->images) {
+      RunVision(image.patches, host_offsets[s] + image.offset);
+    }
+  }
 
   const float ple_scale = 1.0F / std::sqrt(static_cast<float>(hidden));
   for (std::size_t index = 0; index < layers.size(); ++index) {
@@ -359,10 +515,8 @@ void EncoderRuntime::Impl::RunBatch(
                         normed_bf16.get(), tokens, hidden, epsilon, stream);
     for (std::size_t row = 0; row < tokens; row += kChunkTokens) {
       const std::size_t rows = std::min(kChunkTokens, tokens - row);
-      LaunchGemmBf16(blas, layer.qkv.get(),
-                     normed_bf16.get<std::uint16_t>() + row * hidden,
-                     qkv_f32.get<float>(), rows, query_width + 2U * key_width,
-                     hidden, stream);
+      Gemm(layer.qkv.get(), normed_bf16.get<std::uint16_t>() + row * hidden,
+           qkv_f32.get<float>(), rows, query_width + 2U * key_width, hidden);
       LaunchQkvNormRope(qkv_f32.get<float>(), layer.query_norm.get(),
                         layer.key_norm.get(),
                         query_bf16.get<std::uint16_t>() + row * query_width,
@@ -372,7 +526,9 @@ void EncoderRuntime::Impl::RunBatch(
                         rope_table.cos.get<float>(),
                         rope_table.sin.get<float>(), epsilon, stream);
     }
-    if (!LaunchAttention(query_bf16.get(), key_bf16.get(), value_bf16.get(),
+    LaunchTransposeValues(value_bf16.get(), value_t_bf16.get(), tokens,
+                          static_cast<std::uint32_t>(key_width), stream);
+    if (!LaunchAttention(query_bf16.get(), key_bf16.get(), value_t_bf16.get(),
                          context_bf16.get(),
                          sequence_begin.get<std::uint32_t>(),
                          sequence_end.get<std::uint32_t>(), tokens, layout,
@@ -381,9 +537,9 @@ void EncoderRuntime::Impl::RunBatch(
     }
     for (std::size_t row = 0; row < tokens; row += kChunkTokens) {
       const std::size_t rows = std::min(kChunkTokens, tokens - row);
-      LaunchGemmBf16(blas, layer.output.get(),
-                     context_bf16.get<std::uint16_t>() + row * query_width,
-                     temp_f32.get<float>(), rows, hidden, query_width, stream);
+      Gemm(layer.output.get(),
+           context_bf16.get<std::uint16_t>() + row * query_width,
+           temp_f32.get<float>(), rows, hidden, query_width);
       LaunchRmsNormResidual(
           temp_f32.get<float>(), layer.post_attention_norm.get(),
           state.get<float>() + row * hidden, rows, hidden, epsilon, stream);
@@ -393,20 +549,17 @@ void EncoderRuntime::Impl::RunBatch(
                         normed_bf16.get(), tokens, hidden, epsilon, stream);
     for (std::size_t row = 0; row < tokens; row += kChunkTokens) {
       const std::size_t rows = std::min(kChunkTokens, tokens - row);
-      LaunchGemmBf16(blas, layer.gate_up.get(),
-                     normed_bf16.get<std::uint16_t>() + row * hidden,
-                     gate_up_f32.get<float>(), rows,
-                     2U * text.intermediate_size, hidden, stream);
+      Gemm(layer.gate_up.get(), normed_bf16.get<std::uint16_t>() + row * hidden,
+           gate_up_f32.get<float>(), rows, 2U * text.intermediate_size, hidden);
       LaunchGeglu(gate_up_f32.get<float>(),
                   act_bf16.get<std::uint16_t>() + row * text.intermediate_size,
                   rows, text.intermediate_size, stream);
     }
     for (std::size_t row = 0; row < tokens; row += kChunkTokens) {
       const std::size_t rows = std::min(kChunkTokens, tokens - row);
-      LaunchGemmBf16(
-          blas, layer.down.get(),
-          act_bf16.get<std::uint16_t>() + row * text.intermediate_size,
-          temp_f32.get<float>(), rows, hidden, text.intermediate_size, stream);
+      Gemm(layer.down.get(),
+           act_bf16.get<std::uint16_t>() + row * text.intermediate_size,
+           temp_f32.get<float>(), rows, hidden, text.intermediate_size);
       LaunchRmsNormResidual(
           temp_f32.get<float>(), layer.post_feedforward_norm.get(),
           state.get<float>() + row * hidden, rows, hidden, epsilon, stream);
@@ -420,20 +573,18 @@ void EncoderRuntime::Impl::RunBatch(
       float* const state_rows = state.get<float>() + row * hidden;
       std::uint16_t* const normed_rows =
           normed_bf16.get<std::uint16_t>() + row * hidden;
-      LaunchGemmBf16(
-          blas,
-          ple_projection.get<std::byte>() + index * per_layer * hidden * 2U,
-          embeddings_bf16.get<std::uint16_t>() + row * hidden,
-          ple_f32.get<float>(), rows, per_layer, hidden, stream);
+      Gemm(ple_projection.get<std::byte>() + index * per_layer * hidden * 2U,
+           embeddings_bf16.get<std::uint16_t>() + row * hidden,
+           ple_f32.get<float>(), rows, per_layer, hidden);
       LaunchScaledRmsNorm(ple_f32.get<float>(), ple_norm.get(), rows, per_layer,
                           ple_scale, epsilon, stream);
       LaunchFloatToBf16(state_rows, normed_rows, rows * hidden, stream);
-      LaunchGemmBf16(blas, layer.ple_gate.get(), normed_rows,
-                     gate_f32.get<float>(), rows, per_layer, hidden, stream);
+      Gemm(layer.ple_gate.get(), normed_rows, gate_f32.get<float>(), rows,
+           per_layer, hidden);
       LaunchPleGate(gate_f32.get<float>(), ple_f32.get<float>(), act_bf16.get(),
                     rows * per_layer, stream);
-      LaunchGemmBf16(blas, layer.ple_projection.get(), act_bf16.get(),
-                     temp_f32.get<float>(), rows, hidden, per_layer, stream);
+      Gemm(layer.ple_projection.get(), act_bf16.get(), temp_f32.get<float>(),
+           rows, hidden, per_layer);
       LaunchPleResidual(temp_f32.get<float>(), layer.ple_post_norm.get(),
                         layer.layer_scalar.get(), state_rows, rows, hidden,
                         epsilon, stream);
@@ -443,10 +594,13 @@ void EncoderRuntime::Impl::RunBatch(
 
   LaunchRmsNormToBf16(state.get<float>(), final_norm.get(), normed_bf16.get(),
                       tokens, hidden, epsilon, stream);
-  LaunchGemmBf16(blas, embedding_projection.get(), normed_bf16.get(),
-                 projected_f32.get<float>(), tokens, text.embedding_dim, hidden,
-                 stream);
-  const std::size_t count = last - first;
+  for (std::size_t row = 0; row < tokens; row += kChunkTokens) {
+    Gemm(embedding_projection.get(),
+         normed_bf16.get<std::uint16_t>() + row * hidden,
+         projected_f32.get<float>() + row * text.embedding_dim,
+         std::min(kChunkTokens, tokens - row), text.embedding_dim, hidden);
+  }
+  const std::size_t count = sequences.size();
   if (!LaunchMeanPoolNormalize(
           projected_f32.get<float>(), offsets.get<std::uint32_t>(),
           pooled_f32.get<float>(), count, text.embedding_dim, stream)) {
@@ -464,6 +618,30 @@ void EncoderRuntime::Impl::RunBatch(
         host.begin() + static_cast<std::ptrdiff_t>(s * text.embedding_dim),
         host.begin() +
             static_cast<std::ptrdiff_t>((s + 1U) * text.embedding_dim));
+  }
+}
+
+bool EncoderRuntime::Impl::OnDevice(const std::function<void()>& work,
+                                    std::string* error) {
+  if (lost.load(std::memory_order_acquire)) {
+    *error = kDeviceLostMessage;
+    return false;
+  }
+  try {
+    work();
+    return true;
+  } catch (const std::exception& failure) {
+    // Kernels from the failed work may still be queued. They read the index
+    // buffers the next batch overwrites, so drain the stream before the next
+    // batch starts.
+    gufo::hip::LogCleanupError(hipStreamSynchronize(stream));
+    if (!DeviceUsable()) {
+      lost.store(true, std::memory_order_release);
+      *error = std::string(kDeviceLostMessage) + ": " + failure.what();
+      return false;
+    }
+    *error = std::string("embedding_gemma2: ") + failure.what();
+    return false;
   }
 }
 
@@ -489,6 +667,7 @@ std::unique_ptr<EncoderRuntime> EncoderRuntime::Create(
   };
   auto impl = std::make_unique<Impl>();
   try {
+    impl->model_dir = model_dir;
     impl->loaded = LoadModelDirectory(model_dir);
     if (!impl->loaded.ok) {
       return fail(impl->loaded.error);
@@ -502,8 +681,14 @@ std::unique_ptr<EncoderRuntime> EncoderRuntime::Create(
     // its page-cache residency, about 650 MB of host memory.
     impl->loaded.store.reset();
     impl->loaded.mappings.clear();
+    impl->Warmup();
     return std::unique_ptr<EncoderRuntime>(new EncoderRuntime(std::move(impl)));
   } catch (const std::exception& failure) {
+    // Warm-up copies may still be queued. They read the host staging vectors
+    // that `impl` is about to destroy.
+    if (impl != nullptr && impl->stream != nullptr) {
+      gufo::hip::LogCleanupError(hipStreamSynchronize(impl->stream));
+    }
     return fail(std::string("embedding_gemma2: ") + failure.what());
   }
 }
@@ -520,6 +705,17 @@ bool EncoderRuntime::Embed(
     const std::vector<std::vector<std::uint32_t>>& sequences,
     std::vector<std::vector<float>>* embeddings, std::string* error,
     const std::function<bool()>& is_cancelled) {
+  std::vector<EncoderSequence> inputs;
+  inputs.reserve(sequences.size());
+  for (const auto& tokens : sequences)
+    inputs.push_back({tokens, {}});
+  return EmbedMultimodal(inputs, embeddings, error, is_cancelled);
+}
+
+bool EncoderRuntime::EmbedMultimodal(
+    const std::vector<EncoderSequence>& sequences,
+    std::vector<std::vector<float>>* embeddings, std::string* error,
+    const std::function<bool()>& is_cancelled) {
   const auto fail = [&](const std::string& message) {
     if (error != nullptr) {
       *error = message;
@@ -528,58 +724,67 @@ bool EncoderRuntime::Embed(
   };
   const TextConfig& text = impl_->loaded.config.text;
   for (const auto& sequence : sequences) {
-    if (sequence.empty()) {
+    if (sequence.tokens.empty()) {
       return fail("embedding_gemma2: empty token sequence");
     }
-    if (sequence.size() > kMaxSequenceTokens) {
+    if (sequence.tokens.size() > kMaxSequenceTokens) {
       return fail("embedding_gemma2: sequence exceeds " +
                   std::to_string(kMaxSequenceTokens) + " tokens");
     }
-    for (const std::uint32_t id : sequence) {
+    std::size_t previous_end = 0;
+    for (const auto& image : sequence.images) {
+      const auto& patches = image.patches;
+      const std::size_t n = patches.soft_tokens();
+      if (patches.rows == 0 || patches.columns == 0 || patches.rows % 3 ||
+          patches.columns % 3 || n > 280 ||
+          patches.pixels.size() != n * 9 * 768 || image.offset < previous_end ||
+          image.offset > sequence.tokens.size() ||
+          n > sequence.tokens.size() - image.offset) {
+        return fail("embedding_gemma2: invalid image patches or token offset");
+      }
+      for (std::size_t j = 0; j < n; ++j) {
+        if (sequence.tokens[image.offset + j] != kImageTokenId) {
+          return fail("embedding_gemma2: image placeholder mismatch");
+        }
+      }
+      previous_end = image.offset + n;
+    }
+    previous_end = 0;
+    for (const auto& clip : sequence.audio) {
+      const auto& features = clip.features;
+      const std::size_t n = features.soft_tokens();
+      bool padding = false;
+      for (const auto valid : features.mask) {
+        if (valid > 1 || (padding && valid))
+          return fail("embedding_gemma2: invalid audio feature mask");
+        padding = padding || !valid;
+      }
+      if (features.mask.empty() || features.mask.size() > 2999 || n == 0 ||
+          features.values.size() != features.mask.size() * 128 ||
+          !std::ranges::all_of(features.values,
+                               [](float x) { return std::isfinite(x); }) ||
+          clip.offset < previous_end || clip.offset > sequence.tokens.size() ||
+          n > sequence.tokens.size() - clip.offset)
+        return fail("embedding_gemma2: invalid audio features or token offset");
+      for (std::size_t j = 0; j < n; ++j)
+        if (sequence.tokens[clip.offset + j] != kAudioTokenId)
+          return fail("embedding_gemma2: audio placeholder mismatch");
+      previous_end = clip.offset + n;
+    }
+    for (const std::uint32_t id : sequence.tokens) {
       if (id >= text.vocab_size) {
         return fail("embedding_gemma2: token id out of range");
       }
     }
   }
-  embeddings->clear();
-  embeddings->reserve(sequences.size());
-  std::size_t first = 0;
-  while (first < sequences.size()) {
-    std::size_t last = first;
-    std::size_t tokens = 0;
-    while (last < sequences.size() &&
-           tokens + sequences[last].size() <= kMaxSequenceTokens) {
-      tokens += sequences[last].size();
-      ++last;
-    }
-    // Each batch takes a new turn, so requests that arrived meanwhile run
-    // before the next batch of this one.
-    const Impl::Turn turn(*impl_);
-    if (device_lost()) {
-      embeddings->clear();
-      return fail(kDeviceLostMessage);
-    }
-    if (is_cancelled && is_cancelled()) {
-      embeddings->clear();
-      return fail(kCancelledMessage);
-    }
-    try {
-      impl_->RunBatch(sequences, first, last, tokens, embeddings);
-    } catch (const std::exception& failure) {
-      // Kernels from the failed batch may still be queued. They read the
-      // index buffers the next batch overwrites, so drain the stream before
-      // the turn passes on.
-      gufo::hip::LogCleanupError(hipStreamSynchronize(impl_->stream));
-      embeddings->clear();
-      if (!impl_->DeviceUsable()) {
-        impl_->lost.store(true, std::memory_order_release);
-        return fail(std::string(kDeviceLostMessage) + ": " + failure.what());
-      }
-      return fail(std::string("embedding_gemma2: ") + failure.what());
-    }
-    first = last;
+  std::string failure;
+  const auto outcome =
+      impl_->scheduler.Run(sequences, is_cancelled, embeddings, &failure);
+  if (outcome == BatchScheduler::Outcome::kOk) {
+    return true;
   }
-  return true;
+  return fail(outcome == BatchScheduler::Outcome::kCancelled ? kCancelledMessage
+                                                             : failure);
 }
 
 }  // namespace gufo::models::embedding_gemma2::hip

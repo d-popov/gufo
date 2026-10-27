@@ -163,7 +163,7 @@ private:
   /// that service is not configured.
   [[nodiscard]] std::string route_model_id(const HttpRequest& req) const;
   bool device_lost();
-  void handle_connection(int client_fd);
+  void handle_connection(int client_fd, std::atomic<bool>& response_sent);
   void reap_workers();
   void register_routes();
 
@@ -213,7 +213,8 @@ public:
   [[nodiscard]] bool listening() const noexcept { return listen_fd_ >= 0; }
 
   /// Stops answering and releases the port. Returns within one poll interval
-  /// plus the bounded wait for a request that is still arriving.
+  /// plus the bounded waits for a request that is still arriving and for the
+  /// answered client to close.
   void stop();
 
 private:

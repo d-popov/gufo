@@ -44,6 +44,7 @@ def main():
     check(["serve", "embedding"], 2, "--model <DIR> is required")
     text = check(["serve", "embedding", "--help"], 0, "--served-model-name")
     assert "--context" not in text and "--sessions" not in text
+    assert "--default-prompt-name" in text
     check(["serve", "embedding", "--context", "8"], 2, "Unknown option")
     check(["serve", "help", "embedding"], 0, "EmbeddingGemma 2")
     check(["serve", "embedding", "--model", "/missing"], 1,
@@ -81,6 +82,16 @@ def main():
     # The flag is a plain switch: it must not swallow the next argument.
     check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
           "Error loading model 'missing.gguf'")
+    # One process can answer under several names; the first is primary.
+    name_help = next(line for line in help_text.splitlines()
+                     if "--served-model-name" in line)
+    assert "repeatable" in name_help, name_help
+    check(["serve", "llm", "--served-model-name", "a", "--served-model-name",
+           "b", "--model", "missing.gguf"], 1,
+          "Error loading model 'missing.gguf'")
+    check(["serve", "llm", "--served-model-name", "a", "--served-model-name",
+           "a", "--model", "missing.gguf"], 2,
+          "duplicate --served-model-name")
 
     # Verbosity must change the output, not merely parse. The config line is
     # emitted at the debug tier before the model file is opened, so these all
@@ -165,7 +176,8 @@ def main():
         result = run(load + ["--trace", trace])
         assert result.returncode == 1, result.stderr
         assert "[WARN] [trace] event=trace_enabled" in result.stderr
-        assert stat.S_IMODE(os.stat(trace).st_mode) == 0o600
+        if os.name != "nt":
+            assert stat.S_IMODE(os.stat(trace).st_mode) == 0o600
     # Every help variant groups verbosity the same way: a "Logging:" section,
     # with no hand-written "Server Options:" list to drift from the parser.
     for args in (["serve", "--help"], ["serve", "llm", "--help"],
