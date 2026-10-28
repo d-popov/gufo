@@ -135,14 +135,15 @@ async function load() {
 // ---------------------------------------------------------------- sign-in card
 // One form at a time: Sign in (default), Sign up or Admin, also from ?signin, ?signup,
 // ?admin and the profile menu. Signed-in users see the card only when they ask for the
-// admin sign-in; without the credits portal only the Admin tab is left.
+// admin sign-in. Admin is temporary: leaving the whole card dismisses it.
 
 const AUTH_TABS = ['signin', 'signup', 'admin'];
 let authTab = 'signin';
 let adminWanted = false;  // the admin sign-in was asked for, maybe by a signed-in user
+let adminAttempt = 0;
 
 function authTabs() {
-  return AUTH_TABS.filter((tab) => (tab === 'admin' ? !window.GufoHeader.session.admin
+  return AUTH_TABS.filter((tab) => (tab === 'admin' ? adminWanted && !window.GufoHeader.session.admin
     : portalEnabled && !me));
 }
 
@@ -155,6 +156,10 @@ function syncAuth() {
 }
 
 function showAuthTab(name, focus = false) {
+  if (name !== 'admin' && adminWanted) {
+    clearAdmin();
+    $('auth-tab-admin').hidden = true;
+  }
   authTab = name;
   for (const tab of AUTH_TABS) {
     const selected = tab === name;
@@ -165,11 +170,26 @@ function showAuthTab(name, focus = false) {
   if (focus) $(`auth-tab-${name}`).focus();
 }
 
+function clearAdmin() {
+  adminWanted = false;
+  adminAttempt++;
+  $('admin-login-token').value = '';
+  showError('admin-login-error', null);
+}
+
+function dismissAdmin() {
+  if (!adminWanted) return;
+  clearAdmin();
+  authTab = 'signin';
+  syncAuth();
+}
+
 const AUTH_FIRST_FIELD = { signin: 'login-email', signup: 'signup-email', admin: 'admin-login-token' };
 
 // From the profile menu: the form with its first field focused.
 function openAuthForm(name) {
   if (name === 'admin') adminWanted = true;
+  else clearAdmin();
   authTab = name;
   syncAuth();
   if ($('auth').hidden || $(`auth-pane-${name}`).hidden) return;
@@ -192,16 +212,34 @@ function setUpAuthTabs() {
   for (const link of document.querySelectorAll('[data-auth-tab]')) {
     link.addEventListener('click', () => openAuthForm(link.dataset.authTab));
   }
+  $('auth').addEventListener('focusout', (event) => {
+    if (!adminWanted) return;
+    if (event.relatedTarget) {
+      if (!$('auth').contains(event.relatedTarget)) dismissAdmin();
+      return;
+    }
+    // A wallet/browser popup can blur the window without moving DOM focus.
+    // Defer null relatedTarget until the browser has settled its active element.
+    setTimeout(() => {
+      if (!$('auth').contains(document.activeElement)) dismissAdmin();
+    }, 0);
+  });
+  $('auth').addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !adminWanted) return;
+    event.preventDefault();
+    dismissAdmin();
+    $('profile-button').focus();
+  });
 }
 
 async function adminLogin(event) {
   event.preventDefault();
+  const attempt = ++adminAttempt;
   const error = await window.GufoHeader.signInAdmin($('admin-login-token').value);
+  if (attempt !== adminAttempt) return;
   showError('admin-login-error', error);
   if (error) return;
-  $('admin-login-token').value = '';
-  adminWanted = false;
-  syncAuth();
+  dismissAdmin();
   $('admin-area').scrollIntoView({ block: 'start' });
 }
 
@@ -440,7 +478,10 @@ document.addEventListener('DOMContentLoaded', () => {
     copyText(event.currentTarget, $('base-url').textContent));
   window.GufoWallet?.init({ api, reload: () => load(), fmtUsd, parseUsd, el });
   load().catch((error) => showNotice(`Could not load the account: ${error.message}`))
-    .finally(() => window.GufoHeader.refresh().catch(() => {}));
+    .finally(async () => {
+      await window.GufoHeader.refresh().catch(() => {});
+      if (params.has('admin') && adminWanted) openAuthForm('admin');
+    });
   // Usage, approvals and background-confirmed deposits show up without a reload; the header
   // refreshes the admin sign-in itself.
   setInterval(() => {

@@ -205,13 +205,20 @@ keys and requests, never the monitor. The portal needs no SMTP server: the
 verification link is shown to the admin, who sends it on, or verifies the address with
 one click after checking who signed up.
 
-Both pages use the neutral **AI Inference** brand and share one header: links to the
-portal and the monitor (the latter only when signed in as admin) and the profile menu.
-The menu offers **Sign in**, **Sign up** and **Admin sign-in** when signed out, and the
-account's email, status and balance with **Sign out** when signed in. Authentication
-uses a centered portal card with three keyboard-accessible tabs: **Sign in**, **Sign up**
-and **Admin** (`/?signin`, `/?signup`, `/?admin`). Admin sign-in from either page opens
-that card, not a separate header form. Signed in as admin, the portal page shows an **Admin**
+Both pages use the neutral **AI Inference** brand with an original geometric owl mark
+and share one header: links to the portal and the monitor (the latter only when signed
+in as admin) and the profile menu. The menu offers **Sign in**, **Sign up** and
+**Admin sign-in** when signed out, and the account's email, status and balance with
+**Sign out** when signed in. Authentication uses a centered portal card with
+keyboard-accessible **Sign in** and **Sign up** tabs (`/?signin`, `/?signup`).
+The **Admin** tab is hidden by default: **Admin sign-in** in either page's profile
+menu (or `/?admin`) reveals it and focuses the token field. It stays open while
+focus moves within the whole authentication card, including the submit button.
+Moving focus outside the card, selecting another auth tab, or pressing Escape
+dismisses Admin and clears its token and error; Escape returns focus to the profile
+button. A signed-in user's auth card is hidden again on dismissal. Without the
+credits portal, the profile menu still opens Admin sign-in. Signed in as admin,
+the portal page shows an **Admin**
 area with tabs: **Accounts** (sign-ups, verification links with **Verify**, balances,
 wallets and keys; approve, reject, suspend, credit), **API keys** (all keys of
 Gufo's key file), **Pricing** (the editable price list, see [Pricing](#pricing)),
@@ -565,6 +572,8 @@ stays behind the admin sign-in. Keep Gufo's own port private unless you route it
 ## Tests
 
 ```sh
+node tests/tools/monitor_icons_test.js
+node tests/tools/monitor_auth_test.js
 python3 tests/tools/monitor_test.py
 python3 tests/tools/billing_test.py
 python3 tests/tools/billing_chain_test.py
