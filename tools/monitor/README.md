@@ -29,9 +29,9 @@ load nothing from other hosts.
 python3 tools/monitor/gufo-monitor.py --gufo http://127.0.0.1:8080
 ```
 
-Open `http://127.0.0.1:8099/`, click the round profile button at the top right, choose
-**Admin sign-in** and enter the admin token; the header then links to the monitor
-(`/monitor`). If the token file does not exist, the monitor creates it on first start at
+Open `http://127.0.0.1:8099/?admin`, or choose **Admin sign-in** in the profile menu.
+Enter the admin token in the portal's **Admin** authentication tab; the shared header
+then links to the monitor (`/monitor`). If the token file does not exist, the monitor creates it on first start at
 `$XDG_CONFIG_HOME/gufo-monitor/admin-token` with mode 0600. The monitor is the admin's
 alone: nobody else sees it, from any host, and the admin sign-in lasts 12 hours. When it
 ends, the open monitor page says so and links to the sign-in.
@@ -205,18 +205,25 @@ keys and requests, never the monitor. The portal needs no SMTP server: the
 verification link is shown to the admin, who sends it on, or verifies the address with
 one click after checking who signed up.
 
-Both pages share one header: links to the portal and the monitor (the latter only when
-signed in as admin) and the profile menu (the round button at the top right). The menu
-offers **Sign in**, **Sign up** and **Admin sign-in** when
-signed out, and the account's email, status and balance with **Sign out** when signed
-in. Signed out, the portal page shows the sign-in form, with a **Sign up** tab next to
-it (`/?signup` opens that tab). Signed in as admin, the portal page shows an **Admin**
+Both pages use the neutral **AI Inference** brand and share one header: links to the
+portal and the monitor (the latter only when signed in as admin) and the profile menu.
+The menu offers **Sign in**, **Sign up** and **Admin sign-in** when signed out, and the
+account's email, status and balance with **Sign out** when signed in. Authentication
+uses a centered portal card with three keyboard-accessible tabs: **Sign in**, **Sign up**
+and **Admin** (`/?signin`, `/?signup`, `/?admin`). Admin sign-in from either page opens
+that card, not a separate header form. Signed in as admin, the portal page shows an **Admin**
 area with tabs: **Accounts** (sign-ups, verification links with **Verify**, balances,
 wallets and keys; approve, reject, suspend, credit), **API keys** (all keys of
 Gufo's key file), **Pricing** (the editable price list, see [Pricing](#pricing)),
 **Usage** (internal vs user costs, see [Usage](#usage-admin-only)) and **Deposits**
 (the receiving wallet audit, see [Deposit audit](#deposit-audit-admin-only)). The
 monitor page shows the same panels.
+
+The pages share a responsive light/dark design system and a local subset of Lucide
+SVG icons (`static/icons.js`), rendered through DOM APIs without fonts, external
+requests or inline scripts. Icons accompany text labels, with `currentColor` strokes.
+The geometric brand mark and favicon are original; Lucide's ISC and Feather-derived
+MIT notices are retained in `licenses/lucide.txt` and `THIRD_PARTY_NOTICES.md`.
 
 ### Setup
 

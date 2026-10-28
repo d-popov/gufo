@@ -12,6 +12,7 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 
 | Component Name | Relationship | License (SPDX) | Pinned Revision / Version | Upstream Source / Location |
 | --- | --- | --- | --- | --- |
+| Lucide icons | Vendored SVG geometry in the monitor and portal UI (`tools/monitor/static/icons.js`) | `ISC AND MIT` (Feather-derived icons) | `c2dd25753da3f25d9ddc351ddb0ee72332189692` | [Lucide](https://github.com/lucide-icons/lucide/tree/c2dd25753da3f25d9ddc351ddb0ee72332189692/icons); [license](licenses/lucide.txt) |
 | ROCm / HIP | Linked runtime | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/clr](https://github.com/ROCm/clr) |
 | hipBLAS | Linked | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/hipBLAS](https://github.com/ROCm/hipBLAS) |
 | hipBLASLt | Linked | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |

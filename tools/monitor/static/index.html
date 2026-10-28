@@ -4,10 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Gufo monitor</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <title>AI Inference – Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/header.css">
   <link rel="stylesheet" href="/static/admin.css">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/icons.js" defer></script>
   <script src="/static/header.js" defer></script>
   <script src="/static/admin.js" defer></script>
   <script src="/static/app.js" defer></script>
@@ -21,7 +23,7 @@
     <span id="model" class="muted"></span>
   </div>
   <p id="detail" class="detail" hidden></p>
-  <p id="expired" class="detail" role="alert" hidden>Admin session expired, <a href="/">sign in again</a>.</p>
+  <p id="expired" class="detail" role="alert" hidden>Admin session expired, <a href="/?admin">sign in again</a>.</p>
 
   <main>
     <section aria-label="Live metrics">
@@ -29,7 +31,7 @@
     </section>
 
     <section>
-      <h2>Sessions</h2>
+      <h2 class="with-icon"><span data-icon="messages-square"></span>Sessions</h2>
       <div class="table-wrap">
         <table id="sessions" class="data">
           <thead>
@@ -46,7 +48,7 @@
 
     <section>
       <div class="section-head">
-        <h2>Recent requests</h2>
+        <h2 class="with-icon"><span data-icon="list"></span>Recent requests</h2>
         <label class="toggle"><input type="checkbox" id="show-all"> Show all</label>
       </div>
       <div class="table-wrap">
@@ -60,7 +62,7 @@
 
     <section id="admin-keys-section" hidden>
       <div class="section-head">
-        <h2>API keys</h2>
+        <h2 class="with-icon"><span data-icon="key-round"></span>API keys</h2>
         <span id="admin-keys-reload" class="muted"></span>
       </div>
       <div class="table-wrap">
@@ -95,14 +97,14 @@
             <div id="admin-key-model-list"></div>
           </fieldset>
           <div class="form-actions">
-            <button type="submit" id="admin-key-submit">Create key</button>
+            <button type="submit" id="admin-key-submit" class="with-icon"><span data-icon="plus"></span>Create key</button>
             <button type="button" id="admin-key-cancel" class="link" hidden>Cancel</button>
           </div>
         </form>
         <div id="admin-key-secret" class="key-secret" hidden>
           <p>Token for <strong id="admin-key-secret-name"></strong>. Copy it now: it is shown only once.</p>
           <code id="admin-key-secret-token"></code>
-          <button type="button" id="admin-key-secret-copy">Copy</button>
+          <button type="button" id="admin-key-secret-copy" class="with-icon"><span data-icon="copy"></span>Copy</button>
           <button type="button" id="admin-key-secret-done" class="link">Done</button>
         </div>
       </div>
@@ -110,7 +112,7 @@
 
     <section id="accounts-section" hidden>
       <div class="section-head">
-        <h2>Accounts</h2>
+        <h2 class="with-icon"><span data-icon="users"></span>Accounts</h2>
         <span class="muted">credits portal users</span>
       </div>
       <dl id="accounts-totals" class="totals"></dl>
@@ -134,14 +136,14 @@
         <input id="credit-amount" required inputmode="decimal" pattern="-?[0-9]+([.][0-9]{1,6})?" size="10">
         <label for="credit-note">Note</label>
         <input id="credit-note" maxlength="200" size="24">
-        <button type="submit">Add credit</button>
+        <button type="submit" class="with-icon"><span data-icon="circle-plus"></span>Add credit</button>
         <button type="button" id="credit-cancel" class="link">Cancel</button>
       </form>
     </section>
 
     <section id="admin-pricing-section" hidden>
       <div class="section-head">
-        <h2>Pricing</h2>
+        <h2 class="with-icon"><span data-icon="tag"></span>Pricing</h2>
         <span class="muted">USD per 1M tokens; saved prices apply to requests billed from then on</span>
       </div>
       <p id="admin-pricing-message" class="accounts-message" hidden></p>
@@ -164,10 +166,10 @@
           <label for="admin-pricing-new">Model</label>
           <input id="admin-pricing-new" list="admin-pricing-served" maxlength="128" size="28" autocomplete="off">
           <datalist id="admin-pricing-served"></datalist>
-          <button type="button" id="admin-pricing-add">Add model</button>
+          <button type="button" id="admin-pricing-add" class="with-icon"><span data-icon="plus"></span>Add model</button>
         </div>
         <div class="form-actions pricing-actions">
-          <button type="submit" id="admin-pricing-save">Save</button>
+          <button type="submit" id="admin-pricing-save" class="with-icon"><span data-icon="check"></span>Save</button>
           <button type="button" id="admin-pricing-revert" class="link">Revert</button>
           <span id="admin-pricing-state" class="muted"></span>
         </div>
@@ -179,7 +181,7 @@
 
     <section id="admin-usage-section" hidden>
       <div class="section-head usage-head">
-        <h2>Usage</h2>
+        <h2 class="with-icon"><span data-icon="chart-column"></span>Usage</h2>
         <label class="usage-window">Window
           <select id="admin-usage-days">
             <option value="7">7 days</option>
@@ -221,7 +223,7 @@
 
     <section id="admin-deposits-section" hidden>
       <div class="section-head">
-        <h2>Deposits</h2>
+        <h2 class="with-icon"><span data-icon="landmark"></span>Deposits</h2>
         <span class="muted">receiving wallet audit</span>
       </div>
       <p class="muted keys-note">Credited USDC deposits with the receiving wallet's balance right before and
@@ -230,8 +232,8 @@
         credited, for reference only. Delta check: after minus before equals the credited amount.</p>
       <dl id="admin-deposits-totals" class="totals"></dl>
       <div class="inline-form">
-        <button type="button" id="admin-deposits-verify">Re-verify against chain</button>
-        <a id="admin-deposits-csv" href="/api/admin/deposits.csv" download="gufo-deposits.csv">Download CSV</a>
+        <button type="button" id="admin-deposits-verify" class="with-icon"><span data-icon="refresh-cw"></span>Re-verify against chain</button>
+        <a id="admin-deposits-csv" class="with-icon" href="/api/admin/deposits.csv" download="deposits.csv"><span data-icon="download"></span>Download CSV</a>
         <span id="admin-deposits-verify-state" class="muted"></span>
       </div>
       <p id="admin-deposits-error" class="bad" hidden></p>
@@ -254,7 +256,7 @@
     </section>
 
     <section>
-      <h2>Totals</h2>
+      <h2 class="with-icon"><span data-icon="chart-column"></span>Totals</h2>
       <dl id="totals" class="totals"></dl>
     </section>
   </main>

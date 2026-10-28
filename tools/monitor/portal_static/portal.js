@@ -82,11 +82,17 @@ function showNotice(text) {
   $('notice').hidden = !text;
 }
 
+// Copies TEXT; BUTTON shows a check mark and "Copied" for a moment.
 function copyText(button, text) {
-  const label = button.textContent;
   navigator.clipboard?.writeText(text).then(() => {
-    button.textContent = 'Copied';
-    setTimeout(() => { button.textContent = label; }, 1500);
+    if (button.dataset.copied) return;
+    const saved = [...button.childNodes];
+    button.dataset.copied = '1';
+    window.GufoIcons.label(button, 'check', 'Copied');
+    setTimeout(() => {
+      button.replaceChildren(...saved);
+      delete button.dataset.copied;
+    }, 1500);
   }).catch(() => {});
 }
 
@@ -97,8 +103,8 @@ let portalEnabled = true;  // false: no --billing-config, only the admin sign-in
 
 function showAuth() {
   me = null;
-  $('auth').hidden = !portalEnabled;
   $('account').hidden = true;
+  syncAuth();
   window.GufoHeader.setUser(null, portalEnabled);
 }
 
@@ -118,7 +124,7 @@ async function load() {
     throw error;
   }
   me = account;
-  $('auth').hidden = true;
+  syncAuth();
   $('account').hidden = false;
   window.GufoHeader.setUser(me, portalEnabled);
   renderAccount();
@@ -126,12 +132,30 @@ async function load() {
   await loadLedger();
 }
 
-// ---------------------------------------------------------------- sign-in tabs
-// One form at a time: Sign in (default) or Sign up, also from ?signup and the profile menu.
+// ---------------------------------------------------------------- sign-in card
+// One form at a time: Sign in (default), Sign up or Admin, also from ?signin, ?signup,
+// ?admin and the profile menu. Signed-in users see the card only when they ask for the
+// admin sign-in; without the credits portal only the Admin tab is left.
 
-const AUTH_TABS = ['signin', 'signup'];
+const AUTH_TABS = ['signin', 'signup', 'admin'];
+let authTab = 'signin';
+let adminWanted = false;  // the admin sign-in was asked for, maybe by a signed-in user
+
+function authTabs() {
+  return AUTH_TABS.filter((tab) => (tab === 'admin' ? !window.GufoHeader.session.admin
+    : portalEnabled && !me));
+}
+
+function syncAuth() {
+  const tabs = authTabs();
+  for (const tab of AUTH_TABS) $(`auth-tab-${tab}`).hidden = !tabs.includes(tab);
+  $('auth-intro').hidden = !tabs.includes('signin');
+  $('auth').hidden = !tabs.length || (!!me && !adminWanted);
+  showAuthTab(tabs.includes(authTab) ? authTab : tabs[0] ?? 'signin');
+}
 
 function showAuthTab(name, focus = false) {
+  authTab = name;
   for (const tab of AUTH_TABS) {
     const selected = tab === name;
     $(`auth-tab-${tab}`).setAttribute('aria-selected', String(selected));
@@ -141,27 +165,44 @@ function showAuthTab(name, focus = false) {
   if (focus) $(`auth-tab-${name}`).focus();
 }
 
+const AUTH_FIRST_FIELD = { signin: 'login-email', signup: 'signup-email', admin: 'admin-login-token' };
+
 // From the profile menu: the form with its first field focused.
 function openAuthForm(name) {
-  showAuthTab(name);
+  if (name === 'admin') adminWanted = true;
+  authTab = name;
+  syncAuth();
+  if ($('auth').hidden || $(`auth-pane-${name}`).hidden) return;
   $('auth').scrollIntoView({ block: 'nearest' });
-  $(name === 'signup' ? 'signup-email' : 'login-email').focus();
+  $(AUTH_FIRST_FIELD[name]).focus();
 }
 
 function setUpAuthTabs() {
   for (const tab of AUTH_TABS) {
     $(`auth-tab-${tab}`).addEventListener('click', () => showAuthTab(tab));
     $(`auth-tab-${tab}`).addEventListener('keydown', (event) => {
-      const index = AUTH_TABS.indexOf(tab);
-      const next = { ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: AUTH_TABS.length - 1 }[event.key];
+      const tabs = authTabs();
+      const index = tabs.indexOf(tab);
+      const next = { ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: tabs.length - 1 }[event.key];
       if (next === undefined) return;
       event.preventDefault();
-      showAuthTab(AUTH_TABS[(next + AUTH_TABS.length) % AUTH_TABS.length], true);
+      showAuthTab(tabs[(next + tabs.length) % tabs.length], true);
     });
   }
   for (const link of document.querySelectorAll('[data-auth-tab]')) {
     link.addEventListener('click', () => openAuthForm(link.dataset.authTab));
   }
+}
+
+async function adminLogin(event) {
+  event.preventDefault();
+  const error = await window.GufoHeader.signInAdmin($('admin-login-token').value);
+  showError('admin-login-error', error);
+  if (error) return;
+  $('admin-login-token').value = '';
+  adminWanted = false;
+  syncAuth();
+  $('admin-area').scrollIntoView({ block: 'start' });
 }
 
 // ---------------------------------------------------------------- admin area
@@ -179,6 +220,7 @@ function showTab(name) {
 }
 
 async function onSession(session, previous) {
+  syncAuth();
   $('admin-area').hidden = !session.admin;
   $('accounts-off').hidden = portalEnabled;
   for (const tab of ['pricing', 'usage', 'deposits']) $(`tab-${tab}`).hidden = !portalEnabled;
@@ -254,7 +296,8 @@ function renderKeys() {
   $('keys-body').hidden = !approved && !keys.length;
   $('key-form').hidden = !approved;
   const rows = keys.map((key) => {
-    const revoke = el('button', { type: 'button', class: 'link danger' }, 'Revoke');
+    const revoke = el('button', { type: 'button', class: 'link danger with-icon' },
+      window.GufoIcons.svg('trash'), 'Revoke');
     revoke.addEventListener('click', () => revokeKey(key));
     const state = key.enabled ? 'Active' : approved ? 'Paused: no balance' : 'Disabled';
     return el('tr', {},
@@ -380,9 +423,11 @@ document.addEventListener('DOMContentLoaded', () => {
     onSession,
   });
   setUpAuthTabs();
-  showAuthTab(params.has('signup') ? 'signup' : 'signin');
+  adminWanted = params.has('admin');
+  showAuthTab(adminWanted ? 'admin' : params.has('signup') ? 'signup' : 'signin');
   $('login-form').addEventListener('submit', login);
   $('signup-form').addEventListener('submit', signup);
+  $('admin-login-form').addEventListener('submit', adminLogin);
   setUpAdmin();
   $('key-form').addEventListener('submit', createKey);
   $('key-secret-copy').addEventListener('click', (event) =>

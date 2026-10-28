@@ -62,9 +62,14 @@ window.GufoAdmin = (() => {
 
   function copy(button, text) {
     navigator.clipboard?.writeText(text).then(() => {
-      const label = button.textContent;
-      button.textContent = 'Copied';
-      setTimeout(() => { button.textContent = label; }, 1500);
+      if (button.dataset.copied) return;
+      const saved = [...button.childNodes];
+      button.dataset.copied = '1';
+      window.GufoIcons.label(button, 'check', 'Copied');
+      setTimeout(() => {
+        button.replaceChildren(...saved);
+        delete button.dataset.copied;
+      }, 1500);
     }).catch(() => {});
   }
 
@@ -175,16 +180,16 @@ window.GufoAdmin = (() => {
     const usage = state?.key_usage ?? {};
     const reload = state?.key_reload;
     $('admin-keys-reload').textContent = !reload ? ''
-      : reload.ok ? `Gufo loaded ${fmt(reload.keys, 0)} keys · ${fmtTime(reload.t)}`
-        : `Gufo kept its previous keys: ${reload.reason} · ${fmtTime(reload.t)}`;
+      : reload.ok ? `Server loaded ${fmt(reload.keys, 0)} keys · ${fmtTime(reload.t)}`
+        : `Server kept its previous keys: ${reload.reason} · ${fmtTime(reload.t)}`;
     $('admin-keys-reload').className = reload && !reload.ok ? 'bad' : 'muted';
     const rows = keys.map((key) => {
       const used = usage[key.name] ?? {};
       const actions = el('td');
       if (keysAdmin) {
-        const edit = el('button', { type: 'button', class: 'link' }, 'Edit');
+        const edit = el('button', { type: 'button', class: 'link with-icon' }, window.GufoIcons.svg('pencil'), 'Edit');
         edit.addEventListener('click', () => startEdit(key));
-        const revoke = el('button', { type: 'button', class: 'link danger' }, 'Revoke');
+        const revoke = el('button', { type: 'button', class: 'link danger with-icon' }, window.GufoIcons.svg('trash'), 'Revoke');
         revoke.addEventListener('click', () => revokeKey(key.name));
         actions.append(edit, ' ', revoke);
       }
@@ -211,7 +216,7 @@ window.GufoAdmin = (() => {
     $('admin-key-form').reset();
     $('admin-key-name').disabled = false;
     $('admin-key-form-title').textContent = 'New key';
-    $('admin-key-submit').textContent = 'Create key';
+    window.GufoIcons.label($('admin-key-submit'), 'plus', 'Create key');
     $('admin-key-cancel').hidden = true;
     for (const box of $('admin-key-model-list').querySelectorAll('input')) box.checked = false;
     syncModelControls();
@@ -227,7 +232,7 @@ window.GufoAdmin = (() => {
       box.checked = key.models.includes(box.value);
     }
     $('admin-key-form-title').textContent = `Edit ${key.name}`;
-    $('admin-key-submit').textContent = 'Save';
+    window.GufoIcons.label($('admin-key-submit'), 'check', 'Save');
     $('admin-key-cancel').hidden = false;
     syncModelControls();
     $('admin-key-form').scrollIntoView({ block: 'nearest' });
@@ -309,11 +314,11 @@ window.GufoAdmin = (() => {
   }
 
   const ACCOUNT_STATUS = {
-    pending_verification: ['Email unverified', 'state-prompt'],
-    pending_approval: ['Awaiting approval', 'state-prompt'],
-    approved: ['Approved', 'state-busy'],
-    rejected: ['Rejected', 'bad'],
-    suspended: ['Suspended', 'bad'],
+    pending_verification: ['Email unverified', 'state-prompt', 'triangle-alert'],
+    pending_approval: ['Awaiting approval', 'state-prompt', 'clock'],
+    approved: ['Approved', 'state-busy', 'circle-check'],
+    rejected: ['Rejected', 'bad', 'triangle-alert'],
+    suspended: ['Suspended', 'bad', 'ban'],
   };
 
   function renderAccounts() {
@@ -336,16 +341,19 @@ window.GufoAdmin = (() => {
     const rows = list.map((account) => {
       const email = el('td', { class: 'wrap' }, account.email);
       if (account.verification_link) {
-        const copyButton = el('button', { type: 'button', class: 'link' }, 'Copy');
+        const copyButton = el('button', { type: 'button', class: 'link with-icon' }, window.GufoIcons.svg('copy'), 'Copy');
         copyButton.addEventListener('click', () => copy(copyButton, account.verification_link));
         email.append(el('div', { class: 'verify-link' },
           el('span', { class: 'muted' }, 'Verification link: '),
           el('code', {}, account.verification_link), ' ', copyButton));
       }
-      const [statusText, statusClass] = ACCOUNT_STATUS[account.status] ?? [account.status, ''];
+      const [statusText, statusClass, statusIcon] = ACCOUNT_STATUS[account.status] ?? [account.status, '', 'triangle-alert'];
       const actions = el('td', { class: 'account-actions' });
       const button = (label, onClick, extra = {}) => {
-        const node = el('button', { type: 'button', class: extra.danger ? 'link danger' : 'link' }, label);
+        const actionIcons = { Verify: 'badge-check', Approve: 'check', Reject: 'x', Suspend: 'ban',
+          Unsuspend: 'play', 'Add credit': 'circle-plus' };
+        const node = el('button', { type: 'button', class: extra.danger ? 'link danger with-icon' : 'link with-icon' },
+          window.GufoIcons.svg(actionIcons[label]), label);
         if (extra.disabled) {
           node.disabled = true;
           node.title = extra.disabled;
@@ -370,7 +378,7 @@ window.GufoAdmin = (() => {
       return el('tr', {},
         el('td', {}, String(account.id)),
         email,
-        el('td', { class: statusClass }, statusText),
+        el('td', {}, el('span', { class: `status-chip ${statusClass}` }, window.GufoIcons.svg(statusIcon), statusText)),
         el('td', {}, account.email_verified ? 'Yes' : 'No'),
         el('td', { class: account.balance_micro <= 0 ? 'num bad' : 'num' }, fmtUsd(account.balance_micro)),
         el('td', { class: 'num' }, fmtUsd(account.spent_micro)),
@@ -817,13 +825,13 @@ window.GufoAdmin = (() => {
   // A note with "!=" is a mismatch; others (an account created by the deposit) inform.
   function deltaCell(deposit) {
     const note = deposit.audit_note ?? '';
-    if (note.includes('!=')) return el('td', { class: 'bad wrap' }, note);
+    if (note.includes('!=')) return el('td', { class: 'bad wrap' }, window.GufoIcons.svg('triangle-alert'), ' ', note);
     if (deposit.receiver_before_micro == null || deposit.receiver_after_micro == null) {
       return el('td', { class: 'muted wrap', title: 'The chain gave no balances for this deposit.' },
         note ? `no data; ${note}` : 'no data');
     }
     const cell = el('td', { class: 'wrap', title: 'After minus before equals the amount.' },
-      el('span', { class: 'state-busy' }, '✓'));
+      el('span', { class: 'status-chip state-busy' }, window.GufoIcons.svg('circle-check'), 'Verified'));
     if (note) cell.append(' ', el('span', { class: 'muted' }, note));
     return cell;
   }

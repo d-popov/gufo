@@ -2,22 +2,22 @@
 
 // Cards: one per live metric, each with a sparkline over the history window.
 const CARDS = [
-  { key: 'decode_tps', label: 'Decode (all sessions)', unit: 'tok/s', digits: 1 },
-  { key: 'prefill_tps', label: 'Prefill (all sessions)', unit: 'tok/s', digits: 0 },
-  { key: 'running', label: 'Requests running', digits: 0, sub: (s) => `${fmt(s.queued, 0)} queued` },
-  { key: 'cache_reuse_pct', label: 'Cache reuse', unit: '%', digits: 1, max: 100,
+  { key: 'decode_tps', icon: 'zap', label: 'Decode (all sessions)', unit: 'tok/s', digits: 1 },
+  { key: 'prefill_tps', icon: 'layers', label: 'Prefill (all sessions)', unit: 'tok/s', digits: 0 },
+  { key: 'running', icon: 'activity', label: 'Requests running', digits: 0, sub: (s) => `${fmt(s.queued, 0)} queued` },
+  { key: 'cache_reuse_pct', icon: 'database', label: 'Cache reuse', unit: '%', digits: 1, max: 100,
     value: (s) => s.cache_reuse_window_pct, sub: () => 'completed requests, last 5 min' },
-  { key: 'accept_pct', label: 'Draft acceptance', unit: '%', digits: 1, max: 100,
+  { key: 'accept_pct', icon: 'target', label: 'Draft acceptance', unit: '%', digits: 1, max: 100,
     value: (s) => s.accept_window_pct, sub: () => 'completed requests, last 5 min' },
-  { key: 'gpu_busy_pct', label: 'GPU busy', unit: '%', digits: 0, max: 100,
+  { key: 'gpu_busy_pct', icon: 'cpu', label: 'GPU busy', unit: '%', digits: 0, max: 100,
     sub: (s) => (s.gpu_mhz != null ? `${fmt(s.gpu_mhz, 0)} MHz` : '') },
-  { key: 'gtt_used_gb', label: 'GPU memory (GTT)', unit: 'GB', digits: 1,
+  { key: 'gtt_used_gb', icon: 'memory-stick', label: 'GPU memory (GTT)', unit: 'GB', digits: 1,
     sub: (s) => `of ${fmt(s.gtt_total_gb, 1)} GB` },
-  { key: 'mem_avail_gb', label: 'Memory available', unit: 'GB', digits: 1,
+  { key: 'mem_avail_gb', icon: 'memory-stick', label: 'Memory available', unit: 'GB', digits: 1,
     sub: (s) => `swap ${fmt(s.swap_used_gb, 1)} of ${fmt(s.swap_total_gb, 1)} GB used` },
-  { key: 'gpu_temp_c', label: 'GPU temperature', unit: '°C', digits: 0 },
-  { key: 'gpu_power_w', label: 'GPU power', unit: 'W', digits: 0 },
-  { key: 'cpu_pct', label: 'CPU', unit: '%', digits: 0, max: 100 },
+  { key: 'gpu_temp_c', icon: 'thermometer', label: 'GPU temperature', unit: '°C', digits: 0 },
+  { key: 'gpu_power_w', icon: 'plug-zap', label: 'GPU power', unit: 'W', digits: 0 },
+  { key: 'cpu_pct', icon: 'cpu', label: 'CPU', unit: '%', digits: 0, max: 100 },
 ];
 
 // The long-window tile, last in the grid: only the headline rows of [label, 24 h, 7 days]
@@ -173,7 +173,7 @@ function buildCards() {
     chart.append(area, line, dots);
     const unit = el('span', { class: 'card-unit' });
     root.append(el('div', { class: 'card' },
-      el('div', { class: 'card-label' }, card.label),
+      el('div', { class: 'card-label with-icon' }, window.GufoIcons.svg(card.icon), card.label),
       el('div', { class: 'card-value' }, value, unit),
       sub, chart));
     Object.assign(card, { valueNode: value, unitNode: unit, subNode: sub, area, line, dots });
@@ -189,8 +189,8 @@ function buildLongCard() {
   const head = el('tr', {}, el('th', {}, ''), el('th', { class: 'num' }, '24 h'), el('th', { class: 'num' }, '7 d'));
   const rows = LONG_ROWS.map(([label], i) => el('tr', {}, el('th', {}, label), ...longTile.cells[i]));
   return el('div', { class: 'card card-long', title: 'Decode tok/s: generated tokens over the time spent decoding them\n' +
-      'Image enc ms/req: vision encoder time per request with images (— before Gufo logged it)' },
-    el('div', { class: 'card-label' }, 'Last 24 h / 7 days'),
+      'Image enc ms/req: vision encoder time per request with images (— before the server logged it)' },
+    el('div', { class: 'card-label with-icon' }, window.GufoIcons.svg('calendar-clock'), 'Last 24 h / 7 days'),
     el('div', { class: 'card-value' }, longTile.value, longTile.unit, longTile.week),
     el('table', { class: 'long-table' }, el('thead', {}, head), el('tbody', {}, ...rows)),
     el('a', { class: 'card-sub', href: '/' }, 'More in Usage'));
@@ -318,7 +318,7 @@ function renderSessions() {
   const rows = [];
   if (!groups.size) {
     rows.push(el('tr', {}, el('td', { colspan: '7', class: 'muted' },
-      state.status?.state === 'ready' ? 'No sessions reported.' : 'Gufo is not ready.')));
+      state.status?.state === 'ready' ? 'No sessions reported.' : 'The inference server is not ready.')));
   }
   const multiple = groups.size > 1 || (groups.size === 1 && !groups.has(''));
   for (const [model, slots] of groups) {
@@ -401,8 +401,8 @@ function renderTotals() {
 
   const props = Object.values(state.props ?? {})[0] ?? {};
   const parts = [];
-  if (props.build) parts.push(`Gufo ${props.build}`);
-  parts.push('token counters since Gufo start; log counts since monitor start');
+  if (props.build) parts.push(`Server ${props.build}`);
+  parts.push('token counters since server start; log counts since monitor start');
   if (state.monitor_started) parts.push(`monitor started ${fmtTime(state.monitor_started)}`);
   if (state.sample?.t) parts.push(`updated ${fmtTime(state.sample.t)}`);
   $('footer').textContent = parts.join(' · ');

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- The site's mark (the `brand` icon in icons.js) on the accent colour. -->
+  <rect width="32" height="32" rx="7" fill="#2563eb"/>
+  <g transform="translate(4 4)" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 2.5 20.5 7.25v9.5L12 21.5l-8.5-4.75v-9.5Z"/>
+    <circle cx="12" cy="12" r="2.5"/>
+    <path d="M12 9.5v-7"/>
+    <path d="m14.17 13.25 6.33 3.5"/>
+    <path d="m9.83 13.25-6.33 3.5"/>
+  </g>
+</svg>

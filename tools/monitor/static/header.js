@@ -2,15 +2,22 @@
 
 // Page header shared by the portal page (/) and the monitor page (/monitor): the brand,
 // links to both pages, and the profile menu with the portal account (Sign in, Sign up,
-// Sign out) and the admin sign-in (POST /api/admin/login with the admin token). The
-// monitor is the admin's alone, so its link shows only to a signed-in admin. Each page has
-// an empty <header id="site-header">, calls GufoHeader.init() and then refresh() once it
-// is ready for onSession; GET /api/admin/session says what to show. A page that loads the
-// portal account itself passes pageUser and calls setUser(); otherwise refresh() reads
-// /api/portal/me.
+// Sign out) and the admin entries. Signing in, as a user or as the admin, happens in the
+// portal page's sign-in card (tabs Sign in, Sign up and Admin; /?signin, /?signup and
+// /?admin pick one), which calls signInAdmin() with the admin token (POST
+// /api/admin/login). The monitor is the admin's alone, so its link shows only to a
+// signed-in admin. Each page has an empty <header id="site-header">, calls
+// GufoHeader.init() and then refresh() once it is ready for onSession; GET
+// /api/admin/session says what to show. A page that loads the portal account itself
+// passes pageUser and calls setUser(); otherwise refresh() reads /api/portal/me.
 
 window.GufoHeader = (() => {
+  // The product name in the brand and the page titles.
+  const SITE_NAME = 'AI Inference';
+  const PAGES = { portal: 'Portal', monitor: 'Monitor' };
+
   const $ = (id) => document.getElementById(id);
+  const icon = (name) => window.GufoIcons.svg(name);
 
   function el(tag, attrs = {}, ...children) {
     const node = document.createElement(tag);
@@ -47,19 +54,19 @@ window.GufoHeader = (() => {
   let user = null;
   let portalEnabled = true;
 
-  function menuItem(id, label, href) {
-    return href ? el('a', { role: 'menuitem', id, class: 'menu-item', href }, label)
-      : el('button', { type: 'button', role: 'menuitem', id, class: 'menu-item' }, label);
+  function menuItem(id, iconName, label) {
+    return el('button', { type: 'button', role: 'menuitem', id, class: 'menu-item' }, icon(iconName), label);
   }
 
   function build() {
     const page = window.location.pathname === '/monitor' ? 'monitor' : 'portal';
-    const link = (name, href, label) => {
-      const node = el('a', { class: 'site-link', href }, label);
+    document.title = `${SITE_NAME} – ${PAGES[page]}`;
+    const link = (name, href, iconName) => {
+      const node = el('a', { class: 'site-link', href }, icon(iconName), PAGES[name]);
       if (name === page) node.setAttribute('aria-current', 'page');
       return node;
     };
-    const monitorLink = link('monitor', '/monitor', 'Monitor');
+    const monitorLink = link('monitor', '/monitor', 'activity');
     monitorLink.id = 'site-link-monitor';
     monitorLink.hidden = true;
     const button = el('button', {
@@ -70,44 +77,29 @@ window.GufoHeader = (() => {
         el('div', { id: 'menu-email', class: 'menu-email' }),
         el('div', { id: 'menu-status', class: 'menu-muted' }),
         el('div', { id: 'menu-balance' })),
-      el('div', { id: 'menu-admin-info', class: 'menu-info' }, 'Signed in as admin'),
-      menuItem('menu-signin', 'Sign in'),
-      menuItem('menu-signup', 'Sign up'),
-      menuItem('menu-admin-signin', 'Admin sign-in'),
-      menuItem('menu-admin-accounts', 'Admin: accounts'),
-      menuItem('menu-admin-keys', 'Admin: API keys'),
-      menuItem('menu-admin-pricing', 'Admin: pricing'),
-      menuItem('menu-admin-usage', 'Admin: usage'),
-      menuItem('menu-admin-deposits', 'Admin: deposits'),
-      menuItem('menu-admin-signout', 'Sign out of admin'),
-      menuItem('menu-signout', 'Sign out'));
+      el('div', { id: 'menu-admin-info', class: 'menu-info with-icon' }, icon('shield-check'), 'Signed in as admin'),
+      menuItem('menu-signin', 'log-in', 'Sign in'),
+      menuItem('menu-signup', 'user-plus', 'Sign up'),
+      menuItem('menu-admin-signin', 'shield-check', 'Admin sign-in'),
+      menuItem('menu-admin-accounts', 'users', 'Admin: accounts'),
+      menuItem('menu-admin-keys', 'key-round', 'Admin: API keys'),
+      menuItem('menu-admin-pricing', 'tag', 'Admin: pricing'),
+      menuItem('menu-admin-usage', 'chart-column', 'Admin: usage'),
+      menuItem('menu-admin-deposits', 'landmark', 'Admin: deposits'),
+      menuItem('menu-admin-signout', 'log-out', 'Sign out of admin'),
+      menuItem('menu-signout', 'log-out', 'Sign out'));
     menu.hidden = true;
-
-    const token = el('input', { id: 'admin-login-token', type: 'password', autocomplete: 'off' });
-    token.required = true;
-    const error = el('p', { id: 'admin-login-error', class: 'header-error', role: 'alert' });
-    error.hidden = true;
-    const form = el('form', { id: 'admin-login-form', class: 'header-login' },
-      el('h2', {}, 'Admin sign-in'),
-      el('label', { for: 'admin-login-token' }, 'Admin token'),
-      token,
-      el('div', { class: 'header-actions' },
-        el('button', { type: 'submit', class: 'header-primary' }, 'Sign in'),
-        el('button', { type: 'button', id: 'admin-login-cancel', class: 'header-link' }, 'Cancel')),
-      error);
-    form.hidden = true;
 
     $('site-header').replaceChildren(
       el('div', { class: 'site-bar' },
-        el('a', { class: 'brand', href: '/' }, 'Gufo'),
-        el('nav', { class: 'site-nav', 'aria-label': 'Pages' }, link('portal', '/', 'Portal'), monitorLink),
-        el('div', { class: 'profile' }, button, menu)),
-      form);
+        el('a', { class: 'brand', href: '/' }, icon('brand'), SITE_NAME),
+        el('nav', { class: 'site-nav', 'aria-label': 'Pages' }, link('portal', '/', 'wallet'), monitorLink),
+        el('div', { class: 'profile' }, button, menu)));
   }
 
   function render() {
     const button = $('profile-button');
-    button.textContent = user ? user.email.slice(0, 1).toUpperCase() : '';
+    button.replaceChildren(user ? user.email.slice(0, 1).toUpperCase() : icon('user'));
     button.classList.toggle('anon', !user);
     button.classList.toggle('is-admin', session.admin);
     button.title = user ? user.email : session.admin ? 'Admin' : 'Sign in';
@@ -129,18 +121,12 @@ window.GufoHeader = (() => {
     }
     $('menu-admin-signout').hidden = !session.admin;
     $('site-link-monitor').hidden = !session.admin;
-    if (session.admin) $('admin-login-form').hidden = true;
   }
 
   function openMenu(open) {
     $('profile-menu').hidden = !open;
     $('profile-button').setAttribute('aria-expanded', String(open));
     if (open) $('profile-menu').querySelector('.menu-item:not([hidden])')?.focus();
-  }
-
-  function showLoginError(text) {
-    $('admin-login-error').textContent = text ?? '';
-    $('admin-login-error').hidden = !text;
   }
 
   async function loadUser() {
@@ -174,24 +160,21 @@ window.GufoHeader = (() => {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body ?? {}) });
   }
 
-  async function adminSignIn(event) {
-    event.preventDefault();
+  // The admin sign-in with TOKEN; null once signed in (the session is then refreshed),
+  // otherwise what went wrong.
+  async function signInAdmin(token) {
     try {
-      const response = await adminRequest('/api/admin/login', { token: $('admin-login-token').value });
+      const response = await adminRequest('/api/admin/login', { token });
       if (!response.ok) {
-        showLoginError(response.status === 401 ? 'Wrong admin token.'
+        return response.status === 401 ? 'Wrong admin token.'
           : response.status === 429 ? 'Too many attempts; try again in a minute.'
-            : `Sign-in failed (HTTP ${response.status}).`);
-        return;
+            : `Sign-in failed (HTTP ${response.status}).`;
       }
-      $('admin-login-token').value = '';
-      showLoginError(null);
-      $('admin-login-form').hidden = true;
     } catch (error) {
-      showLoginError(String(error.message ?? error));
-      return;
+      return String(error.message ?? error);
     }
     await refresh();
+    return null;
   }
 
   // The monitor page is the admin's alone: signing out there leaves for the portal page.
@@ -214,10 +197,11 @@ window.GufoHeader = (() => {
     setUser(null, portalEnabled);
   }
 
+  // TAB: 'signin', 'signup' or 'admin', the portal page's sign-in card.
   function auth(tab) {
     openMenu(false);
     if (options.onAuth) options.onAuth(tab);
-    else window.location.assign(tab === 'signup' ? '/?signup' : '/?signin');
+    else window.location.assign(`/?${tab}`);
   }
 
   function wire() {
@@ -236,17 +220,8 @@ window.GufoHeader = (() => {
     });
     $('menu-signin').addEventListener('click', () => auth('signin'));
     $('menu-signup').addEventListener('click', () => auth('signup'));
+    $('menu-admin-signin').addEventListener('click', () => auth('admin'));
     $('menu-signout').addEventListener('click', userSignOut);
-    $('menu-admin-signin').addEventListener('click', () => {
-      openMenu(false);
-      $('admin-login-form').hidden = false;
-      $('admin-login-token').focus();
-    });
-    $('admin-login-cancel').addEventListener('click', () => {
-      $('admin-login-form').hidden = true;
-      showLoginError(null);
-    });
-    $('admin-login-form').addEventListener('submit', adminSignIn);
     for (const name of ['accounts', 'keys', 'pricing', 'usage', 'deposits']) {
       $(`menu-admin-${name}`).addEventListener('click', () => {
         openMenu(false);
@@ -256,10 +231,12 @@ window.GufoHeader = (() => {
     $('menu-admin-signout').addEventListener('click', adminSignOut);
   }
 
-  // Builds the header; refresh() then loads the session, which this repeats every 30 s so
-  // the admin sign-in ending shows up without a reload.
+  // Builds the header and puts icons in the page's static markup; refresh() then loads
+  // the session, which this repeats every 30 s so the admin sign-in ending shows up
+  // without a reload.
   function init(settings = {}) {
     options = settings;
+    window.GufoIcons.hydrate();
     build();
     wire();
     render();
@@ -270,6 +247,7 @@ window.GufoHeader = (() => {
     init,
     refresh,
     setUser,
+    signInAdmin,
     fmtUsd,
     get session() { return session; },
   };

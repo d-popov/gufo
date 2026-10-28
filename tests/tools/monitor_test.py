@@ -286,7 +286,7 @@ class MonitorHttpTest(unittest.TestCase):
 
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
-                     "portal.js", "portal.css", "wallet.js"):
+                     "icons.js", "favicon.svg", "portal.js", "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
             self.assertEqual(response.status, 200, name)
         for path in ("/static/../gufo_monitor.py", "/static/%2e%2e/gufo_monitor.py",

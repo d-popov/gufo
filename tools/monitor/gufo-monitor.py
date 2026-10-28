@@ -56,6 +56,8 @@ STATIC_FILES = {
     "admin.css": (STATIC_DIR, _CSS),
     "header.js": (STATIC_DIR, _JS),
     "header.css": (STATIC_DIR, _CSS),
+    "icons.js": (STATIC_DIR, _JS),
+    "favicon.svg": (STATIC_DIR, "image/svg+xml"),
     "portal.js": (PORTAL_STATIC_DIR, _JS),
     "wallet.js": (PORTAL_STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),

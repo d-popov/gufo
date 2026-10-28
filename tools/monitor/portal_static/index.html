@@ -4,10 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Gufo credits</title>
-  <link rel="stylesheet" href="/static/portal.css">
+  <title>AI Inference – Portal</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/header.css">
   <link rel="stylesheet" href="/static/admin.css">
+  <link rel="stylesheet" href="/static/portal.css">
+  <script src="/static/icons.js" defer></script>
   <script src="/static/header.js" defer></script>
   <script src="/static/admin.js" defer></script>
   <script src="/static/wallet.js" defer></script>
@@ -17,18 +19,18 @@
   <header id="site-header" class="site-header"></header>
 
   <main>
-    <h1 class="page-title">Credits</h1>
+    <h1 class="page-title with-icon"><span data-icon="wallet"></span>Credits</h1>
     <p id="notice" class="notice" hidden></p>
 
     <section id="admin-area" class="admin-area" hidden>
       <div class="section-head">
-        <h2>Admin</h2>
+        <h2 class="with-icon"><span data-icon="shield-check"></span>Admin</h2>
         <div class="tabs" role="tablist" aria-label="Admin">
-          <button type="button" role="tab" id="tab-accounts" class="tab" aria-controls="admin-pane-accounts">Accounts</button>
-          <button type="button" role="tab" id="tab-keys" class="tab" aria-controls="admin-pane-keys">API keys</button>
-          <button type="button" role="tab" id="tab-pricing" class="tab" aria-controls="admin-pane-pricing">Pricing</button>
-          <button type="button" role="tab" id="tab-usage" class="tab" aria-controls="admin-pane-usage">Usage</button>
-          <button type="button" role="tab" id="tab-deposits" class="tab" aria-controls="admin-pane-deposits">Deposits</button>
+          <button type="button" role="tab" id="tab-accounts" class="tab with-icon" aria-controls="admin-pane-accounts"><span data-icon="users"></span>Accounts</button>
+          <button type="button" role="tab" id="tab-keys" class="tab with-icon" aria-controls="admin-pane-keys"><span data-icon="key-round"></span>API keys</button>
+          <button type="button" role="tab" id="tab-pricing" class="tab with-icon" aria-controls="admin-pane-pricing"><span data-icon="tag"></span>Pricing</button>
+          <button type="button" role="tab" id="tab-usage" class="tab with-icon" aria-controls="admin-pane-usage"><span data-icon="chart-column"></span>Usage</button>
+          <button type="button" role="tab" id="tab-deposits" class="tab with-icon" aria-controls="admin-pane-deposits"><span data-icon="landmark"></span>Deposits</button>
         </div>
       </div>
 
@@ -56,7 +58,7 @@
             <input id="credit-amount" required inputmode="decimal" pattern="-?[0-9]+([.][0-9]{1,6})?" size="10">
             <label for="credit-note">Note</label>
             <input id="credit-note" maxlength="200" size="24">
-            <button type="submit">Add credit</button>
+            <button type="submit" class="with-icon"><span data-icon="circle-plus"></span>Add credit</button>
             <button type="button" id="credit-cancel" class="link">Cancel</button>
           </form>
         </section>
@@ -64,7 +66,7 @@
 
       <div id="admin-pane-keys" role="tabpanel" aria-labelledby="tab-keys" hidden>
         <section id="admin-keys-section" hidden>
-          <p class="muted keys-note">All keys in Gufo's key file, including portal users' keys
+          <p class="muted keys-note">All keys in the inference server's key file, including portal users' keys
             (u&lt;id&gt;-&lt;n&gt;), which the portal manages. Usage counts requests in the log since
             the monitor started. <span id="admin-keys-reload" class="muted"></span></p>
           <div class="table-wrap">
@@ -97,14 +99,14 @@
                 <div id="admin-key-model-list"></div>
               </fieldset>
               <div class="form-actions">
-                <button type="submit" id="admin-key-submit">Create key</button>
+                <button type="submit" id="admin-key-submit" class="with-icon"><span data-icon="plus"></span>Create key</button>
                 <button type="button" id="admin-key-cancel" class="link" hidden>Cancel</button>
               </div>
             </form>
             <div id="admin-key-secret" class="key-secret" hidden>
               <p>Token for <strong id="admin-key-secret-name"></strong>. Copy it now: it is shown only once.</p>
               <code id="admin-key-secret-token"></code>
-              <button type="button" id="admin-key-secret-copy">Copy</button>
+              <button type="button" id="admin-key-secret-copy" class="with-icon"><span data-icon="copy"></span>Copy</button>
               <button type="button" id="admin-key-secret-done" class="link">Done</button>
             </div>
           </div>
@@ -135,10 +137,10 @@
               <label for="admin-pricing-new">Model</label>
               <input id="admin-pricing-new" list="admin-pricing-served" maxlength="128" size="28" autocomplete="off">
               <datalist id="admin-pricing-served"></datalist>
-              <button type="button" id="admin-pricing-add">Add model</button>
+              <button type="button" id="admin-pricing-add" class="with-icon"><span data-icon="plus"></span>Add model</button>
             </div>
             <div class="form-actions pricing-actions">
-              <button type="submit" id="admin-pricing-save">Save</button>
+              <button type="submit" id="admin-pricing-save" class="with-icon"><span data-icon="check"></span>Save</button>
               <button type="button" id="admin-pricing-revert" class="link">Revert</button>
               <span id="admin-pricing-state" class="muted"></span>
             </div>
@@ -208,8 +210,8 @@
             credited, for reference only. Delta check: after minus before equals the credited amount.</p>
           <dl id="admin-deposits-totals" class="totals"></dl>
           <div class="inline-form">
-            <button type="button" id="admin-deposits-verify">Re-verify against chain</button>
-            <a id="admin-deposits-csv" href="/api/admin/deposits.csv" download="gufo-deposits.csv">Download CSV</a>
+            <button type="button" id="admin-deposits-verify" class="with-icon"><span data-icon="refresh-cw"></span>Re-verify against chain</button>
+            <a id="admin-deposits-csv" class="with-icon" href="/api/admin/deposits.csv" download="deposits.csv"><span data-icon="download"></span>Download CSV</a>
             <span id="admin-deposits-verify-state" class="muted"></span>
           </div>
           <p id="admin-deposits-error" class="bad" hidden></p>
@@ -233,38 +235,65 @@
       </div>
     </section>
 
-    <section id="auth" hidden>
-      <p class="muted">Pay-as-you-go access to this Gufo server's OpenAI-compatible API. Create an account,
-        get it verified and approved by the admin, then create API keys and top up with USDC.</p>
-      <div class="auth-box">
-        <div class="tabs auth-tabs" role="tablist" aria-label="Account">
-          <button type="button" role="tab" id="auth-tab-signin" class="tab" aria-controls="auth-pane-signin"
-                  aria-selected="true">Sign in</button>
-          <button type="button" role="tab" id="auth-tab-signup" class="tab" aria-controls="auth-pane-signup"
-                  aria-selected="false" tabindex="-1">Sign up</button>
+    <section id="auth" class="auth" hidden>
+      <div class="auth-card">
+        <div class="auth-head">
+          <h2>Welcome</h2>
+          <p id="auth-intro" class="muted">Pay-as-you-go access to this server's OpenAI-compatible API. Create an
+            account, get it verified and approved by the admin, then create API keys and top up with USDC.</p>
         </div>
-        <div id="auth-pane-signin" class="panel auth-pane" role="tabpanel" aria-labelledby="auth-tab-signin">
+        <div class="tabs auth-tabs" role="tablist" aria-label="Sign in">
+          <button type="button" role="tab" id="auth-tab-signin" class="tab with-icon" aria-controls="auth-pane-signin"
+                  aria-selected="true"><span data-icon="log-in"></span>Sign in</button>
+          <button type="button" role="tab" id="auth-tab-signup" class="tab with-icon" aria-controls="auth-pane-signup"
+                  aria-selected="false" tabindex="-1"><span data-icon="user-plus"></span>Sign up</button>
+          <button type="button" role="tab" id="auth-tab-admin" class="tab with-icon" aria-controls="auth-pane-admin"
+                  aria-selected="false" tabindex="-1"><span data-icon="shield-check"></span>Admin</button>
+        </div>
+        <div id="auth-pane-signin" class="auth-pane" role="tabpanel" aria-labelledby="auth-tab-signin">
           <form id="login-form" class="form">
-            <label for="login-email">Email</label>
-            <input id="login-email" type="email" autocomplete="username" required maxlength="254">
-            <label for="login-password">Password</label>
-            <input id="login-password" type="password" autocomplete="current-password" required>
-            <button type="submit">Sign in</button>
-            <p id="login-error" class="bad" hidden></p>
+            <div class="field">
+              <label for="login-email">Email</label>
+              <input id="login-email" type="email" autocomplete="username" required maxlength="254">
+            </div>
+            <div class="field">
+              <label for="login-password">Password</label>
+              <input id="login-password" type="password" autocomplete="current-password" required>
+            </div>
+            <p id="login-error" class="form-error" role="alert" hidden></p>
+            <button type="submit" class="btn-block with-icon"><span data-icon="log-in"></span>Sign in</button>
             <p class="muted auth-switch">No account yet?
               <button type="button" class="link" data-auth-tab="signup">Sign up</button></p>
           </form>
         </div>
-        <div id="auth-pane-signup" class="panel auth-pane" role="tabpanel" aria-labelledby="auth-tab-signup" hidden>
+        <div id="auth-pane-signup" class="auth-pane" role="tabpanel" aria-labelledby="auth-tab-signup" hidden>
           <form id="signup-form" class="form">
-            <label for="signup-email">Email</label>
-            <input id="signup-email" type="email" autocomplete="email" required maxlength="254">
-            <label for="signup-password">Password (at least 10 characters)</label>
-            <input id="signup-password" type="password" autocomplete="new-password" required minlength="10">
-            <button type="submit">Sign up</button>
-            <p id="signup-error" class="bad" hidden></p>
+            <div class="field">
+              <label for="signup-email">Email</label>
+              <input id="signup-email" type="email" autocomplete="email" required maxlength="254">
+            </div>
+            <div class="field">
+              <label for="signup-password">Password</label>
+              <input id="signup-password" type="password" autocomplete="new-password" required minlength="10"
+                     aria-describedby="signup-password-hint">
+              <span id="signup-password-hint" class="field-hint">At least 10 characters.</span>
+            </div>
+            <p id="signup-error" class="form-error" role="alert" hidden></p>
+            <button type="submit" class="btn-block with-icon"><span data-icon="user-plus"></span>Create account</button>
             <p class="muted auth-switch">Already have an account?
               <button type="button" class="link" data-auth-tab="signin">Sign in</button></p>
+          </form>
+        </div>
+        <div id="auth-pane-admin" class="auth-pane" role="tabpanel" aria-labelledby="auth-tab-admin" hidden>
+          <form id="admin-login-form" class="form">
+            <div class="field">
+              <label for="admin-login-token">Admin token</label>
+              <input id="admin-login-token" type="password" autocomplete="off" required
+                     aria-describedby="admin-login-hint">
+              <span id="admin-login-hint" class="field-hint">From the server's admin token file.</span>
+            </div>
+            <p id="admin-login-error" class="form-error" role="alert" hidden></p>
+            <button type="submit" class="btn-block with-icon"><span data-icon="shield-check"></span>Sign in as admin</button>
           </form>
         </div>
       </div>
@@ -275,18 +304,18 @@
 
       <div class="cards">
         <div class="card">
-          <div class="card-label">Balance</div>
+          <div class="card-label with-icon"><span data-icon="wallet"></span>Balance</div>
           <div id="balance" class="card-value">—</div>
           <div id="balance-sub" class="card-sub"></div>
         </div>
         <div class="card">
-          <div class="card-label">Model</div>
+          <div class="card-label with-icon"><span data-icon="cpu"></span>Model</div>
           <div id="model" class="card-value small"></div>
           <div class="card-sub">served by this endpoint</div>
         </div>
       </div>
 
-      <h2>Prices</h2>
+      <h2 class="with-icon"><span data-icon="tag"></span>Prices</h2>
       <div class="table-wrap">
         <table id="pricing" class="data narrow">
           <thead><tr><th>Tokens</th><th class="num">USD per 1M tokens</th></tr></thead>
@@ -299,7 +328,7 @@
         start again after a top-up.</p>
 
       <section id="keys-section">
-        <h2>API keys</h2>
+        <h2 class="with-icon"><span data-icon="key-round"></span>API keys</h2>
         <p id="keys-locked" class="muted" hidden>API keys become available once the admin approves your account.</p>
         <div id="keys-body">
           <div class="table-wrap">
@@ -311,13 +340,13 @@
           <form id="key-form" class="inline-form">
             <label for="key-label">Label</label>
             <input id="key-label" maxlength="64" placeholder="e.g. laptop">
-            <button type="submit">Create key</button>
+            <button type="submit" class="with-icon"><span data-icon="plus"></span>Create key</button>
           </form>
           <div id="key-secret" class="secret" hidden>
             <p>Token for <strong id="key-secret-name"></strong>. Copy it now: it is shown only once.</p>
             <code id="key-secret-token"></code>
             <div class="form-actions">
-              <button type="button" id="key-secret-copy">Copy</button>
+              <button type="button" id="key-secret-copy" class="with-icon"><span data-icon="copy"></span>Copy</button>
               <button type="button" id="key-secret-done" class="link">Done</button>
             </div>
           </div>
@@ -326,14 +355,14 @@
       </section>
 
       <section>
-        <h2>Using the API</h2>
+        <h2 class="with-icon"><span data-icon="code"></span>Using the API</h2>
         <p>Base URL: <code id="base-url" class="inline"></code>
-          <button type="button" id="base-url-copy" class="link">Copy</button></p>
+          <button type="button" id="base-url-copy" class="link with-icon"><span data-icon="copy"></span>Copy</button></p>
         <pre id="curl" class="code"></pre>
       </section>
 
       <section id="topup">
-        <h2>Top up</h2>
+        <h2 class="with-icon"><span data-icon="arrow-down-to-line"></span>Top up</h2>
         <p id="topup-locked" class="muted" hidden>Top-ups are possible once the admin approves your account.</p>
         <div id="topup-body">
           <p class="muted note">Pay in USDC; 1 USDC adds $1.00. The paying wallet must be linked to this
@@ -352,8 +381,8 @@
               <div id="solana-connected" class="connected" hidden>
                 <div>Connected: <code id="solana-address" class="inline"></code> <span id="solana-linked"></span></div>
                 <div class="form-actions">
-                  <button type="button" id="solana-link">Link wallet</button>
-                  <button type="button" id="solana-pay">Pay with Solana</button>
+                  <button type="button" id="solana-link" class="with-icon"><span data-icon="link"></span>Link wallet</button>
+                  <button type="button" id="solana-pay" class="with-icon"><span data-icon="wallet"></span>Pay with Solana</button>
                 </div>
               </div>
             </div>
@@ -364,8 +393,8 @@
               <div id="base-connected" class="connected" hidden>
                 <div>Connected: <code id="base-address" class="inline"></code> <span id="base-linked"></span></div>
                 <div class="form-actions">
-                  <button type="button" id="base-link">Link wallet</button>
-                  <button type="button" id="base-pay">Pay with Base</button>
+                  <button type="button" id="base-link" class="with-icon"><span data-icon="link"></span>Link wallet</button>
+                  <button type="button" id="base-pay" class="with-icon"><span data-icon="wallet"></span>Pay with Base</button>
                 </div>
               </div>
             </div>
@@ -377,7 +406,7 @@
       </section>
 
       <section>
-        <h2>History</h2>
+        <h2 class="with-icon"><span data-icon="receipt"></span>History</h2>
         <div class="table-wrap">
           <table id="ledger" class="data">
             <thead>
