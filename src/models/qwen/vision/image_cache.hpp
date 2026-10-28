@@ -39,9 +39,10 @@ public:
     std::size_t evictions{0};
   };
 
+  /// `hit`, when set, reports whether this call reused retained pixels.
   [[nodiscard]] std::shared_ptr<const core::Image> Get(
       const std::shared_ptr<const std::vector<std::uint8_t>>& encoded,
-      tokenization::ChatMessage::ImageDetail detail);
+      tokenization::ChatMessage::ImageDetail detail, bool* hit = nullptr);
   [[nodiscard]] Stats GetStats() const;
 
 private:

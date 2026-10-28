@@ -174,6 +174,21 @@ void TestPromptIdentities() {
   assert(warm.images[0].pixels->width == 320 &&
          warm.images[0].pixels->height == 224);
   assert(cache.GetStats().hits == 2 && cache.GetStats().misses == 2);
+  // Per-request counts, independent of the shared cache's totals.
+  assert(uncached.preprocess.cache_hits == 0 &&
+         uncached.preprocess.cache_misses == 2);
+  assert(cold.preprocess.cache_hits == 0 && cold.preprocess.cache_misses == 2);
+  assert(warm.preprocess.cache_hits == 2 && warm.preprocess.cache_misses == 0);
+  assert(warm.preprocess.encoded_bytes == red->size() + blue->size());
+  assert(warm.preprocess.pixels ==
+         std::size_t{320} * 224 + std::size_t{warm.images[1].pixels->width} *
+                                      warm.images[1].pixels->height);
+  assert(warm.encode_usage && warm.encode_usage != cold.encode_usage &&
+         warm.encode_usage->images == 0);
+  // Grids (13,7,10)/(85,8,8), each with a start and an end marker.
+  assert(warm.VisualTokens(warm.tokens.size()) == 72 + 66);
+  assert(warm.VisualTokens(12) == 0 && warm.VisualTokens(13) == 1);
+  assert(warm.VisualTokens(84) == 72 && warm.VisualTokens(86) == 74);
   const auto other_encoder = prepare(&cache, "another encoder");
   assert(other_encoder.cache_identity != warm.cache_identity &&
          other_encoder.images[0].pixels == warm.images[0].pixels);

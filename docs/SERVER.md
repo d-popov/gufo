@@ -263,6 +263,20 @@ hash; a new screenshot still needs vision encoding and prefill. Debug logs
 expose `event=image_cache` with whether reuse is enabled, entries, retained
 pixel/encoded bytes, hits, misses and evictions.
 
+The `event=completed` line of a Qwen chat, Responses or Anthropic request with
+images adds `images`, `image_tokens` (image pads plus vision start/end
+markers), `image_bytes` (encoded bytes received), `image_px` (pixels after
+resize), `image_px_hits` and `image_px_misses` (this request's pixel-cache
+lookups; a miss, or any image with `cache_prompt: false`, decoded and resized
+the image), `encoder_images` and `encode_ms` (vision encoder runs for this
+request and their wall time, which includes the encoder's own stream
+synchronization; a cancelled encode adds its time but not an image), and
+`image_tokens_reused` (visual tokens inside the reused prefix counted by
+`cached_tokens`). A pixel-cache hit can still run the encoder;
+`encoder_images` is 0 when continuation reuse covered the images or the
+session still held their embeddings from its previous request. Text-only
+lines are unchanged.
+
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
 container limits. Available RAM is `MemAvailable` minus `CmaFree`: free CMA

@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN_VISION_PROMPT_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -48,6 +49,23 @@ struct PreparedImage {
   std::array<std::uint8_t, 32> prefix_identity{};
 };
 
+/// Vision encoder work for one request, written by the session that injects
+/// the prompt's images. A later request that reuses the same session's
+/// embeddings owns a new Prompt and therefore does not count them again.
+struct EncodeUsage {
+  std::atomic<std::size_t> images{0};
+  std::atomic<std::uint64_t> nanoseconds{0};
+};
+
+/// CPU preprocessing of one request's images. A miss decoded and resized the
+/// image, including when the request bypassed the ImageCache.
+struct PreprocessUsage {
+  std::size_t encoded_bytes{0};
+  std::size_t pixels{0};
+  std::size_t cache_hits{0};
+  std::size_t cache_misses{0};
+};
+
 struct Prompt {
   std::vector<tokenization::TokenId> tokens;
   /// Frontier unchanged when an interrupted assistant is followed by a user.
@@ -57,8 +75,14 @@ struct Prompt {
   /// SHA-256 covers decoded pixels, grid placement, preprocessing version,
   /// and the model-specific encoder identity. Tokens remain a separate key.
   std::vector<std::uint8_t> cache_identity;
+  PreprocessUsage preprocess;
+  /// Null for text-only prompts.
+  std::shared_ptr<EncodeUsage> encode_usage;
   [[nodiscard]] std::span<const std::uint8_t> IdentityForPrefix(
       std::size_t token_count) const;
+  /// Image pads plus their vision start/end markers among the first
+  /// `token_count` tokens.
+  [[nodiscard]] std::size_t VisualTokens(std::size_t token_count) const;
 };
 
 /// `kLow` limits both sides of the resized image to 512 pixels, which is at

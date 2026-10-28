@@ -201,6 +201,15 @@ inline std::string GenerationLogDetails(
     out << " cache_miss_reason=" << result.cache_miss_reason
         << " common_prefix_tokens=" << result.cache_common_prefix_tokens
         << " nearest_checkpoint_tokens=" << result.cache_checkpoint_tokens;
+  if (const auto& images = result.images)
+    out << " images=" << images->images << " image_tokens=" << images->tokens
+        << " image_bytes=" << images->encoded_bytes
+        << " image_px=" << images->pixels
+        << " image_px_hits=" << images->preprocess_hits
+        << " image_px_misses=" << images->preprocess_misses
+        << " encoder_images=" << images->encoder_images
+        << " encode_ms=" << images->encode_ms
+        << " image_tokens_reused=" << images->reused_tokens;
   return out.str();
 }
 

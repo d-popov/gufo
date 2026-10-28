@@ -10,7 +10,7 @@ namespace gufo::models::qwen::vision {
 
 std::shared_ptr<const core::Image> ImageCache::Get(
     const std::shared_ptr<const std::vector<std::uint8_t>>& encoded,
-    tokenization::ChatMessage::ImageDetail detail) {
+    tokenization::ChatMessage::ImageDetail detail, bool* hit) {
   if (!encoded)
     throw std::invalid_argument("image input has no encoded bytes");
   const std::hash<std::string_view> hash;
@@ -26,10 +26,14 @@ std::shared_ptr<const core::Image> ImageCache::Get(
     const auto found = std::ranges::find_if(entries_, matches);
     if (found != entries_.end()) {
       ++stats_.hits;
+      if (hit != nullptr)
+        *hit = true;
       entries_.splice(entries_.begin(), entries_, found);
       return found->image;
     }
     ++stats_.misses;
+    if (hit != nullptr)
+      *hit = false;
   }
   // Decode outside the lock so a new upload cannot block historical hits.
   // A concurrent miss may duplicate work, but only one result is retained.

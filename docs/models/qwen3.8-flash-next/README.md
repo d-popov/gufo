@@ -115,6 +115,40 @@ with `--mmproj`. PNG/JPEG CLI and HTTP requests use the
 in prefill, decoding, verification, multi-turn reuse and disk cache identity.
 The predictor embeds shifted text IDs; visual information comes from target
 hidden states and mRoPE. Image snapshots require matching prompt attachment.
+Completion log lines of image requests carry preprocessing, encoder and reuse
+fields; see the image cache notes in [SERVER.md](../../SERVER.md).
+
+### Strix Halo production setup (October 27, 2026)
+
+The production launcher `~/.local/bin/gufo-flash-next` now passes
+`--mmproj "$H/vision/mmproj-BF16.gguf"` alongside the existing target and shared
+Q8 MTP. The projector is the official Unsloth file at the pinned revision above:
+907,542,944 bytes, SHA-256
+`2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355`.
+The locally present F16 projector is not supported by this BF16 loader.
+Keeping BF16 in the `vision/` subdirectory avoids implicit discovery when
+restoring the text-only launcher saved outside the repository at
+`~/.local/bin/gufo-flash-next.before-vision-20261027`.
+
+All four MTP7 sessions remain unchanged: one 262144-token main slot and three
+98304-token sub slots. Prepared vision weights occupy 903,984,064 bytes
+(0.842 GiB). Image-capable admission additionally reserves
+`context * (2560 * 4 + 3 * 4) + 64` bytes per session: 2.503 GiB for the main
+slot and 0.939 GiB per sub slot, 5.319 GiB total. Logged session reservations
+rose from 16,613,262,416 to 22,324,200,784 bytes; these are capacity reservations,
+not immediate resident allocations. Encoder scratch and image/cache contents
+are additional and depend on image size; `detail: low` bounds resolution to
+512 × 512 when full detail is unnecessary.
+
+After waiting for idle `/slots`, the existing ROCm container started in 28.9 s,
+using 101305 MiB of the 122880 MiB HIP heap with 5400 MiB host RAM available.
+Both served model IDs advertise `["text", "image"]`. A real PNG request and the
+same PNG returned in tool-result content correctly identified a red left
+shape and blue right circle; a subsequent text request returned `TEXT_OK`.
+Host available RAM remained about 4.76 GiB after these small smoke requests.
+This confirms setup, not maximum-resolution/concurrent-image memory safety
+or vision benchmark accuracy; the [encoder parity limitation](QUALITY.md#vision)
+still applies. No session/context reductions were needed.
 
 ## Tools and artifacts
 

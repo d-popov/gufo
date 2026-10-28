@@ -153,6 +153,19 @@ std::span<const std::uint8_t> Prompt::IdentityForPrefix(
   return {};
 }
 
+std::size_t Prompt::VisualTokens(std::size_t token_count) const {
+  std::size_t count = 0;
+  for (const auto& image : images) {
+    // The vision start marker precedes the pads and the end marker follows.
+    const std::size_t begin = image.grid.offset - 1;
+    const std::size_t end = std::size_t{image.grid.offset} +
+                            image.grid.height * image.grid.width + 1;
+    if (begin < token_count)
+      count += std::min(end, token_count) - begin;
+  }
+  return count;
+}
+
 void RopeLayout::Validate(std::uint32_t max_context) const {
   // Every non-overlapping image occupies at least one context position.
   if (images.size() > max_context)
@@ -325,10 +338,14 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       if (index >= offsets.size())
         throw std::logic_error("image rendering lost a part");
       append(cursor, offsets[index]);
+      bool hit = false;
       auto pixels = image_cache
-                        ? image_cache->Get(image.bytes, image.detail)
+                        ? image_cache->Get(image.bytes, image.detail, &hit)
                         : std::make_shared<const core::Image>(ResizeImage(
                               core::DecodeImage(*image.bytes), image.detail));
+      prompt.preprocess.encoded_bytes += image.bytes->size();
+      prompt.preprocess.pixels += std::size_t{pixels->width} * pixels->height;
+      ++(hit ? prompt.preprocess.cache_hits : prompt.preprocess.cache_misses);
       const ImageGrid grid{static_cast<std::uint32_t>(prompt.tokens.size()),
                            pixels->height / kResizeFactor,
                            pixels->width / kResizeFactor};
@@ -361,6 +378,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   if (!prompt.images.empty()) {
     const auto digest = identity.Finish();
     prompt.cache_identity.assign(digest.begin(), digest.end());
+    prompt.encode_usage = std::make_shared<EncodeUsage>();
   }
   return prompt;
 }

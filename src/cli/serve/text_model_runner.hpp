@@ -38,6 +38,12 @@ struct TextPromptContext {
       std::size_t token_count) const {
     return PrefixInputIdentity(cache_identity, cache_prefixes, token_count);
   }
+  /// Image work of the request this context belongs to, given how many
+  /// prompt tokens it reused. Empty for contexts without images.
+  [[nodiscard]] virtual std::optional<TextGenerationBackend::ImageMetrics>
+  Images(std::size_t) const {
+    return std::nullopt;
+  }
 };
 
 struct TextPreparedPrompt {

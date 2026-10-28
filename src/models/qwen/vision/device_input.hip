@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 
@@ -108,8 +109,31 @@ void DeviceInput::Inject(float* hidden, std::uint32_t position,
     const auto end = std::min(position + count, image_end);
     if (begin >= end)
       continue;
-    if (!embeddings_[index])
-      embeddings_[index] = encoder_->Encode(*image.pixels, {}, is_cancelled_);
+    if (!embeddings_[index]) {
+      // Encode returns after synchronizing its stream, so wall time covers
+      // its allocations, upload and GPU work without another sync. A
+      // cancelled or failed encode still spent that time.
+      const auto started = std::chrono::steady_clock::now();
+      const auto record = [&](bool completed) noexcept {
+        if (!prompt_->encode_usage)
+          return;
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        prompt_->encode_usage->nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
+                    .count()),
+            std::memory_order_relaxed);
+        if (completed)
+          prompt_->encode_usage->images.fetch_add(1, std::memory_order_relaxed);
+      };
+      try {
+        embeddings_[index] = encoder_->Encode(*image.pixels, {}, is_cancelled_);
+      } catch (...) {
+        record(false);
+        throw;
+      }
+      record(true);
+    }
     const auto& embedding = *embeddings_[index];
     if (embedding.width() != width ||
         embedding.rows() != image.grid.height * image.grid.width) {

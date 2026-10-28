@@ -199,8 +199,27 @@ public:
     }
   };
 
+  /// Image inputs of one request. Preprocessing counts CPU decode/resize;
+  /// encoder fields count only vision encoding run for this request.
+  struct ImageMetrics {
+    std::size_t images{0};
+    /// Image pads plus vision start/end markers in the prompt.
+    std::size_t tokens{0};
+    std::size_t encoded_bytes{0};
+    /// Pixels after resize.
+    std::size_t pixels{0};
+    std::size_t preprocess_hits{0};
+    std::size_t preprocess_misses{0};
+    std::size_t encoder_images{0};
+    double encode_ms{0.0};
+    /// Visual tokens inside the reused prompt prefix (cached_prompt_tokens).
+    std::size_t reused_tokens{0};
+  };
+
   struct Result {
     std::optional<ComponentCacheMetrics> component_cache;
+    /// Absent for text-only prompts.
+    std::optional<ImageMetrics> images;
     std::string text;
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};

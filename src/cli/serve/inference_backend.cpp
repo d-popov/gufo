@@ -74,6 +74,25 @@ void SetError(std::string* error, std::string message) {
 
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
+
+  [[nodiscard]] std::optional<TextGenerationBackend::ImageMetrics> Images(
+      std::size_t reused_tokens) const override {
+    const auto& preprocess = prompt->preprocess;
+    const auto& encode = *prompt->encode_usage;
+    return TextGenerationBackend::ImageMetrics{
+        .images = prompt->images.size(),
+        .tokens = prompt->VisualTokens(prompt->tokens.size()),
+        .encoded_bytes = preprocess.encoded_bytes,
+        .pixels = preprocess.pixels,
+        .preprocess_hits = preprocess.cache_hits,
+        .preprocess_misses = preprocess.cache_misses,
+        .encoder_images = encode.images.load(std::memory_order_relaxed),
+        .encode_ms = static_cast<double>(
+                         encode.nanoseconds.load(std::memory_order_relaxed)) /
+                     1e6,
+        .reused_tokens = prompt->VisualTokens(reused_tokens),
+    };
+  }
 };
 
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,

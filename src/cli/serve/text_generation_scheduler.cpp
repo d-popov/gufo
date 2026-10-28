@@ -86,6 +86,7 @@ struct ScheduledRequest {
   // Index into the pool's session classes; admission uses only its slots.
   std::size_t session_class{0};
   std::vector<TextRunnerToken> prompt;
+  // Kept after admission until FinalizeResult reads its image metrics.
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
   std::size_t cache_prefix_tokens{0};
@@ -833,6 +834,11 @@ struct TextGenerationScheduler::Impl {
           request->inter_token_total.count() /
           static_cast<double>(request->inter_token_samples);
     }
+    if (request->prompt_context) {
+      request->result.images =
+          request->prompt_context->Images(request->result.cached_prompt_tokens);
+      request->prompt_context.reset();
+    }
     if (!incremental_text_is_exact) {
       request->result.text =
           runner_pool->runner().Decode(request->result.tokens);
@@ -1299,7 +1305,7 @@ struct TextGenerationScheduler::Impl {
                      CancellationRequested(request) ||
                      DeadlineExceeded(request);
             },
-            std::move(request->prompt_context), request->cache_prompt,
+            request->prompt_context, request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
             request->session_class);
         // Each admission may restore or capture a checkpoint of its own.

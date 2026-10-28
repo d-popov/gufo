@@ -253,6 +253,24 @@ const FakeState& RequireFakeState(const TextRunnerState& state) {
   return *fake;
 }
 
+// Reports fixed image work and the reused prefix the scheduler passes in.
+class ImageContext final : public gufo::server::TextPromptContext {
+public:
+  [[nodiscard]] std::optional<gufo::server::TextGenerationBackend::ImageMetrics>
+  Images(std::size_t reused_tokens) const override {
+    return gufo::server::TextGenerationBackend::ImageMetrics{
+        .images = 1,
+        .tokens = 4,
+        .encoded_bytes = 1234,
+        .pixels = 1024,
+        .preprocess_hits = 1,
+        .encoder_images = 1,
+        .encode_ms = 2.5,
+        .reused_tokens = std::min<std::size_t>(reused_tokens, 4),
+    };
+  }
+};
+
 class FakeRunner final : public TextModelRunner {
 public:
   explicit FakeRunner(std::shared_ptr<FakeControl> control)
@@ -334,6 +352,14 @@ public:
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest&) const override {
     return std::nullopt;
+  }
+
+  void SetPromptContext(TextRunnerState&,
+                        std::shared_ptr<const gufo::server::TextPromptContext>
+                            context) const override {
+    if (context != nullptr &&
+        dynamic_cast<const ImageContext*>(context.get()) == nullptr)
+      throw std::invalid_argument("model does not support this prompt context");
   }
 
   [[nodiscard]] std::string Decode(
@@ -1878,6 +1904,44 @@ void TestMetricsDuringCacheAdmission() {
          "failed admission releases the session for replacement work");
 }
 
+void TestImageMetricsFollowTheirRequest() {
+  using gufo::server::GenerationLogDetails;
+  auto control = std::make_shared<FakeControl>();
+  control->snapshot_callback = [] {};
+  auto scheduler = MakeScheduler(control, 1);
+  const auto text = scheduler->Submit({1, 10}, 1, 0.0F).Wait();
+  Expect(!text.images &&
+             GenerationLogDetails(text).find("image") == std::string::npos &&
+             GenerationLogDetails(text).find("encode") == std::string::npos,
+         "text-only requests log no image fields");
+
+  TextRequestMetadata metadata;
+  metadata.prompt_context = std::make_shared<ImageContext>();
+  const auto cold =
+      scheduler->Submit({2, 20}, 1, 0.0F, {}, false, metadata).Wait();
+  Expect(cold.images && cold.images->reused_tokens == 0,
+         "an image request reports its own metrics without reuse");
+  Expect(GenerationLogDetails(cold).ends_with(
+             " images=1 image_tokens=4 image_bytes=1234 image_px=1024"
+             " image_px_hits=1 image_px_misses=0 encoder_images=1"
+             " encode_ms=2.5 image_tokens_reused=0"),
+         "image metrics follow the completion log fields");
+
+  const auto warm =
+      scheduler->Submit({2, 20, 200, 21}, 1, 0.0F, {}, false, metadata).Wait();
+  Expect(warm.cache_hit && warm.cached_prompt_tokens == 3 && warm.images &&
+             warm.images->reused_tokens == 3,
+         "reused image tokens follow the request's own cached prefix");
+
+  const auto cancelled =
+      scheduler->Submit(
+                   {3, 30}, 1, 0.0F, [] { return true; }, false, metadata)
+          .Wait();
+  Expect(cancelled.cancelled && cancelled.images &&
+             cancelled.images->reused_tokens == 0,
+         "cancelled image requests still report their preprocessing");
+}
+
 void TestSessionStatesFollowAdmittedRequests() {
   namespace metrics = gufo::server::detail;
   const auto processing_before = metrics::RequestsProcessing().load();
@@ -3084,6 +3148,7 @@ int main() {
   TestQueuedAndPrefillCancellation();
   TestServerMetricsAreLive();
   TestMetricsDuringCacheAdmission();
+  TestImageMetricsFollowTheirRequest();
   TestSessionStatesFollowAdmittedRequests();
   TestDecodeCancellationAndStateReclamation();
   TestFourResidentRequestsMakeProgress();
