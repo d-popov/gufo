@@ -723,15 +723,15 @@ struct TextRunnerPool::Impl {
       // The state claim includes lazy image/rollback storage, not startup
       // usage.
       component_cache =
-          named ? std::make_unique<ComponentTextCache>(
-                      validated.runner, classes, std::min(requested, ceiling),
-                      disk_cache_options, !ram_cache_options.capacity_bytes,
-                      ceiling, ram_cache_options.enabled)
-                : std::make_unique<ComponentTextCache>(
-                      validated.runner, state_count,
-                      std::min(requested, ceiling), disk_cache_options,
-                      !ram_cache_options.capacity_bytes, ceiling,
-                      ram_cache_options.enabled);
+          named
+              ? std::make_unique<ComponentTextCache>(
+                    validated.runner, classes, std::min(requested, ceiling),
+                    disk_cache_options, !ram_cache_options.capacity_bytes,
+                    ceiling, ram_cache_options.enabled)
+              : std::make_unique<ComponentTextCache>(
+                    validated.runner, state_count, std::min(requested, ceiling),
+                    disk_cache_options, !ram_cache_options.capacity_bytes,
+                    ceiling, ram_cache_options.enabled);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
