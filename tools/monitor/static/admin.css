@@ -1,0 +1,67 @@
+/* Panels shared by the monitor page and the portal page: section headings, totals,
+   API keys, accounts and pricing (admin.js). Colours come from the page's own stylesheet. */
+
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.state-busy { color: var(--ok); font-weight: 600; }
+.state-prompt { color: var(--busy); font-weight: 600; }
+
+.totals { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px 16px; margin: 0; }
+.totals div { border-left: 2px solid var(--line); padding-left: 10px; }
+.totals dt { font-size: 0.8rem; color: var(--muted); }
+.totals dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.keys-note { font-size: 0.8rem; margin: 6px 0 0; }
+.inline-form, .key-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-top: 14px; }
+.key-form { flex-direction: column; align-items: stretch; max-width: 420px; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.key-form h3 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+.key-form fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; margin: 0; }
+.key-form fieldset label { display: block; }
+.inline-form input, .key-form input:not([type=checkbox]), .key-form select {
+  font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text);
+}
+.inline-form button[type=submit], .key-form button[type=submit], .key-secret button:not(.link) {
+  font: inherit; font-weight: 600; padding: 6px 12px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer;
+}
+.form-actions { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+button.link.danger { color: var(--bad); }
+button.link:disabled { color: var(--muted); cursor: default; text-decoration: none; }
+.key-secret { margin-top: 14px; padding: 12px; border: 1px solid var(--busy); border-radius: 6px; max-width: 640px; }
+.key-secret p { margin: 0 0 8px; }
+.key-secret code { display: block; padding: 8px; margin-bottom: 8px; background: var(--panel); border-radius: 4px; word-break: break-all; user-select: all; }
+
+#accounts-totals { margin-bottom: 12px; }
+table.data td.wrap { white-space: normal; overflow-wrap: anywhere; min-width: 160px; }
+.verify-link { font-size: 0.8rem; margin-top: 2px; }
+.verify-link code { user-select: all; overflow-wrap: anywhere; }
+.account-actions button + button { margin-left: 12px; }
+.accounts-message { margin: 0 0 10px; padding: 6px 10px; border-left: 3px solid var(--ok); background: var(--panel); border-radius: 4px; }
+.credit-form { padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+
+.pricing-edit input {
+  font: inherit; font-variant-numeric: tabular-nums; text-align: right; width: 8em;
+  padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text);
+}
+.pricing-edit input.invalid { border-color: var(--bad); outline-color: var(--bad); }
+.pricing-edit td.price-default { font-weight: 600; }
+.pricing-errors { margin-top: 8px; font-size: 0.9rem; }
+#admin-pricing-add {
+  font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer;
+}
+.pricing-actions { margin-top: 12px; }
+.pricing-actions button[type=submit] {
+  font: inherit; font-weight: 600; padding: 6px 12px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer;
+}
+.pricing-actions button:disabled, #admin-pricing-add:disabled { opacity: 0.55; cursor: default; }
+
+.usage-head { margin-bottom: 14px; }
+.usage-head p { flex: 1; min-width: 220px; }
+.usage-window { display: flex; align-items: center; gap: 8px; }
+.usage-window select {
+  font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--text);
+}
+.usage-title { font-size: 1rem; margin: 20px 0 8px; }
+
+@media (max-width: 640px) {
+  .totals { grid-template-columns: 1fr; }
+}

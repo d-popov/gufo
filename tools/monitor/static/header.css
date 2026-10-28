@@ -1,0 +1,61 @@
+/* Page header shared by the portal and monitor pages (header.js). Colours come from the
+   page's own stylesheet; everything else is set here so both pages look the same. */
+
+.site-header { font-size: 1rem; line-height: 1.45; border-bottom: 1px solid var(--line); }
+.site-bar { display: flex; align-items: center; gap: 20px; padding: 14px 0; }
+.site-header .brand { font-size: 1.3rem; font-weight: 600; color: var(--text); text-decoration: none; }
+.site-nav { display: flex; gap: 4px; flex: 1; min-width: 0; flex-wrap: wrap; }
+.site-link {
+  padding: 4px 10px; border-radius: 6px; color: var(--muted); font-weight: 600; text-decoration: none;
+}
+.site-link:hover, .site-link:focus-visible { color: var(--text); background: var(--panel); }
+.site-link[aria-current="page"] { color: var(--text); background: var(--panel); }
+
+/* Profile menu: a round avatar with the account's initial, or a person glyph. */
+.profile { position: relative; }
+.profile button.avatar {
+  position: relative; overflow: hidden; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center; font: inherit; font-weight: 600;
+  background: var(--accent); color: #fff; cursor: pointer;
+}
+.profile button.avatar.anon { background: var(--panel); border: 1px solid var(--line); }
+.profile button.avatar.anon::before, .profile button.avatar.anon::after {
+  content: ""; position: absolute; left: 50%; background: var(--muted);
+}
+.profile button.avatar.anon::before { top: 7px; width: 12px; height: 12px; margin-left: -6px; border-radius: 50%; }
+.profile button.avatar.anon::after { bottom: -9px; width: 24px; height: 18px; margin-left: -12px; border-radius: 50% 50% 0 0; }
+.profile button.avatar.is-admin { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ok); }
+.menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 10; min-width: 230px; padding: 6px 0;
+  display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+.menu-info { padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: 0.9rem; }
+.menu-email { font-weight: 600; overflow-wrap: anywhere; }
+.menu-muted { color: var(--muted); }
+.menu .menu-item {
+  display: block; width: 100%; padding: 8px 14px; text-align: left; font: inherit; font-weight: 400;
+  background: none; color: var(--text); border: 0; border-radius: 0; cursor: pointer; text-decoration: none;
+}
+.menu .menu-item:hover, .menu .menu-item:focus-visible { background: var(--panel); }
+
+/* Admin sign-in, opened from the menu, under the bar. */
+.header-login {
+  display: flex; flex-direction: column; gap: 8px; max-width: 360px; margin: 0 0 16px; padding: 14px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+}
+.header-login h2 { font-size: 1.05rem; font-weight: 600; margin: 0; }
+.header-login input {
+  font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--text);
+}
+.header-actions { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+.header-login .header-primary {
+  font: inherit; font-weight: 600; padding: 6px 12px; border: 0; border-radius: 6px;
+  background: var(--accent); color: #fff; cursor: pointer;
+}
+.header-login .header-link {
+  background: none; border: 0; border-radius: 0; color: var(--accent); cursor: pointer; font: inherit; padding: 0;
+}
+.header-login .header-link:hover { text-decoration: underline; }
+.header-error { margin: 0; color: var(--bad); font-weight: 600; }

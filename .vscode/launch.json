@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "gufo-monitor + credits portal (dev, :8199)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "sh tools/monitor/dev.sh",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

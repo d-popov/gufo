@@ -6,20 +6,22 @@
   <meta name="referrer" content="no-referrer">
   <title>Gufo monitor</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/header.css">
+  <link rel="stylesheet" href="/static/admin.css">
+  <script src="/static/header.js" defer></script>
+  <script src="/static/admin.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <header class="top">
-    <div class="title">
-      <h1>Gufo monitor</h1>
-      <span id="model" class="muted"></span>
-    </div>
+  <header id="site-header" class="site-header"></header>
+
+  <div class="status-row">
+    <h1>Monitor</h1>
     <span id="pill" class="pill pill-down">Connecting</span>
-    <form id="logout" method="post" action="/logout" class="logout">
-      <button type="submit" class="link">Log out</button>
-    </form>
-  </header>
+    <span id="model" class="muted"></span>
+  </div>
   <p id="detail" class="detail" hidden></p>
+  <p id="expired" class="detail" role="alert" hidden>Admin session expired, <a href="/">sign in again</a>.</p>
 
   <main>
     <section aria-label="Live metrics">
@@ -56,13 +58,13 @@
       <p id="requests-empty" class="muted">No completed requests yet.</p>
     </section>
 
-    <section id="keys-section" hidden>
+    <section id="admin-keys-section" hidden>
       <div class="section-head">
         <h2>API keys</h2>
-        <span id="keys-reload" class="muted"></span>
+        <span id="admin-keys-reload" class="muted"></span>
       </div>
       <div class="table-wrap">
-        <table id="keys" class="data">
+        <table id="admin-keys" class="data">
           <thead>
             <tr>
               <th>Key</th><th>Access</th><th>Models</th>
@@ -75,42 +77,146 @@
         </table>
       </div>
       <p class="muted keys-note">Usage counts requests in the log since the monitor started.</p>
-      <p id="keys-error" class="bad" hidden></p>
+      <p id="admin-keys-error" class="bad" hidden></p>
 
-      <form id="admin-unlock" class="inline-form">
-        <label for="admin-token">Admin token</label>
-        <input id="admin-token" type="password" autocomplete="off" required>
-        <button type="submit">Unlock key management</button>
-      </form>
-
-      <div id="keys-admin" hidden>
-        <form id="key-form" class="key-form">
-          <h3 id="key-form-title">New key</h3>
-          <label for="key-name">Name</label>
-          <input id="key-name" required pattern="[A-Za-z0-9._\-]{1,64}" maxlength="64">
-          <label for="key-access">Access</label>
-          <select id="key-access">
+      <div id="admin-keys-manage" hidden>
+        <form id="admin-key-form" class="key-form">
+          <h3 id="admin-key-form-title">New key</h3>
+          <label for="admin-key-name">Name</label>
+          <input id="admin-key-name" required pattern="[A-Za-z0-9._\-]{1,64}" maxlength="64">
+          <label for="admin-key-access">Access</label>
+          <select id="admin-key-access">
             <option value="inference">Inference</option>
             <option value="monitor">Monitoring only (health, models, props, slots, metrics)</option>
           </select>
-          <fieldset id="key-models">
+          <fieldset id="admin-key-models">
             <legend>Models</legend>
-            <label><input type="checkbox" id="key-all-models" checked> All models</label>
-            <div id="key-model-list"></div>
+            <label><input type="checkbox" id="admin-key-all-models" checked> All models</label>
+            <div id="admin-key-model-list"></div>
           </fieldset>
           <div class="form-actions">
-            <button type="submit" id="key-submit">Create key</button>
-            <button type="button" id="key-cancel" class="link" hidden>Cancel</button>
-            <button type="button" id="admin-lock" class="link">Lock</button>
+            <button type="submit" id="admin-key-submit">Create key</button>
+            <button type="button" id="admin-key-cancel" class="link" hidden>Cancel</button>
           </div>
         </form>
-        <div id="key-secret" class="key-secret" hidden>
-          <p>Token for <strong id="key-secret-name"></strong>. Copy it now: it is shown only once.</p>
-          <code id="key-secret-token"></code>
-          <button type="button" id="key-secret-copy">Copy</button>
-          <button type="button" id="key-secret-done" class="link">Done</button>
+        <div id="admin-key-secret" class="key-secret" hidden>
+          <p>Token for <strong id="admin-key-secret-name"></strong>. Copy it now: it is shown only once.</p>
+          <code id="admin-key-secret-token"></code>
+          <button type="button" id="admin-key-secret-copy">Copy</button>
+          <button type="button" id="admin-key-secret-done" class="link">Done</button>
         </div>
       </div>
+    </section>
+
+    <section id="accounts-section" hidden>
+      <div class="section-head">
+        <h2>Accounts</h2>
+        <span class="muted">credits portal users</span>
+      </div>
+      <dl id="accounts-totals" class="totals"></dl>
+      <p id="accounts-message" class="accounts-message" hidden></p>
+      <p id="accounts-error" class="bad" hidden></p>
+      <div class="table-wrap">
+        <table id="accounts" class="data">
+          <thead>
+            <tr>
+              <th>ID</th><th>Email</th><th>Status</th><th>Email verified</th>
+              <th class="num">Balance</th><th class="num">Spent</th><th class="num">Deposited</th>
+              <th class="num">Keys</th><th>Wallets</th><th>Created</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <form id="credit-form" class="inline-form credit-form" hidden>
+        <span id="credit-title"></span>
+        <label for="credit-amount">Amount (USD, negative to debit)</label>
+        <input id="credit-amount" required inputmode="decimal" pattern="-?[0-9]+([.][0-9]{1,6})?" size="10">
+        <label for="credit-note">Note</label>
+        <input id="credit-note" maxlength="200" size="24">
+        <button type="submit">Add credit</button>
+        <button type="button" id="credit-cancel" class="link">Cancel</button>
+      </form>
+    </section>
+
+    <section id="admin-pricing-section" hidden>
+      <div class="section-head">
+        <h2>Pricing</h2>
+        <span class="muted">USD per 1M tokens; saved prices apply to requests billed from then on</span>
+      </div>
+      <p id="admin-pricing-message" class="accounts-message" hidden></p>
+      <form id="admin-pricing-form" novalidate>
+        <div class="table-wrap">
+          <table id="admin-pricing-table" class="data pricing-edit">
+            <thead>
+              <tr>
+                <th>Model</th><th class="num">Input</th><th class="num">Cached input</th>
+                <th class="num">Output</th>
+                <th class="num" title="1000 prompt tokens, 200 of them from the prompt cache, and 100 output tokens">Example request</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="admin-pricing-error" class="bad pricing-errors" role="alert" hidden></div>
+        <div class="inline-form">
+          <label for="admin-pricing-new">Model</label>
+          <input id="admin-pricing-new" list="admin-pricing-served" maxlength="128" size="28" autocomplete="off">
+          <datalist id="admin-pricing-served"></datalist>
+          <button type="button" id="admin-pricing-add">Add model</button>
+        </div>
+        <div class="form-actions pricing-actions">
+          <button type="submit" id="admin-pricing-save">Save</button>
+          <button type="button" id="admin-pricing-revert" class="link">Revert</button>
+          <span id="admin-pricing-state" class="muted"></span>
+        </div>
+      </form>
+      <p class="muted keys-note">A model without its own row pays the Default prices. Example request: 1000
+        prompt tokens, 200 of them from the prompt cache, and 100 output tokens, rounded up to the next
+        micro-dollar.</p>
+    </section>
+
+    <section id="admin-usage-section" hidden>
+      <div class="section-head usage-head">
+        <h2>Usage</h2>
+        <label class="usage-window">Window
+          <select id="admin-usage-days">
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+          </select>
+        </label>
+      </div>
+      <p class="muted keys-note">Internal usage (your own keys outside the portal) is not charged; its cost is
+        valued at the prices in force when each request ran. Users' cost is what their balances paid.</p>
+      <p id="admin-usage-error" class="bad" hidden></p>
+      <dl id="admin-usage-totals" class="totals"></dl>
+      <h3 class="usage-title">Internal usage by key</h3>
+      <div class="table-wrap">
+        <table id="admin-usage-keys" class="data">
+          <thead>
+            <tr>
+              <th>Key</th><th class="num">Requests</th><th class="num">Prompt tokens</th>
+              <th class="num">Cached</th><th class="num">Output tokens</th><th class="num">Cost (not charged)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <h3 class="usage-title">By day (UTC)</h3>
+      <div class="table-wrap">
+        <table id="admin-usage-by-day" class="data">
+          <thead>
+            <tr>
+              <th>Day</th><th class="num">Internal requests</th><th class="num">Internal cost</th>
+              <th class="num">User requests</th><th class="num">Users' cost</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="admin-usage-note" class="muted keys-note" hidden></p>
     </section>
 
     <section>

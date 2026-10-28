@@ -78,6 +78,9 @@ test-output/
 test-results/
 .cache/
 
+# gufo-monitor local settings (public URL); tools/monitor/env.example documents them
+/tools/monitor/.env
+
 # Model artifacts, profiles, logit dumps, and teacher captures never belong in
 # source control. Keep the root anchored so similarly named fixture paths are
 # unaffected.
@@ -120,3 +123,4 @@ tests/quality/compsec.json
 
 # Claude Code local settings
 .claude/settings.local.json
+/tools/monitor/.dev/

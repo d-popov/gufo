@@ -6,11 +6,15 @@ One background thread polls Gufo (/ready, /metrics, /slots; /v1/models and
 tails Gufo's log for completed requests. Browsers read the shared state from
 GET /api/state (snapshot with history) and GET /api/stream (Server-Sent
 Events, one event per poll), so any number of browsers cost one set of polls.
+Hourly sums of requests, image work and GPU samples persist in --stats-file for the
+last 24 h / 7 days tile (GET /api/stats/long).
 
 The Gufo API key stays in this process: it is never sent to browsers, written
-to responses or logged. Browsers authenticate with a separate monitor token.
-With --keys-file it also lists Gufo's named API keys, and manages them for
-holders of a separate admin token; nothing else changes Gufo.
+to responses or logged. The monitor is for the admin only: every monitor route
+needs the admin token (header) or the admin session cookie from signing in with
+it, which also manages Gufo's named API keys (--keys-file) and portal accounts.
+One listener serves everything: the monitor page at /monitor, and with
+--billing-config the public credits portal at / and /api/portal/*.
 
 Python 3.11+ standard library only.
 """
@@ -29,6 +33,7 @@ import os
 import re
 import secrets
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -39,19 +44,29 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+HERE = Path(__file__).resolve().parent
+STATIC_DIR = HERE / "static"
+PORTAL_STATIC_DIR = HERE / "portal_static"
+_JS, _CSS = "text/javascript; charset=utf-8", "text/css; charset=utf-8"
+# /static/NAME, from either page's directory; a whitelist, so no paths or traversal.
 STATIC_FILES = {
-    "app.js": "text/javascript; charset=utf-8",
-    "app.css": "text/css; charset=utf-8",
+    "app.js": (STATIC_DIR, _JS),
+    "app.css": (STATIC_DIR, _CSS),
+    "admin.js": (STATIC_DIR, _JS),
+    "admin.css": (STATIC_DIR, _CSS),
+    "header.js": (STATIC_DIR, _JS),
+    "header.css": (STATIC_DIR, _CSS),
+    "portal.js": (PORTAL_STATIC_DIR, _JS),
+    "wallet.js": (PORTAL_STATIC_DIR, _JS),
+    "portal.css": (PORTAL_STATIC_DIR, _CSS),
 }
-COOKIE_NAME = "gufo_monitor"
-COOKIE_MAX_AGE = 30 * 24 * 3600
-# Set by reverse proxies and tunnels: a loopback peer sending one relays another client.
-FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP",
-                      "CF-Connecting-IP")
-# Unlocking key management lasts an hour and is sent only to /api/.
+# Settings read from the environment or --env-file.
+ENV_KEYS = ("GUFO_PUBLIC_URL", "GUFO_API_URL")
+# The admin session cookie, from POST /api/admin/login; sent to /monitor and /api/.
 ADMIN_COOKIE_NAME = "gufo_monitor_admin"
-ADMIN_COOKIE_MAX_AGE = 3600
+ADMIN_COOKIE_MAX_AGE = 12 * 3600
+SIGNIN_LIMIT = 10  # sign-in attempts per client address per SIGNIN_WINDOW_S
+SIGNIN_WINDOW_S = 60.0
 MAX_STREAMS = 32
 MAX_REQUESTS = 500
 CARD_WINDOW_S = 300.0
@@ -87,6 +102,15 @@ COUNTERS = {
     "device_lost": "gufo_device_lost_total",
 }
 
+# Per-request image fields of the completed line, present only when the request had
+# images. image_px_hits/misses count the CPU pixel cache (decode and resize) only: a hit
+# can still run the vision encoder. encoder_images and image_tokens_reused are the
+# encoder work done and the visual tokens served by continuation (KV) reuse.
+IMAGE_FIELDS = (
+    "images", "image_tokens", "image_bytes", "image_px", "image_px_hits", "image_px_misses",
+    "encoder_images", "encode_ms", "image_tokens_reused",
+)
+
 # Completed-request fields copied from the log; everything else is dropped so
 # unknown or sensitive keys never reach the page.
 REQUEST_FIELDS = (
@@ -94,6 +118,8 @@ REQUEST_FIELDS = (
     "prefill_tokens", "cached_tokens", "generated_tokens", "finish", "cache", "queue_ms",
     "ttft_ms", "prefill_tps", "decode_tps", "batch_width", "plan", "draft_accepted",
     "draft_proposed", "acceptance_pct",
+    # Only on requests with images; text requests and older Gufo builds have none.
+    *IMAGE_FIELDS,
 )
 CLIENT_FIELDS = ("client", "client_id")
 # Probes and monitoring routes are not requests worth listing.
@@ -495,6 +521,8 @@ class Monitor:
         self.started = time.time()
         self.tick_payload = b"{}"
         self._published_request_seq = 0
+        self.billing = None  # with --billing-config: meters each completed request
+        self.stats: StatsStore | None = None  # hourly sums for the long-window tile
 
     # -- polling
 
@@ -522,6 +550,8 @@ class Monitor:
         with self.cond:
             self._record(t, status, metrics, deltas, slots, rates, telemetry)
             self._publish()
+        if self.stats is not None:
+            self.stats.maybe_flush(t)
 
     def _poll_status(self) -> dict:
         try:
@@ -635,6 +665,8 @@ class Monitor:
             **telemetry,
         }
         self.sample = sample
+        if self.stats is not None:
+            self.stats.add_sample(t, sample)
         self.times.append(round(t, 3))
         for key in SERIES:
             value = sample.get(key)
@@ -676,6 +708,10 @@ class Monitor:
                     if isinstance(value, int):
                         usage[field] += value
                 usage["last_t"] = max(usage["last_t"] or 0, record["t"] or 0) or None
+        if self.billing is not None:
+            self.billing.on_request(record)
+        if self.stats is not None:
+            self.stats.add_request(record)
 
     def set_key_reload(self, status: dict):
         with self.cond:
@@ -798,6 +834,8 @@ class LogTail:
         entry = parse_log_line(line, self.log_utc)
         if entry is None:
             return
+        if self.monitor.stats is not None:
+            self.monitor.stats.note_log_time(entry["t"])
         reload = key_reload_status(entry)
         if reload is not None:
             self.monitor.set_key_reload(reload)
@@ -871,9 +909,297 @@ class LogTail:
                 stop.wait(0.5)
 
 
+# --------------------------------------------------------------------------- long-window stats
+
+# The long-window tile's windows in hours: the current UTC hour and the N - 1 before it.
+LONG_WINDOWS = {"24h": 24, "168h": 168}
+STATS_RETENTION_S = 8 * 24 * 3600  # hourly buckets and request keys are kept this long
+STATS_FLUSH_S = 60.0  # the poll thread writes pending sums this often
+STATS_FLUSH_KEYS = 1000  # ... or once this many requests are pending (a backfill)
+# Per-hour sums, the columns of the `hours` table. Columns added later reach existing
+# files through StatsStore's migration and are 0 in older rows.
+STATS_SUMS = (
+    "requests", "errors", "prompt_tokens", "cached_tokens", "generated_tokens", "duration_ms",
+    "decode_tokens", "decode_seconds", "prefill_tokens", "prefill_seconds",
+    "samples", "sample_seconds", "active_samples", "gpu_busy_n", "gpu_busy_sum",
+    "gpu_power_n", "gpu_power_sum", "gpu_temp_n", "gpu_temp_sum",
+    # Requests with images; encode_requests are those of them that reported encode_ms.
+    "image_requests", "images", "image_tokens", "encoder_images", "encode_ms",
+    "image_tokens_reused", "encode_requests",
+)
+_IMAGE_SUMS = ("images", "image_tokens", "encoder_images", "encode_ms", "image_tokens_reused")
+STATS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS hours (hour INTEGER PRIMARY KEY, "
+    + ", ".join(f"{name} REAL NOT NULL DEFAULT 0" for name in STATS_SUMS) + ");\n"
+    "CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, t REAL NOT NULL) WITHOUT ROWID;\n"
+    "CREATE INDEX IF NOT EXISTS seen_t ON seen (t);\n"
+    "CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value REAL) WITHOUT ROWID;\n"
+)
+_GPU_SAMPLES = (("gpu_busy", "gpu_busy_pct"), ("gpu_power", "gpu_power_w"),
+                ("gpu_temp", "gpu_temp_c"))
+
+
+def _count(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+def request_sums(record: dict) -> dict | None:
+    """The hourly sums one completed request adds; None unless it is inference (POST /v1/)."""
+    path = record.get("path")
+    if record.get("method") != "POST" or not isinstance(path, str) or not path.startswith("/v1/"):
+        return None
+    status = record.get("status")
+    sums = {"requests": 1, "errors": int(isinstance(status, int) and status >= 400)}
+    for field in ("prompt_tokens", "cached_tokens", "generated_tokens", "duration_ms"):
+        if _count(record.get(field)):
+            sums[field] = record[field]
+    # Rates are weighed by tokens: a request decoded (prefilled) for its tokens over its
+    # rate, so a window's rate is its tokens over that time, not a mean of request rates.
+    for tokens, rate, kind in (("generated_tokens", "decode_tps", "decode"),
+                               ("prefill_tokens", "prefill_tps", "prefill")):
+        count, tps = record.get(tokens), record.get(rate)
+        if _count(count) and count > 0 and _count(tps) and tps > 0:
+            sums[kind + "_tokens"] = count
+            sums[kind + "_seconds"] = count / tps
+    images = record.get("images")
+    if _count(images) and images > 0:
+        sums["image_requests"] = 1
+        for field in _IMAGE_SUMS:
+            if _count(record.get(field)):
+                sums[field] = record[field]
+        if _count(record.get("encode_ms")):
+            sums["encode_requests"] = 1
+    return sums
+
+
+class StatsStore:
+    """Hourly (UTC) sums for the long-window tile in a SQLite file of their own (not
+    billing's): completed inference requests from Gufo's log, and the 1 s GPU samples of
+    the poll, which only the live monitor sees. A request counts once by `request@t`,
+    so log replays, restarts and the start-up backfill never count it twice. Sums gather
+    in memory and are written every STATS_FLUSH_S; reads add the pending ones."""
+
+    def __init__(self, path: Path | str, poll_s: float = 1.0):
+        if str(path) != ":memory:":
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+        self.path = path
+        self.poll_s = poll_s
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None,
+                                    timeout=30.0)
+        with self.lock:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.executescript(STATS_SCHEMA)
+            # Files from before a column existed gain it here; their rows read 0.
+            present = {row[1] for row in self.conn.execute("PRAGMA table_info(hours)")}
+            for name in STATS_SUMS:
+                if name not in present:
+                    self.conn.execute(
+                        f"ALTER TABLE hours ADD COLUMN {name} REAL NOT NULL DEFAULT 0")
+            meta = dict(self.conn.execute("SELECT name, value FROM meta").fetchall())
+        self.log_since: float | None = meta.get("log_since")  # first log line seen
+        self.samples_since: float | None = meta.get("samples_since")  # first GPU sample
+        self._hours: dict[int, collections.Counter] = {}
+        self._keys: dict[str, float] = {}
+        self._flushed_t: float | None = None
+
+    def _bucket(self, t: float) -> collections.Counter:
+        return self._hours.setdefault(int(t // 3600), collections.Counter())
+
+    def note_log_time(self, t: float | None):
+        """The log covers time T: windows that start earlier have data only from its
+        first line on."""
+        if t is not None and (self.log_since is None or t < self.log_since):
+            with self.lock:
+                if self.log_since is None or t < self.log_since:
+                    self.log_since = t
+
+    def add_request(self, record: dict, now: float | None = None) -> bool:
+        """Count a completed request (request_record's fields) once; whether it was new."""
+        sums = request_sums(record)
+        t = record.get("t")
+        if sums is None or not _count(t):
+            return False
+        now = time.time() if now is None else now
+        if t < now - STATS_RETENTION_S:
+            return False
+        request = record.get("request")
+        key = f"{request}@{t:.3f}" if request is not None else "@{:.3f}/{}/{}/{}".format(
+            t, record.get("duration_ms"), record.get("prompt_tokens"),
+            record.get("generated_tokens"))
+        self.note_log_time(t)
+        with self.lock:
+            if key in self._keys or self.conn.execute(
+                    "SELECT 1 FROM seen WHERE key = ?", (key,)).fetchone():
+                return False
+            self._keys[key] = t
+            self._bucket(t).update(sums)
+            if len(self._keys) >= STATS_FLUSH_KEYS:
+                self._flush(now)
+        return True
+
+    def add_sample(self, t: float, sample: dict):
+        """One poll: GPU readings, and whether a request was running or queued."""
+        active = (sample.get("running") or 0) + (sample.get("queued") or 0) > 0
+        with self.lock:
+            bucket = self._bucket(t)
+            bucket["samples"] += 1
+            bucket["sample_seconds"] += self.poll_s
+            bucket["active_samples"] += int(active)
+            for name, key in _GPU_SAMPLES:
+                value = sample.get(key)
+                if value is not None:
+                    bucket[name + "_n"] += 1
+                    bucket[name + "_sum"] += value
+            if self.samples_since is None or t < self.samples_since:
+                self.samples_since = t
+
+    def maybe_flush(self, now: float):
+        if self._flushed_t is None:
+            self._flushed_t = now
+        elif now - self._flushed_t >= STATS_FLUSH_S:
+            self.flush(now)
+
+    def flush(self, now: float | None = None):
+        with self.lock:
+            self._flush(time.time() if now is None else now)
+
+    def _flush(self, now: float):
+        """Write the pending sums and keys and drop what is older than the retention."""
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for hour, sums in self._hours.items():
+                names = [name for name in STATS_SUMS if sums.get(name)]
+                if names:
+                    conn.execute(
+                        f"INSERT INTO hours (hour, {', '.join(names)}) "
+                        f"VALUES (?{', ?' * len(names)}) ON CONFLICT (hour) DO UPDATE SET "
+                        + ", ".join(f"{name} = {name} + excluded.{name}" for name in names),
+                        (hour, *(sums[name] for name in names)))
+            conn.executemany("INSERT OR IGNORE INTO seen (key, t) VALUES (?, ?)",
+                             self._keys.items())
+            for name in ("log_since", "samples_since"):
+                value = getattr(self, name)
+                if value is not None:
+                    conn.execute("INSERT INTO meta (name, value) VALUES (?, ?) ON CONFLICT (name) "
+                                 "DO UPDATE SET value = min(value, excluded.value)", (name, value))
+            oldest = now - STATS_RETENTION_S
+            conn.execute("DELETE FROM hours WHERE hour < ?", (int(oldest // 3600),))
+            conn.execute("DELETE FROM seen WHERE t < ?", (oldest,))
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        self._hours.clear()
+        self._keys.clear()
+        self._flushed_t = now
+
+    def needs_backfill(self, now: float | None = None) -> bool:
+        """Whether the log data seen so far starts after the longest window does."""
+        now = time.time() if now is None else now
+        return self.log_since is None or self.log_since > now - max(LONG_WINDOWS.values()) * 3600
+
+    def long_window(self, now: float | None = None) -> dict:
+        """GET /api/stats/long: every window of LONG_WINDOWS from at most 168 hourly rows."""
+        now = time.time() if now is None else now
+        current = int(now // 3600)
+        first = current - max(LONG_WINDOWS.values()) + 1
+        with self.lock:
+            hours = {row[0]: dict(zip(STATS_SUMS, row[1:])) for row in self.conn.execute(
+                f"SELECT hour, {', '.join(STATS_SUMS)} FROM hours WHERE hour >= ?", (first,))}
+            for hour, sums in self._hours.items():
+                if hour >= first:
+                    merged = hours.setdefault(hour, dict.fromkeys(STATS_SUMS, 0.0))
+                    for name, value in sums.items():
+                        merged[name] += value
+            log_since, samples_since = self.log_since, self.samples_since
+        return {
+            "now": now, "since": log_since, "gpu_since": samples_since,
+            "windows": {name: _stats_window(hours, current - n + 1, n, now, log_since,
+                                            samples_since)
+                        for name, n in LONG_WINDOWS.items()},
+        }
+
+
+def _stats_window(hours: dict, start_hour: int, window_hours: int, now: float,
+                  log_since: float | None, samples_since: float | None) -> dict:
+    total = dict.fromkeys(STATS_SUMS, 0.0)
+    for hour, sums in hours.items():
+        if hour >= start_hour:
+            for name in STATS_SUMS:
+                total[name] += sums[name]
+    start = start_hour * 3600
+    data_since = None if log_since is None else max(start, log_since)
+    data_hours = 0.0 if data_since is None else max(0.0, now - data_since) / 3600
+
+    def ratio(top, bottom, scale=1.0):
+        return scale * total[top] / total[bottom] if total[bottom] > 0 else None
+
+    return {
+        "window_hours": window_hours,
+        "start": start,
+        "data_since": data_since,  # log data, so requests and tokens, from here on
+        "data_hours": data_hours,
+        "requests": int(total["requests"]),
+        "errors": int(total["errors"]),
+        "prompt_tokens": int(total["prompt_tokens"]),
+        "cached_tokens": int(total["cached_tokens"]),
+        "generated_tokens": int(total["generated_tokens"]),
+        "decode_tps": ratio("decode_tokens", "decode_seconds"),
+        "prefill_tps": ratio("prefill_tokens", "prefill_seconds"),
+        "tokens_per_hour": total["generated_tokens"] / data_hours if data_hours > 0 else None,
+        "cache_reuse_pct": ratio("cached_tokens", "prompt_tokens", 100.0),
+        "serving_pct": ratio("active_samples", "samples", 100.0),
+        "gpu_busy_pct": ratio("gpu_busy_sum", "gpu_busy_n"),
+        "gpu_power_w": ratio("gpu_power_sum", "gpu_power_n"),
+        "gpu_temp_c": ratio("gpu_temp_sum", "gpu_temp_n"),
+        "gpu_hours": total["sample_seconds"] / 3600,  # polled time; the log has no samples
+        "gpu_since": None if samples_since is None else max(start, samples_since),
+        # Requests with images (none from Gufo builds without the image fields).
+        "image_requests": int(total["image_requests"]),
+        **{name: int(total[name]) for name in _IMAGE_SUMS if name != "encode_ms"},
+        "encode_ms": total["encode_ms"],
+        "encode_ms_per_request": ratio("encode_ms", "encode_requests"),
+    }
+
+
+def backfill_stats(stats: StatsStore, path: Path, log_utc: bool,
+                   stop: threading.Event | None = None) -> int:
+    """Feed the completed requests of Gufo's log file and its rotated predecessor PATH.1,
+    from their first lines, to STATS; returns how many were new. Only request_record's
+    fields are kept, and the store's request keys make a replay count nothing twice."""
+    added = 0
+    for candidate in (path.with_name(path.name + ".1"), path):
+        try:
+            handle = open(candidate, "r", errors="replace")
+        except FileNotFoundError:
+            continue
+        with handle:
+            first = True
+            for line in handle:
+                if stop is not None and stop.is_set():
+                    return added
+                if not first and "event=completed" not in line:
+                    continue
+                entry = parse_log_line(line, log_utc)
+                if entry is None:
+                    continue
+                if first:
+                    stats.note_log_time(entry["t"])
+                    first = False
+                record = request_record(entry, show_clients=False)
+                if record is not None and stats.add_request(record):
+                    added += 1
+    stats.flush()
+    return added
+
+
 # --------------------------------------------------------------------------- auth and HTTP
 
-def load_or_create_token(path: Path, label: str = "monitor token") -> str:
+def load_or_create_token(path: Path) -> str:
     try:
         token = path.read_text().strip()
         if token:
@@ -885,7 +1211,7 @@ def load_or_create_token(path: Path, label: str = "monitor token") -> str:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         handle.write(token + "\n")
-    print(f"gufo-monitor: created {label} in {path}", file=sys.stderr)
+    print(f"gufo-monitor: created admin token in {path}", file=sys.stderr)
     return token
 
 
@@ -894,6 +1220,64 @@ def read_api_key(path: Path) -> str:
     if not key:
         raise ValueError(f"{path} is empty")
     return key
+
+
+# --------------------------------------------------------------------------- settings (.env)
+
+_ENV_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """The KEY=VALUE lines of a .env file: `#` starts a comment (a whole line, or after
+    whitespace in an unquoted value), a value may be in single or double quotes, and
+    nothing is expanded or unescaped. A missing file reads as empty."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    values = {}
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _ENV_LINE.fullmatch(line)
+        if match is None:
+            raise ValueError(f"{path}:{number}: expected KEY=VALUE")
+        key, value = match[1], match[2]
+        if value[:1] in ("'", '"'):
+            end = value.find(value[0], 1)
+            rest = value[end + 1:].strip() if end > 0 else None
+            if rest is None or (rest and not rest.startswith("#")):
+                raise ValueError(f"{path}:{number}: unbalanced quotes in the value of {key}")
+            value = value[1:end]
+        else:
+            value = re.split(r"\s#", value, maxsplit=1)[0].rstrip()
+        values[key] = value
+    return values
+
+
+def load_environment(path: Path | None, environ=os.environ) -> dict[str, str]:
+    """The ENV_KEYS settings that are set, from the process environment or else from the
+    .env file PATH; an empty value counts as unset."""
+    values = read_env_file(path) if path is not None else {}
+    for key in values:
+        if key not in ENV_KEYS:
+            print(f"gufo-monitor: {path}: ignoring unknown setting {key}", file=sys.stderr)
+    settings = {}
+    for key in ENV_KEYS:
+        value = (environ.get(key) or "").strip() or values.get(key, "").strip()
+        if value:
+            settings[key] = value
+    return settings
+
+
+def default_env_file() -> Path:
+    """.env next to this script if there is one, else in the config directory."""
+    local = HERE / ".env"
+    if local.exists():
+        return local
+    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config / "gufo-monitor" / ".env"
 
 
 # --------------------------------------------------------------------------- key file
@@ -1047,34 +1431,106 @@ class KeyStore:
             del lines[current["line"]]
             self._write(lines)
 
+    def sync_managed(self, wanted: dict[str, dict], managed) -> bool:
+        """Make the keys whose names satisfy `managed` exactly `wanted`, {name: {"digest",
+        "models"}} of inference keys, in one atomic write; other lines stay as they are.
+        Returns whether the file changed."""
+        desired = {}
+        for name, spec in wanted.items():
+            if not managed(name):
+                raise KeyFileError(f"key '{name}' is not a managed name")
+            key = self._validated(name, "inference", list(spec["models"]))
+            if not re.fullmatch(r"[0-9a-f]{64}", spec["digest"]):
+                raise KeyFileError(f"key '{name}': digest must be 64 lowercase hex digits")
+            key["digest"] = spec["digest"]
+            desired[name] = format_key_line(key)
+        with self._lock:
+            lines, keys = self._read()
+            updated = list(lines)
+            drop = set()
+            present = set()
+            for key in keys:
+                if not managed(key["name"]):
+                    continue
+                present.add(key["name"])
+                line = desired.get(key["name"])
+                if line is None:
+                    drop.add(key["line"])
+                else:
+                    updated[key["line"]] = line
+            updated = [line for index, line in enumerate(updated) if index not in drop]
+            added = [line for name, line in desired.items() if name not in present]
+            updated += added
+            if updated == lines:
+                return False
+            if len(keys) - len(drop) + len(added) == 0:
+                # Gufo refuses a file without keys and would keep the old ones.
+                raise KeyFileError("cannot remove the last key")
+            self._write(updated)
+            return True
 
-class Auth:
-    """A shared secret, presented as a header or as a cookie holding an HMAC of it."""
 
-    def __init__(self, token: str, cookie: str = COOKIE_NAME,
-                 context: bytes = b"gufo-monitor-session-v1", header: str | None = None):
+class AdminAuth:
+    """The admin token. Scripts send it as `X-Admin-Token: TOKEN` or `Authorization:
+    Bearer TOKEN`; browsers send the session cookie from POST /api/admin/login, which holds
+    its expiry time and an HMAC of that under the token."""
+
+    def __init__(self, token: str):
         self._token = token.encode()
-        self.cookie = cookie
-        self.header = header  # None: `Authorization: Bearer`
-        self.session = hmac.new(self._token, context, hashlib.sha256).hexdigest()
 
     def check_token(self, candidate: str) -> bool:
         return hmac.compare_digest(candidate.encode(), self._token)
 
-    def check_request(self, headers) -> bool:
-        if self.header is None:
-            authorization = headers.get("Authorization", "")
-            if authorization.startswith("Bearer ") and self.check_token(
-                    authorization[7:].strip()):
-                return True
-        elif self.check_token(headers.get(self.header, "").strip() or "\0"):
-            return True
+    def _sign(self, expires: int) -> bytes:
+        return hmac.new(self._token, b"gufo-monitor-admin-v2:%d" % expires,
+                        hashlib.sha256).hexdigest().encode()
+
+    def session(self, now: float | None = None) -> str:
+        """A new session cookie value, valid for ADMIN_COOKIE_MAX_AGE."""
+        expires = int(time.time() if now is None else now) + ADMIN_COOKIE_MAX_AGE
+        return f"{expires}.{self._sign(expires).decode()}"
+
+    def valid_until(self, headers, now: float | None = None) -> float | None:
+        """Until when the request's admin credentials hold: forever for the token, the
+        expiry of a valid session cookie, None without either."""
+        if self.check_token(headers.get("X-Admin-Token", "").strip()):
+            return math.inf
+        authorization = headers.get("Authorization", "")
+        if authorization.startswith("Bearer ") and self.check_token(authorization[7:].strip()):
+            return math.inf
+        now = time.time() if now is None else now
         for part in headers.get("Cookie", "").split(";"):
             name, _, value = part.strip().partition("=")
-            if name == self.cookie and hmac.compare_digest(value.encode(),
-                                                           self.session.encode()):
-                return True
-        return False
+            expires, _, signature = value.partition(".")
+            if (name == ADMIN_COOKIE_NAME and 0 < len(expires) <= 12 and expires.isascii()
+                    and expires.isdigit() and now < int(expires)
+                    and hmac.compare_digest(signature.encode(), self._sign(int(expires)))):
+                return float(expires)
+        return None
+
+
+class RateLimiter:
+    """Sign-in attempts per key, e.g. "login:" + client address, in a sliding window."""
+
+    def __init__(self, limit: int = SIGNIN_LIMIT, window_s: float = SIGNIN_WINDOW_S):
+        self.limit, self.window_s = limit, window_s
+        self._hits: dict[str, collections.deque] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            if len(self._hits) > 10_000:  # forget idle addresses
+                for stale in [k for k, v in self._hits.items()
+                              if not v or v[-1] <= now - self.window_s]:
+                    del self._hits[stale]
+            hits = self._hits.setdefault(key, collections.deque())
+            while hits and hits[0] <= now - self.window_s:
+                hits.popleft()
+            if len(hits) >= self.limit:
+                return False
+            hits.append(now)
+            return True
 
 
 def is_loopback(host: str | None) -> bool:
@@ -1092,16 +1548,21 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, monitor: Monitor, auth: Auth, secure_cookie: bool,
-                 keys: KeyStore | None = None, admin: Auth | None = None,
-                 trust_localhost: bool = False):
+    def __init__(self, address, monitor: Monitor, admin: AdminAuth, secure_cookie: bool,
+                 keys: KeyStore | None = None, billing=None):
         super().__init__(address, Handler)
         self.monitor = monitor
-        self.auth = auth
+        self.admin = admin
         self.secure_cookie = secure_cookie
         self.keys = keys  # None: no --keys-file, the key routes answer 404
-        self.admin = admin
-        self.trust_localhost = trust_localhost  # browsers on this host skip the monitor token
+        # Sign-in attempts (admin, portal login and signup), budgeted per kind and client.
+        self.limiter = RateLimiter()
+        # None without --billing-config: the account and portal routes answer 404.
+        self.billing = billing
+        self.portal = None
+        if billing is not None:
+            from billing.portal import Portal  # the package load_billing put on sys.path
+            self.portal = Portal(billing, secure_cookie, self.limiter)
         self.streams = threading.BoundedSemaphore(MAX_STREAMS)
         self.stop = threading.Event()
 
@@ -1141,29 +1602,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _redirect(self, location: str, headers: tuple[tuple[str, str], ...] = ()):
         self._send(303, b"", "text/plain", (("Location", location), *headers))
 
-    def _from_this_host(self) -> bool:
-        """With --trust-localhost, a direct request from a browser on this host: a loopback
-        peer asking for a loopback name. The Host check stops DNS rebinding; forwarding
-        headers mark a local proxy or tunnel relaying another client."""
-        if not self.server.trust_localhost:
-            return False
-        if any(name in self.headers for name in FORWARDING_HEADERS):
-            return False
-        try:
-            host = urllib.parse.urlsplit("//" + self.headers.get("Host", "")).hostname
-        except ValueError:
-            return False
-        return is_loopback(self.client_address[0]) and is_loopback(host)
+    def client_ip(self) -> str:
+        """The client's address for rate limits. A loopback peer is a local tunnel or
+        proxy relaying someone: Cloudflare's CF-Connecting-IP names them, else the last
+        X-Forwarded-For entry. Anyone else is keyed by their own address, whatever
+        headers they send."""
+        peer = self.client_address[0]
+        if not is_loopback(peer):
+            return peer
+        connecting = self.headers.get("CF-Connecting-IP", "").strip()
+        if connecting:
+            return connecting
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        return forwarded.split(",")[-1].strip() or peer
 
-    def _authorized(self) -> bool:
-        return self._from_this_host() or self.server.auth.check_request(self.headers)
+    def _admin_until(self) -> float | None:
+        """Until when this request has admin access, or None: see AdminAuth.valid_until."""
+        return self.server.admin.valid_until(self.headers)
+
+    def _admin(self) -> bool:
+        """Admin access, which every monitor route needs."""
+        return self._admin_until() is not None
 
     def _secure(self) -> bool:
         return self.server.secure_cookie or self.headers.get("X-Forwarded-Proto", "") == "https"
 
-    def _cookie(self, value: str, max_age: int, name: str = COOKIE_NAME,
-                path: str = "/") -> tuple[str, str]:
-        cookie = (f"{name}={value}; Path={path}; Max-Age={max_age}; HttpOnly; "
+    def _admin_cookie(self, value: str, max_age: int) -> tuple[str, str]:
+        cookie = (f"{ADMIN_COOKIE_NAME}={value}; Path=/; Max-Age={max_age}; HttpOnly; "
                   "SameSite=Strict")
         return ("Set-Cookie", cookie + ("; Secure" if self._secure() else ""))
 
@@ -1187,8 +1652,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _error(self, status: int, message: str):
         self._json(status, json.dumps({"error": message}).encode())
 
-    # -- API keys (Gufo's --api-key-file): view with the monitor token, change
-    # with the admin token as well
+    # -- API keys (Gufo's --api-key-file); the admin's only, like everything below
 
     def _keys_route(self, path: str) -> str | None:
         """The key name of /api/keys/NAME, "" for /api/keys, None otherwise."""
@@ -1198,19 +1662,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return urllib.parse.unquote(path[len("/api/keys/"):])
         return None
 
-    def _admin(self) -> bool:
-        return self.server.admin is not None and self.server.admin.check_request(self.headers)
-
     def _keys_get(self):
         try:
             keys = self.server.keys.list()
         except KeyFileError as error:
             return self._error(500, str(error))
-        self._json(200, json.dumps({"keys": keys, "admin": self._admin()}).encode())
+        self._json(200, json.dumps({"keys": keys}).encode())
 
     def _keys_change(self, method: str, name: str):
-        if not self._admin():
-            return self._error(403, "admin token required")
         store = self.server.keys
         try:
             if method == "DELETE" and name:
@@ -1234,26 +1693,134 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(400, str(error))
         self._error(405, "method not allowed")
 
+    # -- admin sign-in, from the profile menu of either page
+
     def _admin_login(self):
-        if self.server.admin is None:
-            return self._error(404, "not_found")
+        """The admin token for the admin session cookie, sent to /monitor and /api/.
+        Attempts are rate limited per client address, like the portal's sign-in."""
+        if not self.server.limiter.allow("admin:" + self.client_ip()):
+            return self._error(429, "too many attempts, try again in a minute")
         body = self._read_json(4096)
         token = body.get("token") if body else None
         if not isinstance(token, str) or not self.server.admin.check_token(token.strip()):
             time.sleep(0.5)
             return self._error(401, "wrong admin token")
-        self._send(204, b"", "text/plain", (self._cookie(
-            self.server.admin.session, ADMIN_COOKIE_MAX_AGE, ADMIN_COOKIE_NAME, "/api/"),))
+        self._send(204, b"", "text/plain", (
+            self._admin_cookie(self.server.admin.session(), ADMIN_COOKIE_MAX_AGE),))
+
+    def _admin_logout(self):
+        self._send(204, b"", "text/plain", (self._admin_cookie("", 0),))
+
+    def _admin_session(self):
+        """What the pages show: the monitor link and the admin areas for "admin"."""
+        self._json(200, json.dumps({"admin": self._admin()}).encode())
+
+    def _portal(self, method: str):
+        if self.server.portal is None:
+            return self._json(404, json.dumps({
+                "error": "not_found", "message": "the credits portal is not enabled"}).encode())
+        self.server.portal.handle(self, method)
+
+    # -- portal accounts (--billing-config)
+
+    def _account_error(self, status: int, code: str, message: str):
+        self._json(status, json.dumps({"error": code, "message": message}).encode())
+
+    def _accounts_get(self):
+        if self.server.billing is None:
+            return self._account_error(404, "not_found", "billing is not configured")
+        self._json(200, json.dumps(self.server.billing.admin_accounts()).encode())
+
+    def _accounts_change(self, method: str, path: str):
+        billing = self.server.billing
+        if billing is None:
+            return self._account_error(404, "not_found", "billing is not configured")
+        match = re.fullmatch(r"/api/admin/accounts/(\d{1,18})/([a-z]+)", path)
+        if match is None:
+            return self._account_error(404, "not_found", "no such route")
+        if method != "POST":
+            return self._account_error(405, "method_not_allowed", "use POST")
+        body = None
+        if match[2] == "credit":
+            body = self._read_json()
+            if body is None:
+                return self._account_error(400, "bad_request", "expected a JSON object")
+        try:
+            result = billing.admin_action(int(match[1]), match[2], body)
+        except billing.Error as error:
+            return self._account_error(error.status, error.code, error.message)
+        self._json(200, json.dumps(result).encode())
+
+    def _pricing(self, method: str):
+        """GET: the price table and the models Gufo serves; PUT: replace the table."""
+        billing = self.server.billing
+        if billing is None:
+            return self._account_error(404, "not_found", "billing is not configured")
+        if method == "PUT":
+            body = self._read_json(64 << 10)
+            if body is None:
+                return self._account_error(400, "bad_request", "expected a JSON object")
+            try:
+                table = billing.save_pricing(body)
+            except billing.Error as error:
+                return self._account_error(error.status, error.code, error.message)
+            except OSError as error:
+                print(f"gufo-monitor: saving the prices failed: {error}", file=sys.stderr)
+                return self._account_error(500, "save_failed", "could not write the prices file")
+        elif method == "GET":
+            table = billing.pricing.to_dict()
+        else:
+            return self._account_error(405, "method_not_allowed", "use GET or PUT")
+        served = [model["id"] for model in self.server.monitor.models]
+        self._json(200, json.dumps({**table, "served_models": served}).encode())
+
+    def _usage_get(self):
+        """Internal (owner and hand-made keys) and portal users' usage of the last
+        ?days=N UTC days (default 30)."""
+        billing = self.server.billing
+        if billing is None:
+            return self._account_error(404, "not_found", "billing is not configured")
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+        values = query.get("days", ["30"])
+        days = int(values[0]) if len(values) == 1 and re.fullmatch(r"\d{1,3}", values[0]) else 0
+        try:
+            report = billing.admin_usage(days)
+        except billing.Error as error:
+            return self._account_error(error.status, error.code, error.message)
+        self._json(200, json.dumps(report).encode())
+
+    def _long_stats(self):
+        """The last 24 h / 7 days tile: StatsStore.long_window, O(hours)."""
+        stats = self.server.monitor.stats
+        if stats is None:
+            return self._json(404, b'{"error":"not_found"}')
+        try:
+            report = stats.long_window()
+            billing = self.server.billing
+            # {users, internal, total} micro-dollars per window; null without --billing-config.
+            report["revenue_micro"] = None if billing is None else {
+                name: billing.revenue_micro(hours, report["now"])
+                for name, hours in LONG_WINDOWS.items()}
+            body = json.dumps(report, allow_nan=False).encode()
+        except sqlite3.Error as error:
+            print(f"gufo-monitor: --stats-file: {error}", file=sys.stderr)
+            return self._error(500, "stats unavailable")
+        self._json(200, body)
 
     def _mutation(self, method: str):
         path = urllib.parse.urlsplit(self.path).path
-        if not self._authorized():
+        if path.startswith("/api/portal/"):
+            return self._portal(method)
+        if path in ("/api/admin/login", "/api/admin/logout"):
+            if method != "POST":
+                return self._error(405, "method not allowed")
+            return self._admin_login() if path == "/api/admin/login" else self._admin_logout()
+        if not self._admin():
             return self._error(401, "unauthorized")
-        if path == "/api/admin/login":
-            return self._admin_login()
-        if path == "/api/admin/logout":
-            return self._send(204, b"", "text/plain",
-                              (self._cookie("", 0, ADMIN_COOKIE_NAME, "/api/"),))
+        if path.startswith("/api/admin/accounts/"):
+            return self._accounts_change(method, path)
+        if path == "/api/admin/pricing":
+            return self._pricing(method)
         name = self._keys_route(path)
         if name is None or self.server.keys is None:
             return self._error(404, "not_found")
@@ -1265,88 +1832,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._mutation("DELETE")
 
-    # -- routes
+    # -- routes: / and /api/portal/* are public; /monitor and the rest of /api/ are the
+    # admin's alone, apart from signing in and out and asking whether one is signed in
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
-        if path == "/login":
-            if self._from_this_host():
-                return self._redirect("/")
-            return self._login_page(error=False)
+        if path in ("/", "/index.html"):
+            return self._file(PORTAL_STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if path == "/favicon.ico":
             return self._send(204, b"", "text/plain")
-        if not self._authorized():
+        if path.startswith("/api/portal/"):
+            return self._portal("GET")
+        if path == "/api/admin/session":
+            return self._admin_session()
+        until = self._admin_until()
+        if until is None:
+            if path == "/monitor":
+                return self._redirect("/")  # the admin signs in from the profile menu
             if path.startswith("/api/"):
                 return self._json(401, b'{"error":"unauthorized"}')
-            return self._redirect("/login")
-        if path in ("/", "/index.html"):
-            return self._index()
+            return self._json(404, b'{"error":"not_found"}')
+        if path == "/monitor":
+            return self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
-            return self._stream()
+            return self._stream(until)
+        if path == "/api/stats/long":
+            return self._long_stats()
+        if path == "/api/admin/accounts":
+            return self._accounts_get()
+        if path == "/api/admin/pricing":
+            return self._pricing("GET")
+        if path == "/api/admin/usage":
+            return self._usage_get()
         if self._keys_route(path) == "" and self.server.keys is not None:
             return self._keys_get()
         self._json(404, b'{"error":"not_found"}')
 
     def do_POST(self):
-        path = urllib.parse.urlsplit(self.path).path
-        if path == "/login":
-            return self._login()
-        if path == "/logout":
-            return self._redirect("/login", (
-                self._cookie("", 0),
-                self._cookie("", 0, ADMIN_COOKIE_NAME, "/api/")))
         self._mutation("POST")
 
-    def _file(self, name: str, content_type: str, cache: str = "no-store"):
+    def _file(self, path: Path, content_type: str, cache: str = "no-store"):
         try:
-            body = (STATIC_DIR / name).read_bytes()
+            body = path.read_bytes()
         except OSError:
             return self._json(404, b'{"error":"not_found"}')
         self._send(200, body, content_type, cache=cache)
 
     def _static(self, name: str):
-        content_type = STATIC_FILES.get(name)  # whitelist: no paths, no traversal
-        if content_type is None:
+        entry = STATIC_FILES.get(name)
+        if entry is None:
             return self._json(404, b'{"error":"not_found"}')
-        self._file(name, content_type, cache="no-cache")
+        directory, content_type = entry
+        self._file(directory / name, content_type, cache="no-cache")
 
-    def _index(self):
-        try:
-            body = (STATIC_DIR / "index.html").read_bytes()
-        except OSError:
-            return self._json(404, b'{"error":"not_found"}')
-        if self._from_this_host():  # no login, so nothing to log out of
-            body = body.replace(b'id="logout"', b'id="logout" hidden', 1)
-        self._send(200, body, "text/html; charset=utf-8")
-
-    def _login_page(self, error: bool, status: int = 200):
-        try:
-            body = (STATIC_DIR / "login.html").read_text()
-        except OSError:
-            return self._json(500, b'{"error":"missing login page"}')
-        message = '<p class="login-error">Wrong token.</p>' if error else ""
-        self._send(status, body.replace("<!--ERROR-->", message).encode(),
-                   "text/html; charset=utf-8")
-
-    def _login(self):
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if length <= 0 or length > 4096:
-            return self._login_page(error=True, status=400)
-        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
-        token = (form.get("token") or [""])[0].strip()
-        if not self.server.auth.check_token(token):
-            time.sleep(0.5)
-            return self._login_page(error=True, status=401)
-        self._redirect("/", (self._cookie(self.server.auth.session, COOKIE_MAX_AGE),))
-
-    def _stream(self):
+    def _stream(self, until: float):
+        """Ticks until the client leaves, the server stops or, at time UNTIL, the admin
+        session cookie expires: the browser's reconnect then gets 401."""
         if not self.server.streams.acquire(blocking=False):
             return self._json(503, b'{"error":"too_many_streams"}')
         try:
@@ -1364,7 +1909,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"retry: 2000\n\n")
             self.wfile.flush()
             while not self.server.stop.is_set():
-                seq, payload = monitor.wait_tick(seq, 15.0)
+                left = until - time.time()
+                if left <= 0:
+                    break
+                seq, payload = monitor.wait_tick(seq, min(15.0, left))
                 if payload is None:
                     self.wfile.write(b": keep-alive\n\n")
                 else:
@@ -1384,10 +1932,9 @@ def parse_args(argv=None):
     parser.add_argument("--gufo", default="http://127.0.0.1:8080", help="Gufo base URL")
     parser.add_argument("--gufo-key-file", type=Path,
                         help="file holding Gufo's --api-key; read and used only by this process")
-    parser.add_argument("--bind", default="127.0.0.1", help="listen address")
+    parser.add_argument("--bind", default="127.0.0.1",
+                        help="listen address, for the monitor and the portal")
     parser.add_argument("--port", type=int, default=8099)
-    parser.add_argument("--token-file", type=Path, default=config / "gufo-monitor" / "token",
-                        help="monitor token for browsers; created (mode 0600) if missing")
     parser.add_argument("--poll", type=float, default=1.0, help="poll interval in seconds")
     parser.add_argument("--history", type=float, default=900.0, help="sparkline window, s")
     parser.add_argument("--log-source", default="none",
@@ -1400,25 +1947,64 @@ def parse_args(argv=None):
     parser.add_argument("--show-clients", action="store_true",
                         help="show client ids from the log")
     parser.add_argument("--secure-cookie", action="store_true",
-                        help="always mark the login cookie Secure (served over https)")
+                        help="always mark the sign-in cookies Secure (served over https)")
     parser.add_argument("--keys-file", type=Path,
                         help="Gufo's --api-key-file: view keys and usage, and manage them "
                              "with the admin token")
     parser.add_argument("--admin-token-file", type=Path,
                         default=config / "gufo-monitor" / "admin-token",
-                        help="admin token for managing keys; created (mode 0600) if missing")
-    parser.add_argument("--trust-localhost", action="store_true",
-                        help="browsers on this host need no monitor token; changing keys "
-                             "still takes the admin token")
+                        help="admin token, the only way into the monitor: browser sign-in, "
+                             "scripts (X-Admin-Token or Authorization: Bearer), key and account "
+                             "management; created (mode 0600) if missing")
+    parser.add_argument("--billing-config", type=Path,
+                        help="enable prepaid credits and the public portal (needs --keys-file)")
+    parser.add_argument("--stats-file", type=Path,
+                        default=config / "gufo-monitor" / "stats.sqlite",
+                        help="hourly usage and GPU sums for the last 24 h / 7 days tile, kept "
+                             "8 days; created (mode 0600) if missing")
+    parser.add_argument("--env-file", type=Path,
+                        help="settings such as GUFO_PUBLIC_URL (default: .env next to this "
+                             "script if present, else $XDG_CONFIG_HOME/gufo-monitor/.env; "
+                             "the process environment wins)")
     args = parser.parse_args(argv)
+    if args.env_file is None:
+        args.env_file = default_env_file()  # optional: a missing default file is fine
+    elif not args.env_file.is_file():
+        parser.error(f"--env-file {args.env_file}: no such file")
+    if args.billing_config and not args.keys_file:
+        parser.error("--billing-config needs --keys-file")
+    if args.billing_config and args.log_source == "none":
+        parser.error("--billing-config needs --log-source: usage is metered from Gufo's log")
     if args.poll < 0.2:
         parser.error("--poll must be at least 0.2 s")
     return args
 
 
+def load_billing(args, monitor: Monitor, keys: KeyStore, settings: dict[str, str]):
+    """The billing service of --billing-config. Its package sits next to this file and
+    is imported only here, so the monitor without billing never loads it. Links use
+    GUFO_PUBLIC_URL, never a request's Host header; without it, this listener's address."""
+    here = str(HERE)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import billing
+    from billing import db as billing_db
+
+    host = f"[{args.bind}]" if ":" in args.bind else args.bind
+    config = billing.load_config(args.billing_config, settings.get("GUFO_PUBLIC_URL"),
+                                 settings.get("GUFO_API_URL"), f"http://{host}:{args.port}")
+    if not any(billing_db.key_owner(key["name"]) is None for key in keys.list()):
+        raise ValueError(f"{keys.path} needs an owner key besides portal keys (u<id>-<n>)")
+
+    def served_model():
+        status, models = monitor.status, monitor.models
+        return status.get("model") or (models[0]["id"] if models else None)
+
+    return billing.Billing(config, keys, served_model)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
-    token = load_or_create_token(args.token_file)
     try:
         api_key = read_api_key(args.gufo_key_file) if args.gufo_key_file else None
     except (OSError, ValueError) as error:
@@ -1426,7 +2012,18 @@ def main(argv=None) -> int:
         return 2
     monitor = Monitor(GufoClient(args.gufo, api_key), Telemetry(args.gpu_card),
                       poll_s=args.poll, history_s=args.history)
-    keys = admin = None
+    try:
+        settings = load_environment(args.env_file)
+    except (OSError, ValueError) as error:
+        print(f"gufo-monitor: --env-file: {error}", file=sys.stderr)
+        return 2
+    try:
+        monitor.stats = StatsStore(args.stats_file, args.poll)
+    except (OSError, sqlite3.Error) as error:
+        print(f"gufo-monitor: --stats-file: {error}", file=sys.stderr)
+        return 2
+    admin = AdminAuth(load_or_create_token(args.admin_token_file))
+    keys = None
     if args.keys_file:
         keys = KeyStore(args.keys_file)
         try:
@@ -1434,10 +2031,15 @@ def main(argv=None) -> int:
         except (OSError, KeyFileError) as error:
             print(f"gufo-monitor: --keys-file: {error}", file=sys.stderr)
             return 2
-        admin = Auth(load_or_create_token(args.admin_token_file, "admin token"),
-                     ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1", "X-Admin-Token")
-    server = Server((args.bind, args.port), monitor, Auth(token), args.secure_cookie,
-                    keys, admin, args.trust_localhost)
+    service = None
+    if args.billing_config:
+        try:
+            service = load_billing(args, monitor, keys, settings)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            print(f"gufo-monitor: --billing-config: {error}", file=sys.stderr)
+            return 2
+        monitor.billing = service
+    server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":
@@ -1445,9 +2047,29 @@ def main(argv=None) -> int:
                        args.log_since)
         threads.append(threading.Thread(target=tail.run, args=(server.stop,), daemon=True,
                                         name="log"))
+    if args.log_source.startswith("file:") and monitor.stats.needs_backfill():
+        log_path = Path(args.log_source.partition(":")[2])
+
+        def backfill():  # once, beside the tail: the store counts each request once
+            try:
+                added = backfill_stats(monitor.stats, log_path, args.log_utc, server.stop)
+            except (OSError, sqlite3.Error) as error:
+                print(f"gufo-monitor: stats backfill: {error}", file=sys.stderr)
+                return
+            print(f"gufo-monitor: stats backfill: {added} requests from {log_path}",
+                  file=sys.stderr)
+
+        threads.append(threading.Thread(target=backfill, daemon=True, name="stats-backfill"))
+    if service is not None:
+        threads.append(threading.Thread(target=service.run, args=(server.stop,), daemon=True,
+                                        name="billing"))
     for thread in threads:
         thread.start()
-    print(f"gufo-monitor: http://{args.bind}:{args.port}/ watching {args.gufo}", file=sys.stderr)
+    if service is not None:
+        print(f"gufo-monitor: portal links use {service.config['public_base_url']}",
+              file=sys.stderr)
+    print(f"gufo-monitor: http://{args.bind}:{args.port}/ (monitor at /monitor) watching "
+          f"{args.gufo}", file=sys.stderr)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -1457,6 +2079,10 @@ def main(argv=None) -> int:
         with monitor.cond:
             monitor.cond.notify_all()
         server.server_close()
+        try:
+            monitor.stats.flush()
+        except sqlite3.Error as error:
+            print(f"gufo-monitor: --stats-file: {error}", file=sys.stderr)
     return 0
 
 

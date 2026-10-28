@@ -20,6 +20,19 @@ const CARDS = [
   { key: 'cpu_pct', label: 'CPU', unit: '%', digits: 0, max: 100 },
 ];
 
+// The long-window tile, last in the grid: only the headline rows of [label, 24 h, 7 days]
+// from GET /api/stats/long, refreshed every LONG_REFRESH_MS. The full set (GPU, errors,
+// cache reuse, coverage) is the portal's Usage tab. Revenue rows need --billing-config.
+const LONG_ROWS = [
+  ['Prefill tok/s', (w) => fmt(w.prefill_tps, 0)],
+  ['Tokens/h', (w) => fmtCompact(w.tokens_per_hour)],
+  ['Revenue/h', (w, r) => fmtUsdShort(r == null ? null : r.total / w.window_hours)],
+  ['Revenue/day', (w, r) => fmtUsdShort(r == null ? null : (r.total * 24) / w.window_hours)],
+  ['Image enc ms/req', (w) => fmt(w.encode_ms_per_request, 0)],
+];
+const LONG_REFRESH_MS = 60000;
+const longTile = {};  // the tile's nodes
+
 // Recent-request columns; optional ones appear only when some row has them.
 const REQUEST_COLUMNS = [
   { title: 'Time', cell: (r) => fmtTime(r.t) },
@@ -33,6 +46,7 @@ const REQUEST_COLUMNS = [
   { title: 'Prompt', num: true, cell: (r) => fmt(r.prompt_tokens, 0) },
   { title: 'Cached', num: true, cell: (r) => fmt(r.cached_tokens, 0) },
   { title: 'Generated', num: true, cell: (r) => fmt(r.generated_tokens, 0) },
+  { title: 'Images', key: 'images', optional: true, cell: imageCell, tip: imageTip },
   { title: 'TTFT ms', num: true, cell: (r) => fmt(r.ttft_ms, 0) },
   { title: 'Prefill tok/s', num: true, cell: (r) => fmt(r.prefill_tps, 1) },
   { title: 'Decode tok/s', num: true, cell: (r) => fmt(r.decode_tps, 1) },
@@ -40,6 +54,7 @@ const REQUEST_COLUMNS = [
   { title: 'Accept %', num: true, cell: (r) => fmt(r.acceptance_pct, 1) },
   { title: 'Duration s', num: true, cell: (r) => fmt(r.duration_ms != null ? r.duration_ms / 1000 : null, 1) },
 ];
+
 const RECENT_ROWS = 20;
 const SVG = 'http://www.w3.org/2000/svg';
 
@@ -49,6 +64,8 @@ let requestsDirty = true;
 let renderQueued = false;
 let streamUp = false;
 let source = null;
+let expired = false;  // the admin session ended: no more data until a new sign-in
+let longStats = null;  // GET /api/stats/long, or null before it answers or without it
 
 // ---------------------------------------------------------------- formatting (browser locale)
 
@@ -63,6 +80,17 @@ function fmt(value, digits) {
   return numberFormats.get(digits).format(value);
 }
 
+const compactFormat = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
+
+// Micro-dollars as whole cents; null without billing.
+function fmtUsdShort(micro) {
+  return micro == null || !Number.isFinite(micro) ? '—' : `$${fmt(micro / 1e6, 2)}`;
+}
+
+function fmtCompact(value) {
+  return value == null || !Number.isFinite(value) ? '—' : compactFormat.format(value);
+}
+
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'short' });
 const clockFormat = new Intl.DateTimeFormat(undefined, { timeStyle: 'medium' });
 
@@ -72,6 +100,41 @@ function fmtTime(t) {
   const day = dateFormat.format(date);
   const clock = clockFormat.format(date);
   return day === dateFormat.format(new Date()) ? clock : `${day} ${clock}`;
+}
+
+function joinKnown(parts) {
+  const known = parts.filter((part) => part != null);
+  return known.length ? known.join(' · ') : '—';
+}
+
+// Recent-requests Images cell and its tooltip: empty without image fields (text requests,
+// Gufo builds before them); a field Gufo did not report is left out, never shown as 0.
+function imageCell(r) {
+  if (r.images == null) return '';
+  return [`${fmt(r.images, 0)} img`,
+    r.image_tokens != null ? `${fmtCompact(r.image_tokens)} tok` : null,
+    r.encode_ms != null ? `${fmt(r.encode_ms, 0)} ms enc` : null].filter(Boolean).join(' · ');
+}
+
+function imageTip(r) {
+  if (r.images == null) return '';
+  const lines = [];
+  const input = [r.image_bytes != null ? `${fmt(r.image_bytes / 1e6, 2)} MB received` : null,
+    r.image_px != null ? `${fmt(r.image_px / 1e6, 2)} MP after resize` : null].filter(Boolean);
+  lines.push(`${fmt(r.images, 0)} image(s)${input.length ? `: ${input.join(', ')}` : ''}`);
+  if (r.image_px_hits != null || r.image_px_misses != null) {
+    lines.push(`Pixel cache (decode/resize only): ${fmt(r.image_px_hits ?? 0, 0)} hit, ` +
+      `${fmt(r.image_px_misses ?? 0, 0)} miss`);
+  }
+  if (r.encoder_images != null || r.encode_ms != null) {
+    lines.push(`Vision encoder: ${r.encoder_images != null ? `${fmt(r.encoder_images, 0)} image(s)` : 'ran'}` +
+      `${r.encode_ms != null ? `, ${fmt(r.encode_ms, 1)} ms` : ''}`);
+  }
+  if (r.image_tokens != null) lines.push(`Visual tokens in prompt: ${fmt(r.image_tokens, 0)}`);
+  if (r.image_tokens_reused != null) {
+    lines.push(`Visual tokens reused (continuation/KV, not prefilled): ${fmt(r.image_tokens_reused, 0)}`);
+  }
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------- DOM helpers
@@ -115,6 +178,46 @@ function buildCards() {
       sub, chart));
     Object.assign(card, { valueNode: value, unitNode: unit, subNode: sub, area, line, dots });
   }
+  root.append(buildLongCard());
+}
+
+function buildLongCard() {
+  longTile.value = el('span', { class: 'card-number' }, '—');
+  longTile.unit = el('span', { class: 'card-unit' });
+  longTile.week = el('span', { class: 'card-alt' });
+  longTile.cells = LONG_ROWS.map(() => [el('td', { class: 'num' }, '—'), el('td', { class: 'num' }, '—')]);
+  const head = el('tr', {}, el('th', {}, ''), el('th', { class: 'num' }, '24 h'), el('th', { class: 'num' }, '7 d'));
+  const rows = LONG_ROWS.map(([label], i) => el('tr', {}, el('th', {}, label), ...longTile.cells[i]));
+  return el('div', { class: 'card card-long', title: 'Decode tok/s: generated tokens over the time spent decoding them\n' +
+      'Image enc ms/req: vision encoder time per request with images (— before Gufo logged it)' },
+    el('div', { class: 'card-label' }, 'Last 24 h / 7 days'),
+    el('div', { class: 'card-value' }, longTile.value, longTile.unit, longTile.week),
+    el('table', { class: 'long-table' }, el('thead', {}, head), el('tbody', {}, ...rows)),
+    el('a', { class: 'card-sub', href: '/' }, 'More in Usage'));
+}
+
+function renderLong() {
+  const day = longStats?.windows?.['24h'];
+  const week = longStats?.windows?.['168h'];
+  longTile.value.textContent = fmt(day?.decode_tps, 1);
+  longTile.unit.textContent = day?.decode_tps == null ? '' : 'tok/s decode';
+  longTile.week.textContent = `7 d ${fmt(week?.decode_tps, 1)}`;
+  LONG_ROWS.forEach(([, cell], i) => {
+    const revenue = longStats?.revenue_micro;
+    longTile.cells[i][0].textContent = day ? cell(day, revenue?.['24h']) : '—';
+    longTile.cells[i][1].textContent = week ? cell(week, revenue?.['168h']) : '—';
+  });
+}
+
+async function loadLongStats() {
+  if (expired) return;
+  const response = await fetch('/api/stats/long', { credentials: 'same-origin', cache: 'no-store' });
+  if (response.status === 401) {
+    sessionExpired();
+    return;
+  }
+  longStats = response.ok ? await response.json() : null;
+  renderLong();
 }
 
 // Sparkline over the full history window: gaps (null) break the line, lone
@@ -158,7 +261,7 @@ function renderCards() {
   }
 }
 
-// ---------------------------------------------------------------- pill and header
+// ---------------------------------------------------------------- pill and model
 
 function renderPill() {
   const pill = $('pill');
@@ -167,7 +270,9 @@ function renderPill() {
   const sample = state.sample ?? {};
   let text;
   let kind;
-  if (!streamUp) {
+  if (expired) {
+    [text, kind] = ['Signed out', 'down'];
+  } else if (!streamUp) {
     [text, kind] = ['Monitor offline', 'down'];
   } else if (status.state === 'down') {
     [text, kind] = ['Down', 'down'];
@@ -191,7 +296,7 @@ function renderPill() {
   pill.className = `pill pill-${kind}`;
 
   const detail = $('detail');
-  const message = !streamUp ? 'Lost the connection to the monitor; reconnecting.'
+  const message = expired ? '' : !streamUp ? 'Lost the connection to the monitor; reconnecting.'
     : status.state !== 'ready' && status.detail ? status.detail : '';
   detail.textContent = message;
   detail.hidden = !message;
@@ -266,7 +371,10 @@ function renderRequests() {
     const r = shown[i];
     rows.push(el('tr', {}, ...columns.map((c) => {
       const classes = [c.num ? 'num' : '', c.bad && c.bad(r) ? 'bad' : ''].filter(Boolean).join(' ');
-      return el('td', classes ? { class: classes } : {}, c.cell(r));
+      const attrs = classes ? { class: classes } : {};
+      const tip = c.tip ? c.tip(r) : '';
+      if (tip) attrs.title = tip;
+      return el('td', attrs, c.cell(r));
     })));
   }
   table.tBodies[0].replaceChildren(...rows);
@@ -310,7 +418,7 @@ function render() {
   renderSessions();
   renderRequests();
   renderTotals();
-  renderKeys();
+  window.GufoAdmin.renderKeys();  // per-key usage arrives with every tick
 }
 
 function scheduleRender() {
@@ -320,10 +428,21 @@ function scheduleRender() {
   }
 }
 
+// The monitor is the admin's alone: a 401 means the admin session expired or ended
+// elsewhere. The data stops and the page says so, with a link to sign in again.
+function sessionExpired() {
+  if (expired) return;
+  expired = true;
+  source?.close();
+  $('expired').hidden = false;
+  window.GufoAdmin.load().catch(() => {});  // the key and account panels close too
+  scheduleRender();
+}
+
 async function loadState() {
   const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store' });
   if (response.status === 401) {
-    window.location.assign('/login');
+    sessionExpired();
     return false;
   }
   if (!response.ok) throw new Error(`state ${response.status}`);
@@ -361,6 +480,7 @@ function applyTick(tick) {
 }
 
 function connect() {
+  if (expired) return;
   source = new EventSource('/api/stream');
   source.addEventListener('open', () => {
     const wasDown = !streamUp;
@@ -372,211 +492,27 @@ function connect() {
     streamUp = false;
     scheduleRender();
     if (source.readyState === EventSource.CLOSED) {
-      // Closed for good (e.g. 401 after logout elsewhere): check, then retry.
+      // Closed for good (e.g. 401 once the admin session ends): check, then retry.
       loadState().then((ok) => ok && setTimeout(connect, 2000)).catch(() => setTimeout(connect, 5000));
     }
   });
 }
 
-// ---------------------------------------------------------------- API keys
-// The list comes from Gufo's key file (GET /api/keys, monitor token); usage
-// and reload status arrive with every tick. Changes need the admin token.
+// ---------------------------------------------------------------- setup
+// API keys and accounts live in admin.js (GufoAdmin), fed with this page's state; the
+// page header and the admin sign-in in header.js (GufoHeader).
 
-let keys = null;  // null: the monitor has no --keys-file
-let keysAdmin = false;
-let editingKey = null;
-
-async function keysRequest(method, path, body) {
-  const options = { method, credentials: 'same-origin', cache: 'no-store', headers: {} };
-  if (body !== undefined) {
-    options.headers['Content-Type'] = 'application/json';
-    options.body = JSON.stringify(body);
-  }
-  const response = await fetch(path, options);
-  const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-  return data;
+// After a sign-in or sign-out from the header: the page needs the admin session, and
+// reloads when the admin signs in again from its own header.
+function onSession(session) {
+  if (!session.admin) sessionExpired();
+  else if (expired) window.location.reload();
 }
 
-function showKeysError(error) {
-  const node = $('keys-error');
-  node.textContent = error ? String(error.message ?? error) : '';
-  node.hidden = !error;
-}
-
-async function loadKeys() {
-  const response = await fetch('/api/keys', { credentials: 'same-origin', cache: 'no-store' });
-  if (response.status === 404) return;  // key management not configured
-  try {
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-    keys = data.keys;
-    keysAdmin = data.admin;
-    showKeysError(null);
-  } catch (error) {
-    keys = keys ?? [];
-    showKeysError(error);
-  }
-  $('keys-section').hidden = false;
-  $('admin-unlock').hidden = keysAdmin;
-  $('keys-admin').hidden = !keysAdmin;
-  renderModelChoices();
-  renderKeys();
-}
-
-function renderModelChoices() {
-  const list = $('key-model-list');
-  const checked = new Set([...list.querySelectorAll('input:checked')].map((i) => i.value));
-  const names = new Set((state?.models ?? []).map((m) => m.id));
-  for (const key of keys ?? []) for (const model of key.models) names.add(model);
-  list.replaceChildren(...[...names].sort().map((name) => {
-    const box = el('input', { type: 'checkbox', value: name });
-    box.checked = checked.has(name);
-    return el('label', {}, box, ` ${name}`);
-  }));
-  syncModelControls();
-}
-
-function syncModelControls() {
-  const monitor = $('key-access').value === 'monitor';
-  $('key-models').disabled = monitor;
-  const all = $('key-all-models').checked;
-  for (const box of $('key-model-list').querySelectorAll('input')) box.disabled = all || monitor;
-}
-
-function renderKeys() {
-  if (keys === null) return;
-  const usage = state?.key_usage ?? {};
-  const reload = state?.key_reload;
-  $('keys-reload').textContent = !reload ? ''
-    : reload.ok ? `Gufo loaded ${fmt(reload.keys, 0)} keys · ${fmtTime(reload.t)}`
-      : `Gufo kept its previous keys: ${reload.reason} · ${fmtTime(reload.t)}`;
-  $('keys-reload').className = reload && !reload.ok ? 'bad' : 'muted';
-  const rows = keys.map((key) => {
-    const used = usage[key.name] ?? {};
-    const actions = el('td');
-    if (keysAdmin) {
-      const edit = el('button', { type: 'button', class: 'link' }, 'Edit');
-      edit.addEventListener('click', () => startEdit(key));
-      const revoke = el('button', { type: 'button', class: 'link danger' }, 'Revoke');
-      revoke.addEventListener('click', () => revokeKey(key.name));
-      actions.append(edit, ' ', revoke);
-    }
-    return el('tr', {},
-      el('td', {}, key.name),
-      el('td', {}, key.access === 'monitor' ? 'Monitoring' : 'Inference'),
-      el('td', {}, key.access === 'monitor' ? '—' : key.models.length ? key.models.join(', ') : 'All'),
-      el('td', { class: 'num' }, fmt(used.requests ?? 0, 0)),
-      el('td', { class: 'num' }, fmt(used.prompt_tokens ?? 0, 0)),
-      el('td', { class: 'num' }, fmt(used.cached_tokens ?? 0, 0)),
-      el('td', { class: 'num' }, fmt(used.generated_tokens ?? 0, 0)),
-      el('td', { class: used.errors ? 'num bad' : 'num' }, fmt(used.errors ?? 0, 0)),
-      el('td', {}, used.last_t ? fmtTime(used.last_t) : '—'),
-      actions);
-  });
-  if (!rows.length) {
-    rows.push(el('tr', {}, el('td', { colspan: '10', class: 'muted' }, 'No keys in the file.')));
-  }
-  $('keys').tBodies[0].replaceChildren(...rows);
-}
-
-function resetKeyForm() {
-  editingKey = null;
-  $('key-form').reset();
-  $('key-name').disabled = false;
-  $('key-form-title').textContent = 'New key';
-  $('key-submit').textContent = 'Create key';
-  $('key-cancel').hidden = true;
-  for (const box of $('key-model-list').querySelectorAll('input')) box.checked = false;
-  syncModelControls();
-}
-
-function startEdit(key) {
-  editingKey = key.name;
-  $('key-name').value = key.name;
-  $('key-name').disabled = true;
-  $('key-access').value = key.access;
-  $('key-all-models').checked = key.models.length === 0;
-  for (const box of $('key-model-list').querySelectorAll('input')) {
-    box.checked = key.models.includes(box.value);
-  }
-  $('key-form-title').textContent = `Edit ${key.name}`;
-  $('key-submit').textContent = 'Save';
-  $('key-cancel').hidden = false;
-  syncModelControls();
-  $('key-form').scrollIntoView({ block: 'nearest' });
-}
-
-async function submitKey(event) {
-  event.preventDefault();
-  const access = $('key-access').value;
-  const models = access === 'monitor' || $('key-all-models').checked ? []
-    : [...$('key-model-list').querySelectorAll('input:checked')].map((box) => box.value);
-  if (access === 'inference' && !$('key-all-models').checked && !models.length) {
-    showKeysError('Choose at least one model, or All models.');
-    return;
-  }
-  try {
-    if (editingKey) {
-      await keysRequest('PUT', `/api/keys/${encodeURIComponent(editingKey)}`, { access, models });
-    } else {
-      const created = await keysRequest('POST', '/api/keys', { name: $('key-name').value, access, models });
-      $('key-secret-name').textContent = created.name;
-      $('key-secret-token').textContent = created.token;
-      $('key-secret').hidden = false;
-    }
-    resetKeyForm();
-    showKeysError(null);
-  } catch (error) {
-    showKeysError(error);
-  }
-  await loadKeys();
-}
-
-async function revokeKey(name) {
-  if (!window.confirm(`Revoke key "${name}"? Clients using it are refused within seconds.`)) return;
-  try {
-    await keysRequest('DELETE', `/api/keys/${encodeURIComponent(name)}`);
-    if (editingKey === name) resetKeyForm();
-    showKeysError(null);
-  } catch (error) {
-    showKeysError(error);
-  }
-  await loadKeys();
-}
-
-function setUpKeys() {
-  $('admin-unlock').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    try {
-      await keysRequest('POST', '/api/admin/login', { token: $('admin-token').value });
-      $('admin-token').value = '';
-      showKeysError(null);
-    } catch (error) {
-      showKeysError(error);
-    }
-    await loadKeys();
-  });
-  $('admin-lock').addEventListener('click', async () => {
-    await keysRequest('POST', '/api/admin/logout').catch(() => {});
-    resetKeyForm();
-    await loadKeys();
-  });
-  $('key-form').addEventListener('submit', submitKey);
-  $('key-cancel').addEventListener('click', resetKeyForm);
-  $('key-access').addEventListener('change', syncModelControls);
-  $('key-all-models').addEventListener('change', syncModelControls);
-  $('key-secret-copy').addEventListener('click', () => {
-    navigator.clipboard?.writeText($('key-secret-token').textContent).catch(() => {});
-  });
-  $('key-secret-done').addEventListener('click', () => {
-    $('key-secret-token').textContent = '';
-    $('key-secret').hidden = true;
-  });
-  loadKeys().catch(() => {});
-  // Picks up edits made outside the page and the hour-long admin unlock ending.
-  setInterval(() => loadKeys().catch(() => {}), 30000);
+function showAdminSection(name) {
+  const section = $({ accounts: 'accounts-section', keys: 'admin-keys-section',
+    pricing: 'admin-pricing-section', usage: 'admin-usage-section' }[name]);
+  if (!section.hidden) section.scrollIntoView({ block: 'start' });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -585,6 +521,13 @@ document.addEventListener('DOMContentLoaded', () => {
     requestsDirty = true;
     scheduleRender();
   });
+  window.GufoHeader.init({ onSession, onAdminTab: showAdminSection });
+  window.GufoHeader.refresh().catch(() => {});
+  window.GufoAdmin.init({ state: () => state, onChange: () => window.GufoHeader.refresh().catch(() => {}) });
   // Keys need the state's model list for their choices.
-  loadState().then((ok) => ok && connect()).catch(() => connect()).finally(setUpKeys);
+  loadState().then((ok) => ok && connect()).catch(() => connect())
+    .finally(() => window.GufoAdmin.load().catch(() => {}));
+  // The long-window tile changes slowly: once a minute, not with every poll.
+  loadLongStats().catch(() => {});
+  setInterval(() => loadLongStats().catch(() => {}), LONG_REFRESH_MS);
 });

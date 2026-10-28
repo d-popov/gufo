@@ -1,0 +1,6 @@
+{
+  "default": {"input": 225000, "cached_input": 22500, "output": 705000},
+  "models": {
+    "qwen3.8-flash-next": {"input": 225000, "cached_input": 22500, "output": 705000}
+  }
+}

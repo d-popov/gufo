@@ -1,0 +1,482 @@
+"""Prepaid credits for Gufo API keys: accounts, USDC deposits, metering and key sync.
+
+gufo-monitor loads this package only with --billing-config. `Billing` ties the parts
+together: the database (db), prices (pricing), log metering and key-file sync (meter),
+deposit checks on Solana and Base (chain, crypto) and the public portal (portal).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+from .db import BillingError, Database
+from .meter import KeySync, Meter
+from .pricing import Pricing, PriceList, PricingError
+
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_CHAIN_ID = 8453
+RECONCILE_S = 60.0
+RECHECK_S = 30.0
+PENDING_MAX_S = 24 * 3600.0
+MAX_ADMIN_CREDIT = 10 ** 12
+MAX_USAGE_DAYS = 365
+USAGE_FIELDS = ("requests", "prompt", "cached", "generated", "cost_micro")
+SOLANA_SIGNATURE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{64,90}")
+BASE_TX = re.compile(r"0x[0-9a-fA-F]{64}")
+BASE_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _int(value, name: str, default: int, minimum: int = 0) -> int:
+    value = default if value is None else value
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f"{name}: expected an integer >= {minimum}")
+    return value
+
+
+def _str(section: dict, name: str, where: str, default: str | None = None) -> str:
+    value = section.get(name, default)
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{where}.{name}: expected a non-empty string")
+    return value
+
+
+def check_url(value, name: str, path: bool = True) -> str:
+    """An http(s) base URL without a trailing slash. PATH=False refuses a path: the
+    portal's pages and links live at the root of its host."""
+    if not isinstance(value, str):
+        raise ConfigError(f"{name}: expected a URL")
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+        parts.port  # noqa: B018 (raises ValueError on a bad port)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(f"{name}: expected an http:// or https:// URL, got {value!r}")
+    if parts.username or parts.password or parts.query or parts.fragment or (
+            not path and parts.path.strip("/")):
+        example = "https://gufo.example.com" + ("/v1" if path else "")
+        raise ConfigError(f"{name}: expected a plain base URL like {example}, got {value!r}")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+
+
+def load_config(path: Path, public_url: str | None = None, api_url: str | None = None,
+                default_url: str = "http://127.0.0.1:8099") -> dict:
+    """Read and check --billing-config. Relative paths are relative to the file.
+
+    The public URL (verification links, wallet messages) is PUBLIC_URL (GUFO_PUBLIC_URL),
+    else the config's optional `public_base_url`, else DEFAULT_URL; the API URL shown to
+    users is API_URL (GUFO_API_URL), else `api_base_url`, else the public URL + /v1."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text())
+    except ValueError as error:
+        raise ConfigError(f"{path}: {error}") from None
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a JSON object")
+    base = path.resolve().parent
+    if public_url:
+        public = check_url(public_url, "GUFO_PUBLIC_URL", path=False)
+    else:
+        public = check_url(data.get("public_base_url", default_url), "public_base_url",
+                           path=False)
+    if api_url:
+        api = check_url(api_url, "GUFO_API_URL")
+    else:
+        api = check_url(data.get("api_base_url", public + "/v1"), "api_base_url")
+    config = {
+        "db": base / _str(data, "db", "config"),
+        "pricing": base / _str(data, "pricing", "config"),
+        "signup_grant_micro": _int(data.get("signup_grant_micro"), "signup_grant_micro",
+                                   990_000),
+        "public_base_url": public,
+        "api_base_url": api,
+        "max_keys_per_user": _int(data.get("max_keys_per_user"), "max_keys_per_user", 5, 1),
+        "model": data.get("model") if isinstance(data.get("model"), str) else None,
+        "solana": None,
+        "base": None,
+    }
+    solana = data.get("solana")
+    if solana is not None:
+        if not isinstance(solana, dict):
+            raise ConfigError("solana: expected an object")
+        config["solana"] = {
+            "rpc": _str(solana, "rpc", "solana", "https://api.mainnet-beta.solana.com"),
+            "receiver_owner": _str(solana, "receiver_owner", "solana"),
+            "receiver_token_account": _str(solana, "receiver_token_account", "solana"),
+            "mint": _str(solana, "mint", "solana", USDC_MINT),
+            "commitment": _str(solana, "commitment", "solana", "finalized"),
+        }
+    chain_base = data.get("base")
+    if chain_base is not None:
+        if not isinstance(chain_base, dict):
+            raise ConfigError("base: expected an object")
+        receiver = _str(chain_base, "receiver", "base")
+        usdc = _str(chain_base, "usdc", "base", BASE_USDC)
+        if not BASE_ADDRESS.fullmatch(receiver) or not BASE_ADDRESS.fullmatch(usdc):
+            raise ConfigError("base.receiver and base.usdc must be 0x addresses")
+        config["base"] = {
+            "rpc": _str(chain_base, "rpc", "base", "https://mainnet.base.org"),
+            "receiver": receiver.lower(),
+            "usdc": usdc.lower(),
+            "confirmations": _int(chain_base.get("confirmations"), "base.confirmations", 12, 1),
+        }
+    return config
+
+
+def chain_clients(config: dict) -> dict:
+    """The deposit checkers of the enabled chains."""
+    from . import chain
+    clients = {}
+    if config["solana"]:
+        s = config["solana"]
+        clients["solana"] = chain.Solana(s["rpc"], s["receiver_owner"],
+                                         s["receiver_token_account"], s["mint"],
+                                         s["commitment"])
+    if config["base"]:
+        b = config["base"]
+        clients["base"] = chain.Base(b["rpc"], b["receiver"], b["usdc"], b["confirmations"])
+    return clients
+
+
+def normalize_tx(chain_name: str, tx) -> str | None:
+    if not isinstance(tx, str):
+        return None
+    tx = tx.strip()
+    if chain_name == "solana":
+        return tx if SOLANA_SIGNATURE.fullmatch(tx) else None
+    if chain_name == "base":
+        return tx.lower() if BASE_TX.fullmatch(tx) else None
+    return None
+
+
+def normalize_sender(chain_name: str, sender) -> str | None:
+    if not isinstance(sender, str) or not sender:
+        return None
+    return sender.lower() if chain_name == "base" else sender
+
+
+class Billing:
+    """The billing service. `keys` is the monitor's KeyStore for Gufo's key file and
+    `served_model` returns the model Gufo serves (None while unknown); a `model` in
+    the config overrides it. `chains` maps "solana"/"base" to deposit checkers."""
+
+    Error = BillingError  # raised by deposit() and admin_action(): .status, .code, .message
+
+    def __init__(self, config: dict, keys, served_model=lambda: None,
+                 chains: dict | None = None):
+        self.config = config
+        self.db = Database(config["db"])
+        self.prices = PriceList(config["pricing"])
+        self.chains = chain_clients(config) if chains is None else chains
+        self._served_model = served_model
+        self.sync = KeySync(self.db, keys, self.model)
+        self.meter = Meter(self.db, self.prices, self.sync)
+
+    @property
+    def pricing(self) -> Pricing:
+        """The live prices; a new object after each admin save."""
+        return self.prices.current
+
+    def model(self) -> str | None:
+        return self.config.get("model") or self._served_model()
+
+    def save_pricing(self, data) -> dict:
+        """Replace the price table (admin); raises BillingError when it is invalid.
+        Requests billed afterwards use it; ledger rows already written stay as they are."""
+        try:
+            return self.prices.save(data).to_dict()
+        except PricingError as error:
+            raise BillingError(400, "bad_pricing", str(error)) from None
+
+    # -- hooks and background work
+
+    def on_request(self, record: dict):
+        """Called by the monitor for every completed request in Gufo's log."""
+        try:
+            self.meter.on_request(record)
+        except Exception as error:  # metering must never stop the log tail
+            print(f"gufo-monitor: billing: metering failed: {error}", file=sys.stderr)
+
+    def reconcile(self) -> bool:
+        return self.sync.reconcile()
+
+    def run(self, stop: threading.Event):
+        """Reconcile keys at start and every minute; re-check pending deposits."""
+        next_reconcile = next_recheck = time.monotonic()
+        while not stop.is_set():
+            now = time.monotonic()
+            try:
+                if now >= next_reconcile:
+                    next_reconcile = now + RECONCILE_S
+                    self.reconcile()
+                    self.db.expire()
+                if now >= next_recheck:
+                    next_recheck = now + RECHECK_S
+                    self.recheck_pending()
+            except Exception as error:
+                print(f"gufo-monitor: billing: {error}", file=sys.stderr)
+            stop.wait(max(0.5, min(next_reconcile, next_recheck) - time.monotonic()))
+
+    # -- deposits
+
+    def deposit(self, user_id: int, chain_name, tx) -> dict:
+        client = self.chains.get(chain_name) if isinstance(chain_name, str) else None
+        if client is None:
+            raise BillingError(400, "chain_disabled", "deposits on this chain are not enabled")
+        tx = normalize_tx(chain_name, tx)
+        if tx is None:
+            raise BillingError(400, "bad_tx", "not a transaction id for this chain")
+        user = self.db.user(user_id)
+        if user is None or user["status"] != "approved":
+            raise BillingError(403, "not_approved", "the account is not approved")
+        now = time.time()
+        with self.db.write() as conn:
+            row = conn.execute("SELECT * FROM deposits WHERE chain=? AND tx=?",
+                               (chain_name, tx)).fetchone()
+            if row is not None and row["status"] == "credited":
+                if row["user_id"] == user_id:
+                    return {"status": "credited", "amount_micro": row["amount_micro"],
+                            "reason": ""}
+                return {"status": "rejected", "amount_micro": 0, "reason": "already_claimed"}
+            if row is None:
+                conn.execute("INSERT INTO deposits (chain, tx, user_id, status, created, updated)"
+                             " VALUES (?, ?, ?, 'pending', ?, ?)",
+                             (chain_name, tx, user_id, now, now))
+            else:  # not credited yet: whoever submits it claims it, if the sender is theirs
+                conn.execute("UPDATE deposits SET user_id=?, status='pending', updated=? "
+                             "WHERE chain=? AND tx=?", (user_id, now, chain_name, tx))
+        return self.check_deposit(chain_name, tx)
+
+    def check_deposit(self, chain_name: str, tx: str) -> dict:
+        """Ask the chain about a stored deposit and settle it: credited once, kept
+        pending (for at most a day) or rejected."""
+        check = self.chains[chain_name].check(tx)
+        now = time.time()
+        credited = None
+        with self.db.write() as conn:
+            row = conn.execute("SELECT * FROM deposits WHERE chain=? AND tx=?",
+                               (chain_name, tx)).fetchone()
+            if row["status"] == "credited":
+                return {"status": "credited", "amount_micro": row["amount_micro"], "reason": ""}
+            user_id = row["user_id"]
+            status, amount, reason = check.status, int(check.amount_micro or 0), check.reason or ""
+            sender = normalize_sender(chain_name, check.sender)
+            if status == "confirmed":
+                linked = sender is not None and conn.execute(
+                    "SELECT 1 FROM wallets WHERE chain=? AND address=? AND user_id=?",
+                    (chain_name, sender, user_id)).fetchone()
+                if not linked:
+                    status, reason = "rejected", "sender_not_linked"
+                elif amount <= 0:
+                    status, reason = "rejected", "no_amount"
+                else:
+                    credited = Database.post(conn, user_id, "deposit", amount,
+                                             f"{chain_name}:{tx}", f"{chain_name} from {sender}")
+                    status, reason = "credited", ""
+            elif status == "pending" and now - row["created"] > PENDING_MAX_S:
+                status, reason = "rejected", "expired"
+            elif status not in ("pending", "rejected"):
+                status, reason = "rejected", f"unknown status {status}"
+            conn.execute("UPDATE deposits SET status=?, amount_micro=?, sender=?, reason=?, "
+                         "updated=? WHERE chain=? AND tx=?",
+                         (status, amount if status == "credited" else 0, sender, reason[:200],
+                          now, chain_name, tx))
+        if credited is not None and credited[0] <= 0 < credited[1]:
+            self.reconcile()
+        return {"status": status, "amount_micro": amount if status == "credited" else 0,
+                "reason": reason}
+
+    def recheck_pending(self):
+        rows = self.db.query("SELECT chain, tx FROM deposits WHERE status='pending'")
+        for row in rows:
+            if row["chain"] not in self.chains:
+                continue
+            try:
+                self.check_deposit(row["chain"], row["tx"])
+            except Exception as error:
+                print(f"gufo-monitor: billing: deposit check failed: {error}", file=sys.stderr)
+
+    # -- admin
+
+    def verification_link(self, token: str) -> str:
+        return (self.config["public_base_url"] + "/api/portal/verify?token="
+                + urllib.parse.quote(token, safe=""))
+
+    def admin_accounts(self) -> dict:
+        rows = self.db.query(
+            "SELECT u.*, "
+            "(SELECT COUNT(*) FROM keys k WHERE k.user_id=u.id AND k.revoked=0) AS key_count, "
+            "(SELECT COALESCE(-SUM(amount_micro), 0) FROM ledger l "
+            " WHERE l.user_id=u.id AND l.kind='usage') AS spent, "
+            "(SELECT COALESCE(SUM(amount_micro), 0) FROM ledger l "
+            " WHERE l.user_id=u.id AND l.kind='deposit') AS deposited "
+            "FROM users u ORDER BY u.id")
+        wallets: dict[int, list] = {}
+        for row in self.db.query("SELECT user_id, chain, address FROM wallets ORDER BY linked"):
+            wallets.setdefault(row["user_id"], []).append(
+                {"chain": row["chain"], "address": row["address"]})
+        accounts = [{
+            "id": row["id"],
+            "email": row["email"],
+            "status": row["status"],
+            "email_verified": bool(row["email_verified"]),
+            "verification_link": self.verification_link(row["verify_token"])
+            if not row["email_verified"] and row["verify_token"] else None,
+            "balance_micro": row["balance_micro"],
+            "created": row["created"],
+            "approved_at": row["approved_at"],
+            "wallets": wallets.get(row["id"], []),
+            "keys": row["key_count"],
+            "spent_micro": row["spent"],
+            "deposited_micro": row["deposited"],
+        } for row in rows]
+        totals = {
+            "users": len(accounts),
+            "pending_approval": sum(a["status"] == "pending_approval" for a in accounts),
+            "balance_micro": sum(a["balance_micro"] for a in accounts),
+            "deposited_micro": sum(a["deposited_micro"] for a in accounts),
+            "spent_micro": sum(a["spent_micro"] for a in accounts),
+        }
+        return {"accounts": accounts, "totals": totals}
+
+    def revenue_micro(self, hours: int, now: float | None = None) -> dict[str, int]:
+        """Micro-dollars of the last HOURS hours: "users" is what portal users paid
+        (usage ledger debits), "internal" the requests of keys outside the portal at
+        the prices of the moment (never charged), "total" both."""
+        now = time.time() if now is None else now
+        since = now - hours * 3600
+        users = self.db.one("SELECT COALESCE(-SUM(amount_micro), 0) AS micro FROM ledger "
+                            "WHERE kind='usage' AND t>=?", (since,))["micro"]
+        internal = self.db.one("SELECT COALESCE(SUM(cost_micro), 0) AS micro FROM usage_log "
+                               "WHERE kind='internal' AND t>=?", (since,))["micro"]
+        return {"users": int(users), "internal": int(internal), "total": int(users + internal)}
+
+    def admin_usage(self, days: int, now: float | None = None) -> dict:
+        """Usage of the last DAYS UTC calendar days, today included. "internal": the
+        requests of keys outside the portal (the owner's and hand-made ones), never
+        charged, priced when they were metered. "users": what portal users paid (usage
+        ledger debits) with the tokens from usage_log; debits from before usage_log
+        existed have no token counts and are counted in tokens_unknown_requests."""
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= MAX_USAGE_DAYS:
+            raise BillingError(400, "bad_days", f"days must be an integer from 1 to "
+                               f"{MAX_USAGE_DAYS}")
+        now = time.time() if now is None else now
+        since = (now // 86400 - (days - 1)) * 86400
+        sums = ("COUNT(*) AS requests, COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                "COALESCE(SUM(cached_tokens), 0) AS cached, "
+                "COALESCE(SUM(generated_tokens), 0) AS generated, "
+                "COALESCE(SUM(cost_micro), 0) AS cost_micro")
+        day = "date(t, 'unixepoch')"  # UTC
+
+        def internal(group: str) -> list[dict]:
+            return [dict(row) for row in self.db.query(
+                f"SELECT {group} AS name, {sums} FROM usage_log WHERE kind='internal' "
+                f"AND t>=? GROUP BY {group} ORDER BY {group}", (since,))]
+
+        by_key = [{"key": row.pop("name"), **row} for row in internal("key_name")]
+        by_key.sort(key=lambda row: (-row["cost_micro"], row["key"]))
+        internal_by_day = [{"day": row.pop("name"), **row} for row in internal(day)]
+
+        # Users: tokens from usage_log, money from the ledger (cost-free requests have no
+        # debit; debits without a usage_log row predate it).
+        users: dict[str, dict] = {}
+        empty = lambda: {**dict.fromkeys(USAGE_FIELDS, 0), "tokens_unknown_requests": 0}  # noqa: E731
+        for row in self.db.query(
+                f"SELECT {day} AS day, COUNT(*) AS requests, "
+                "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                "COALESCE(SUM(cached_tokens), 0) AS cached, "
+                "COALESCE(SUM(generated_tokens), 0) AS generated "
+                f"FROM usage_log WHERE kind='user' AND t>=? GROUP BY {day}", (since,)):
+            entry = users.setdefault(row["day"], empty())
+            for field in ("requests", "prompt", "cached", "generated"):
+                entry[field] += row[field]
+        for row in self.db.query(
+                f"SELECT {day} AS day, -SUM(amount_micro) AS cost, "
+                "SUM(NOT EXISTS (SELECT 1 FROM usage_log u WHERE u.ref=l.ref "
+                "AND u.kind='user')) AS unknown "
+                f"FROM ledger l WHERE kind='usage' AND t>=? GROUP BY {day}", (since,)):
+            entry = users.setdefault(row["day"], empty())
+            entry["cost_micro"] += row["cost"]
+            entry["requests"] += row["unknown"]
+            entry["tokens_unknown_requests"] += row["unknown"]
+        users_by_day = [{"day": name, **users[name]} for name in sorted(users)]
+
+        def totals(rows: list[dict], fields) -> dict:
+            return {field: sum(row[field] for row in rows) for field in fields}
+
+        return {
+            "days": days,
+            "since": since,
+            "internal": {"totals": totals(internal_by_day, USAGE_FIELDS), "by_key": by_key,
+                         "by_day": internal_by_day},
+            "users": {"totals": totals(users_by_day,
+                                       (*USAGE_FIELDS, "tokens_unknown_requests")),
+                      "by_day": users_by_day},
+        }
+
+    def admin_action(self, user_id: int, action: str, body: dict | None) -> dict:
+        """verify, approve, reject, suspend, unsuspend or credit; raises BillingError."""
+        if action not in ("verify", "approve", "reject", "suspend", "unsuspend", "credit"):
+            raise BillingError(404, "not_found", "unknown action")
+        result: dict = {"ok": True}
+        with self.db.write() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if user is None:
+                raise BillingError(404, "not_found", "no such account")
+            status = user["status"]
+            if action == "verify":  # what the verification link does, for the admin
+                if user["email_verified"]:
+                    raise BillingError(409, "already_verified", "the email is already verified")
+                Database.mark_verified(conn, user)
+            elif action == "approve":
+                if not user["email_verified"]:
+                    raise BillingError(409, "not_verified", "the email is not verified yet")
+                if status == "suspended":
+                    raise BillingError(409, "suspended", "unsuspend the account instead")
+                conn.execute("UPDATE users SET status='approved', "
+                             "approved_at=COALESCE(approved_at, ?) WHERE id=?",
+                             (time.time(), user_id))
+                grant = self.config["signup_grant_micro"]
+                posted = grant > 0 and Database.post(conn, user_id, "signup_grant", grant,
+                                                     f"user:{user_id}", "signup credit")
+                result["grant_micro"] = grant if posted else 0
+            elif action == "reject":
+                conn.execute("UPDATE users SET status='rejected' WHERE id=?", (user_id,))
+            elif action == "suspend":
+                if status != "approved":
+                    raise BillingError(409, "not_approved", "only approved accounts can be "
+                                       "suspended")
+                conn.execute("UPDATE users SET status='suspended' WHERE id=?", (user_id,))
+            elif action == "unsuspend":
+                if status != "suspended":
+                    raise BillingError(409, "not_suspended", "the account is not suspended")
+                conn.execute("UPDATE users SET status='approved' WHERE id=?", (user_id,))
+            else:
+                amount = (body or {}).get("amount_micro")
+                note = (body or {}).get("note", "")
+                if isinstance(amount, bool) or not isinstance(amount, int) or amount == 0 \
+                        or abs(amount) > MAX_ADMIN_CREDIT:
+                    raise BillingError(400, "bad_amount", "amount_micro must be a non-zero "
+                                       "integer")
+                if not isinstance(note, str) or len(note) > 200:
+                    raise BillingError(400, "bad_note", "note must be text of at most 200 "
+                                       "characters")
+                Database.post(conn, user_id, "admin_credit", amount,
+                              "admin:" + secrets.token_hex(8), note.strip() or None)
+            result["balance_micro"] = conn.execute(
+                "SELECT balance_micro FROM users WHERE id=?", (user_id,)).fetchone()[0]
+        self.reconcile()
+        return result

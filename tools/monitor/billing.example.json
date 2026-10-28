@@ -1,0 +1,19 @@
+{
+  "db": "billing.sqlite",
+  "pricing": "pricing.example.json",
+  "signup_grant_micro": 990000,
+  "max_keys_per_user": 5,
+  "solana": {
+    "rpc": "https://api.mainnet-beta.solana.com",
+    "receiver_owner": "REPLACE_WITH_YOUR_SOLANA_WALLET_ADDRESS",
+    "receiver_token_account": "REPLACE_WITH_ITS_USDC_TOKEN_ACCOUNT",
+    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "commitment": "finalized"
+  },
+  "base": {
+    "rpc": "https://mainnet.base.org",
+    "receiver": "0x0000000000000000000000000000000000000000",
+    "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "confirmations": 12
+  }
+}

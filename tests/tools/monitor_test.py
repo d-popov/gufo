@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """CPU-only tests for tools/monitor: parsers, rates, Gufo polling and access control."""
 
+import contextlib
 import hashlib
+import io
 import http.client
 import http.server
 import importlib.util
@@ -11,6 +13,7 @@ from pathlib import Path
 import socket
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,7 +30,7 @@ REAL_LINE = (
     "draft_proposed=3 acceptance_pct=66.7 rss_mib=1234 host_available_mib=90000"
 )
 GUFO_KEY = "gufo-secret-key-do-not-leak-7f3a"
-MONITOR_TOKEN = "monitor-token-for-tests"
+ADMIN_TOKEN = "admin-token-for-tests"
 
 
 class PrometheusParserTest(unittest.TestCase):
@@ -86,6 +89,19 @@ class LogParserTest(unittest.TestCase):
         self.assertIsNone(gm.request_record(gm.parse_log_line(poll), show_clients=False))
         received = "2026-10-23 20:12:28 [INFO] [http] request=r1 event=received path=/v1/x"
         self.assertIsNone(gm.request_record(gm.parse_log_line(received), show_clients=False))
+
+    def test_image_fields_kept_and_absent_on_text_requests(self):
+        line = REAL_LINE.replace("finish=stop", "finish=stop images=2 image_tokens=3100 "
+                                 "image_bytes=1400000 image_px=2100000 image_px_hits=1 "
+                                 "image_px_misses=1 encoder_images=1 encode_ms=410.5 "
+                                 "image_tokens_reused=1500")
+        record = gm.request_record(gm.parse_log_line(line), show_clients=False)
+        self.assertEqual({key: record[key] for key in gm.IMAGE_FIELDS}, {
+            "images": 2, "image_tokens": 3100, "image_bytes": 1400000, "image_px": 2100000,
+            "image_px_hits": 1, "image_px_misses": 1, "encoder_images": 1, "encode_ms": 410.5,
+            "image_tokens_reused": 1500})
+        text = gm.request_record(gm.parse_log_line(REAL_LINE), show_clients=False)
+        self.assertFalse(set(gm.IMAGE_FIELDS) & set(text))
 
 
 class RatesTest(unittest.TestCase):
@@ -194,7 +210,7 @@ class MonitorHttpTest(unittest.TestCase):
             cls.monitor.poll_once(t)
             FakeGufo.counters = {k: v + 50 for k, v in FakeGufo.counters.items()}
         cls.monitor.add_request(gm.request_record(gm.parse_log_line(REAL_LINE), False))
-        cls.server = serve(gm.Server(("127.0.0.1", 0), cls.monitor, gm.Auth(MONITOR_TOKEN),
+        cls.server = serve(gm.Server(("127.0.0.1", 0), cls.monitor, gm.AdminAuth(ADMIN_TOKEN),
                                      secure_cookie=False))
         cls.port = cls.server.server_address[1]
 
@@ -215,21 +231,21 @@ class MonitorHttpTest(unittest.TestCase):
         connection.close()
         return response, data
 
-    def test_requires_monitor_token(self):
-        response, _ = self.request("GET", "/api/state")
-        self.assertEqual(response.status, 401)
-        response, _ = self.request("GET", "/api/state", {"Authorization": "Bearer wrong"})
-        self.assertEqual(response.status, 401)
-        response, _ = self.request("GET", "/api/stream")
-        self.assertEqual(response.status, 401)
-        response, _ = self.request("GET", "/")
-        self.assertEqual((response.status, response.getheader("Location")), (303, "/login"))
-        response, _ = self.request("GET", "/api/state", {"Cookie": f"{gm.COOKIE_NAME}={MONITOR_TOKEN}"})
-        self.assertEqual(response.status, 401)  # the cookie carries a derived session, not the token
+    def test_requires_the_admin(self):
+        for headers in ({}, {"Authorization": "Bearer wrong"}, {"X-Admin-Token": "wrong"},
+                        {"Cookie": f"{gm.ADMIN_COOKIE_NAME}={ADMIN_TOKEN}"},
+                        {"Cookie": "gufo_monitor=" + "0" * 64}):
+            for path in ("/api/state", "/api/stream"):
+                response, _ = self.request("GET", path, headers)
+                self.assertEqual(response.status, 401, (path, headers))
+            response, _ = self.request("GET", "/monitor", headers)
+            self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
+            response, data = self.request("GET", "/api/admin/session", headers)
+            self.assertEqual(json.loads(data), {"admin": False})
 
     def test_state_with_bearer_token_hides_the_gufo_key(self):
         response, data = self.request("GET", "/api/state",
-                                      {"Authorization": "Bearer " + MONITOR_TOKEN})
+                                      {"Authorization": "Bearer " + ADMIN_TOKEN})
         self.assertEqual(response.status, 200)
         self.assertIn("default-src 'self'", response.getheader("Content-Security-Policy"))
         self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
@@ -250,38 +266,37 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertEqual(state["requests"][0]["decode_tps"], 39.1)
         self.assertEqual(len(state["history"]["t"]), 4)
 
-    def test_login_sets_a_strict_cookie(self):
-        response, data = self.request("POST", "/login", {
-            "Content-Type": "application/x-www-form-urlencoded"}, "token=wrong")
-        self.assertEqual(response.status, 401)
-        self.assertIn(b"Wrong token", data)
-        response, _ = self.request("POST", "/login", {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Forwarded-Proto": "https"}, "token=" + MONITOR_TOKEN)
-        self.assertEqual(response.status, 303)
-        cookie = response.getheader("Set-Cookie")
-        for part in ("HttpOnly", "SameSite=Strict", "Secure", "Path=/"):
-            self.assertIn(part, cookie)
-        self.assertNotIn(MONITOR_TOKEN, cookie)
-        session = cookie.split(";")[0]
-        response, _ = self.request("GET", "/api/state", {"Cookie": "other=1; " + session})
-        self.assertEqual(response.status, 200)
-        response, data = self.request("GET", "/", {"Cookie": session})
+    def test_one_listener_serves_portal_and_monitor_pages(self):
+        response, data = self.request("GET", "/")
+        self.assertEqual(response.status, 200)  # the public portal page
+        self.assertIn(b'src="/static/portal.js"', data)
+        self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+        self.assertNotIn(b"<script>", data)
+        response, data = self.request("GET", "/monitor", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(response.status, 200)
         self.assertIn(b'src="/static/app.js"', data)
+        self.assertIn(b'src="/static/admin.js"', data)
         self.assertNotIn(b"<script>", data)
+        # Without --billing-config the portal API is absent, not the monitor's.
+        response, data = self.request("GET", "/api/portal/me")
+        self.assertEqual((response.status, json.loads(data)["error"]), (404, "not_found"))
+        for method in ("GET", "POST"):  # the old token login page is gone
+            response, _ = self.request(method, "/login")
+            self.assertIn(response.status, (401, 404), method)
 
     def test_static_whitelist(self):
-        response, _ = self.request("GET", "/static/app.css")
-        self.assertEqual(response.status, 200)
+        for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
+                     "portal.js", "portal.css", "wallet.js"):
+            response, _ = self.request("GET", "/static/" + name)
+            self.assertEqual(response.status, 200, name)
         for path in ("/static/../gufo_monitor.py", "/static/%2e%2e/gufo_monitor.py",
-                     "/static/index.html", "/static/"):
+                     "/static/index.html", "/static/", "/static/login.html"):
             response, _ = self.request("GET", path)
             self.assertEqual(response.status, 404, path)
 
     def test_stream_sends_ticks(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        connection.request("GET", "/api/stream", headers={"Authorization": "Bearer " + MONITOR_TOKEN})
+        connection.request("GET", "/api/stream", headers={"Authorization": "Bearer " + ADMIN_TOKEN})
         response = connection.getresponse()
         self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
         self.assertEqual(response.readline(), b"retry: 2000\n")
@@ -416,27 +431,21 @@ class KeyUsageTest(unittest.TestCase):
 
 
 class KeyAdminHttpTest(unittest.TestCase):
-    ADMIN = "admin-token-for-tests"
-
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.keys = Path(self.directory.name) / "api_keys"
         self.keys.write_text("watch sha256:" + "ab" * 32 + " access=monitor\n")
         monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
-        admin = gm.Auth(self.ADMIN, gm.ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1",
-                        "X-Admin-Token")
-        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.Auth(MONITOR_TOKEN),
-                                      False, gm.KeyStore(self.keys), admin))
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN),
+                                      False, gm.KeyStore(self.keys)))
 
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
         self.directory.cleanup()
 
-    def request(self, method, path, headers=None, body=None, monitor=True):
+    def request(self, method, path, headers=None, body=None):
         headers = dict(headers or {})
-        if monitor:
-            headers["Authorization"] = "Bearer " + MONITOR_TOKEN
         if isinstance(body, dict):
             body = json.dumps(body)
             headers.setdefault("Content-Type", "application/json")
@@ -448,36 +457,42 @@ class KeyAdminHttpTest(unittest.TestCase):
         connection.close()
         return response, data
 
-    def test_viewing_needs_the_monitor_token_and_changes_the_admin_token(self):
-        response, _ = self.request("GET", "/api/keys", monitor=False)
-        self.assertEqual(response.status, 401)
-        response, data = self.request("GET", "/api/keys")
-        self.assertEqual(json.loads(data), {
-            "keys": [{"name": "watch", "access": "monitor", "models": []}], "admin": False})
-        self.assertNotIn(b"abab", data)  # digests stay in the file
+    def sign_in(self, headers=None) -> str:
+        """The Set-Cookie header of a successful admin sign-in."""
+        response, _ = self.request("POST", "/api/admin/login", headers, {"token": ADMIN_TOKEN})
+        self.assertEqual(response.status, 204)
+        cookies = response.headers.get_all("Set-Cookie")
+        self.assertEqual(len(cookies), 1)  # the admin cookie only; there is no monitor cookie
+        return cookies[0]
+
+    def test_keys_are_the_admins_alone(self):
         new = {"name": "alice", "access": "inference", "models": ["fn"]}
-        response, _ = self.request("POST", "/api/keys", body=new)
-        self.assertEqual(response.status, 403)
-        response, _ = self.request("DELETE", "/api/keys/watch")
-        self.assertEqual(response.status, 403)
-        # The admin token alone is not enough either.
-        response, _ = self.request("POST", "/api/keys", {"X-Admin-Token": self.ADMIN}, new,
-                                   monitor=False)
-        self.assertEqual(response.status, 401)
+        for headers in ({}, {"Authorization": "Bearer wrong"}, {"X-Admin-Token": "wrong"},
+                        {"Cookie": "gufo_monitor=" + "0" * 64}):
+            for method, path, body in (("GET", "/api/keys", None), ("POST", "/api/keys", new),
+                                       ("PUT", "/api/keys/watch", {"models": []}),
+                                       ("DELETE", "/api/keys/watch", None)):
+                response, _ = self.request(method, path, headers, body)
+                self.assertEqual(response.status, 401, (method, path, headers))
         self.assertNotIn("alice", self.keys.read_text())
+        for headers in ({"X-Admin-Token": ADMIN_TOKEN},
+                        {"Authorization": "Bearer " + ADMIN_TOKEN}):
+            response, data = self.request("GET", "/api/keys", headers)
+            self.assertEqual((response.status, json.loads(data)), (200, {
+                "keys": [{"name": "watch", "access": "monitor", "models": []}]}))
+            self.assertNotIn(b"abab", data)  # digests stay in the file
 
     def test_admin_creates_edits_and_revokes(self):
         response, _ = self.request("POST", "/api/admin/login", body={"token": "wrong"})
         self.assertEqual(response.status, 401)
-        response, _ = self.request("POST", "/api/admin/login", body={"token": self.ADMIN})
-        self.assertEqual(response.status, 204)
-        cookie = response.getheader("Set-Cookie")
-        for part in ("Path=/api/", "HttpOnly", "SameSite=Strict", "Max-Age=3600"):
+        cookie = self.sign_in()
+        for part in ("Path=/;", "HttpOnly", "SameSite=Strict", f"Max-Age={12 * 3600}"):
             self.assertIn(part, cookie)
-        self.assertNotIn(self.ADMIN, cookie)
+        self.assertEqual(gm.ADMIN_COOKIE_MAX_AGE, 12 * 3600)
+        self.assertNotIn(ADMIN_TOKEN, cookie)
         admin = {"Cookie": cookie.split(";")[0]}
-        _, data = self.request("GET", "/api/keys", admin)
-        self.assertTrue(json.loads(data)["admin"])
+        response, _ = self.request("GET", "/api/keys", admin)
+        self.assertEqual(response.status, 200)
 
         response, data = self.request("POST", "/api/keys", admin,
                                       {"name": "alice", "models": ["fn-sub"]})
@@ -499,23 +514,97 @@ class KeyAdminHttpTest(unittest.TestCase):
         self.assertIn(f"alice sha256:{digest} access=monitor\n", self.keys.read_text())
         response, _ = self.request("PUT", "/api/keys/nobody", admin, {"models": []})
         self.assertEqual(response.status, 404)
-        response, _ = self.request("DELETE", "/api/keys/alice", {"X-Admin-Token": self.ADMIN})
+        response, _ = self.request("DELETE", "/api/keys/alice", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(response.status, 204)
         response, data = self.request("DELETE", "/api/keys/watch", admin)
         self.assertEqual(response.status, 400)
         self.assertIn(b"last key", data)
         response, _ = self.request("POST", "/api/admin/logout", admin)
-        self.assertIn("Max-Age=0", response.getheader("Set-Cookie"))
+        cleared = response.headers.get_all("Set-Cookie")
+        self.assertEqual(len(cleared), 1)
+        for part in (f"{gm.ADMIN_COOKIE_NAME}=;", "Path=/;", "Max-Age=0"):
+            self.assertIn(part, cleared[0])
+
+    def test_admin_cookie_opens_the_monitor(self):
+        for path in ("/api/state", "/api/keys", "/api/stream"):
+            response, _ = self.request("GET", path)
+            self.assertEqual(response.status, 401, path)
+        response, _ = self.request("GET", "/monitor")
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
+        # A form post cannot sign in: JSON is required.
+        response, _ = self.request("POST", "/api/admin/login",
+                                   {"Content-Type": "application/x-www-form-urlencoded"},
+                                   "token=" + ADMIN_TOKEN)
+        self.assertEqual(response.status, 401)
+        cookie = self.sign_in({"X-Forwarded-Proto": "https"})
+        for part in ("Path=/;", "HttpOnly", "SameSite=Strict", "Secure"):
+            self.assertIn(part, cookie)
+        admin = {"Cookie": cookie.split(";")[0]}
+        # Path=/: the browser sends the one cookie to the page and to /api/.
+        response, data = self.request("GET", "/monitor", admin)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'src="/static/app.js"', data)
+        self.assertNotIn(b"data-monitor-signout", data)
+        for path in ("/api/state", "/api/keys"):
+            response, _ = self.request("GET", path, admin)
+            self.assertEqual(response.status, 200, path)
+        response, data = self.request("GET", "/api/admin/session", admin)
+        self.assertEqual(json.loads(data), {"admin": True})
+
+    def test_admin_cookie_expires_and_cannot_be_forged(self):
+        now = time.time()
+        fresh = self.server.admin.session(now)
+        expires, signature = fresh.split(".")
+        for value in (self.server.admin.session(now - gm.ADMIN_COOKIE_MAX_AGE - 1),
+                      f"{int(expires) + 3600}.{signature}", f"{expires}.{'0' * 64}",
+                      "1" * 40 + "." + signature, expires, ADMIN_TOKEN,
+                      gm.AdminAuth("another token").session(now)):
+            response, _ = self.request("GET", "/api/state",
+                                       {"Cookie": f"{gm.ADMIN_COOKIE_NAME}={value}"})
+            self.assertEqual(response.status, 401, value)
+        response, _ = self.request("GET", "/api/state", {"Cookie": f"{gm.ADMIN_COOKIE_NAME}={fresh}"})
+        self.assertEqual(response.status, 200)
+
+    def test_stream_ends_with_the_admin_session(self):
+        cookie = self.server.admin.session(time.time() - gm.ADMIN_COOKIE_MAX_AGE + 1.5)
+        headers = {"Cookie": f"{gm.ADMIN_COOKIE_NAME}={cookie}"}
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
+                                                timeout=10)
+        connection.request("GET", "/api/stream", headers=headers)
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        started = time.monotonic()
+        self.assertTrue(response.read().startswith(b"retry: 2000\n\n"))  # read to the end
+        self.assertLess(time.monotonic() - started, 5)
+        connection.close()
+        time.sleep(max(0.0, float(cookie.split(".")[0]) - time.time()))
+        response, _ = self.request("GET", "/api/stream", headers)
+        self.assertEqual(response.status, 401)  # the browser's reconnect
+
+    def test_admin_sign_in_is_rate_limited_per_client(self):
+        self.assertEqual((gm.RateLimiter().limit, gm.RateLimiter().window_s), (10, 60.0))
+        self.server.limiter = gm.RateLimiter(limit=3)  # each wrong token costs half a second
+
+        def attempts(token, headers=None, count=1):
+            return [self.request("POST", "/api/admin/login", headers, {"token": token})[0].status
+                    for _ in range(count)]
+
+        self.assertEqual(attempts("wrong", count=4), [401] * 3 + [429])
+        self.assertEqual(attempts(ADMIN_TOKEN), [429])  # even the right token waits now
+        # From loopback (a tunnel on this host), CF-Connecting-IP names the client.
+        tunnel = {"CF-Connecting-IP": "203.0.113.7", "X-Forwarded-For": "198.51.100.1"}
+        self.assertEqual(attempts("wrong", tunnel, 4), [401] * 3 + [429])
+        self.assertEqual(attempts(ADMIN_TOKEN, {**tunnel, "CF-Connecting-IP": "203.0.113.8"}),
+                         [204])
 
     def test_no_key_routes_without_a_keys_file(self):
         monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
-        plain = serve(gm.Server(("127.0.0.1", 0), monitor, gm.Auth(MONITOR_TOKEN), False))
+        plain = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False))
         try:
             for method in ("GET", "POST"):
                 connection = http.client.HTTPConnection("127.0.0.1", plain.server_address[1],
                                                         timeout=5)
-                connection.request(method, "/api/keys",
-                                   headers={"Authorization": "Bearer " + MONITOR_TOKEN})
+                connection.request(method, "/api/keys", headers={"X-Admin-Token": ADMIN_TOKEN})
                 self.assertEqual(connection.getresponse().status, 404)
                 connection.close()
         finally:
@@ -523,55 +612,337 @@ class KeyAdminHttpTest(unittest.TestCase):
             plain.server_close()
 
 
-class TrustLocalhostTest(unittest.TestCase):
+class AdminOnlyFromThisHostTest(unittest.TestCase):
+    """What --trust-localhost used to admit: a browser on the monitor's own host, asking
+    for a loopback name with no proxy headers. It gets nothing without the admin."""
+
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.keys = Path(self.directory.name) / "api_keys"
-        self.keys.write_text("watch sha256:" + "ab" * 32 + " access=monitor\n")
         monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
-        admin = gm.Auth("admin", gm.ADMIN_COOKIE_NAME, b"gufo-monitor-admin-v1", "X-Admin-Token")
-        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.Auth(MONITOR_TOKEN), False,
-                                      gm.KeyStore(self.keys), admin, trust_localhost=True))
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN),
+                                      False))
 
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
+
+    def test_loopback_browser_needs_the_admin(self):
+        port = self.server.server_address[1]
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
+            for path in ("/api/state", "/api/stream", "/monitor"):
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                connection.request("GET", path, headers={"Host": host})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 303 if path == "/monitor" else 401,
+                                 (host, path))
+                connection.close()
+
+    def test_removed_options_are_rejected(self):
+        for argv in (["--trust-localhost"], ["--token-file", "/tmp/token"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                gm.parse_args(argv)
+
+
+class EnvFileTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / ".env"
+
+    def tearDown(self):
         self.directory.cleanup()
 
-    def request(self, method, path, headers=None, body=None):
+    def test_parser(self):
+        self.path.write_text(
+            "# the tunnel\n\n"
+            "GUFO_PUBLIC_URL = https://gufo.example.com/  # trailing comment\n"
+            "GUFO_API_URL='https://api.example.com/v1#not a comment'\n"
+            'QUOTED="a $HOME b"  # comment\n'
+            "EMPTY=\n"
+            "HASH=a#b\n")
+        self.assertEqual(gm.read_env_file(self.path), {
+            "GUFO_PUBLIC_URL": "https://gufo.example.com/",
+            "GUFO_API_URL": "https://api.example.com/v1#not a comment",
+            "QUOTED": "a $HOME b",  # no shell expansion
+            "EMPTY": "",
+            "HASH": "a#b",
+        })
+        self.assertEqual(gm.read_env_file(Path(self.directory.name) / "missing"), {})
+        for bad in ("export GUFO_PUBLIC_URL=x\n", "no equals sign\n", "A='unterminated\n",
+                    "A='x' trailing\n", "1A=x\n"):
+            self.path.write_text(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                gm.read_env_file(self.path)
+
+    def test_process_environment_wins(self):
+        self.path.write_text("GUFO_PUBLIC_URL=https://from-file.example\n"
+                             "GUFO_API_URL=https://api-file.example/v1\n")
+        environ = {"GUFO_PUBLIC_URL": "https://from-env.example", "GUFO_API_URL": "",
+                   "HOME": "/x"}
+        self.assertEqual(gm.load_environment(self.path, environ), {
+            "GUFO_PUBLIC_URL": "https://from-env.example",
+            "GUFO_API_URL": "https://api-file.example/v1",  # empty in the environment: unset
+        })
+        self.assertEqual(gm.load_environment(Path(self.directory.name) / "missing", {}), {})
+
+    def test_env_file_argument(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            gm.parse_args(["--env-file", str(Path(self.directory.name) / "missing")])
+        self.assertIn("--env-file", err.getvalue())
+        self.path.write_text("GUFO_PUBLIC_URL=https://gufo.example.com\n")
+        self.assertEqual(gm.parse_args(["--env-file", str(self.path)]).env_file, self.path)
+        self.assertEqual(gm.parse_args([]).env_file, gm.default_env_file())
+        for removed in ("--portal-port", "--portal-bind"):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                gm.parse_args([removed, "8098"])
+
+
+def stats_record(t, request="r1", generated=100, decode_tps=50.0, prefill=40, prefill_tps=400.0,
+                 prompt=200, cached=160, status=200, path="/v1/chat/completions", method="POST"):
+    return {"request": request, "method": method, "path": path, "status": status, "t": t,
+            "duration_ms": 1000.0, "prompt_tokens": prompt, "prefill_tokens": prefill,
+            "cached_tokens": cached, "generated_tokens": generated, "decode_tps": decode_tps,
+            "prefill_tps": prefill_tps}
+
+
+def log_line(t, request, generated=10, status=200):
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
+    return (f"{stamp} [INFO] [http] request={request} event=completed method=POST "
+            f"path=/v1/chat/completions status={status} duration_ms=500.0 outcome=completed "
+            f"prompt_tokens=20 prefill_tokens=20 generated_tokens={generated} cached_tokens=0 "
+            "prefill_tps=200.0 decode_tps=40.0 key=owner\n")
+
+
+class StatsStoreTest(unittest.TestCase):
+    HOUR = 500_000  # an hour number; NOW is half past it
+    NOW = HOUR * 3600 + 1800.0
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "sub" / "stats.sqlite"
+        self.stats = gm.StatsStore(self.path)
+
+    def tearDown(self):
+        self.stats.conn.close()
+        self.dir.cleanup()
+
+    def windows(self, now=None):
+        return self.stats.long_window(self.NOW if now is None else now)["windows"]
+
+    def test_file_is_private_and_wal(self):
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.stats.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_hourly_buckets_and_window_boundaries(self):
+        # The 24 h window is the current UTC hour and the 23 before it; 168 h likewise.
+        for i, hours_ago in enumerate((0, 23, 24, 167, 168)):
+            t = (self.HOUR - hours_ago) * 3600 + 10.0
+            self.assertTrue(self.stats.add_request(stats_record(t, f"r{i}"), now=self.NOW))
+        self.stats.add_request(stats_record(self.NOW - 60, "r9", status=503), now=self.NOW)
+        self.stats.flush(self.NOW)
+        self.stats.add_request(stats_record(self.NOW - 30, "r10"), now=self.NOW)  # pending
+        day, week = self.windows()["24h"], self.windows()["168h"]
+        self.assertEqual((day["requests"], week["requests"]), (4, 6))
+        self.assertEqual((day["errors"], week["errors"]), (1, 1))
+        self.assertEqual(day["generated_tokens"], 400)
+        self.assertEqual(day["start"], (self.HOUR - 23) * 3600)
+        self.assertEqual(week["start"], (self.HOUR - 167) * 3600)
+        self.assertEqual(self.stats.conn.execute("SELECT count(*) FROM hours").fetchone()[0], 5)
+        self.assertAlmostEqual(day["cache_reuse_pct"], 80.0)
+
+    def test_rates_are_weighed_by_tokens(self):
+        # 1000 tokens at 50 tok/s (20 s) and 10 at 10 tok/s (1 s): 1010 / 21 s, not 30.
+        self.stats.add_request(stats_record(self.NOW - 10, "a", 1000, 50.0, 3000, 1000.0),
+                               now=self.NOW)
+        self.stats.add_request(stats_record(self.NOW - 5, "b", 10, 10.0, 100, 100.0), now=self.NOW)
+        # No rate: counted as a request, left out of the rates.
+        self.stats.add_request(stats_record(self.NOW - 4, "c", 0, None, 0, None), now=self.NOW)
+        day = self.windows()["24h"]
+        self.assertAlmostEqual(day["decode_tps"], 1010 / 21)
+        self.assertAlmostEqual(day["prefill_tps"], 3100 / 4)
+        self.assertEqual(day["requests"], 3)
+
+    def test_only_inference_requests_count(self):
+        for request, method, path in (("a", "GET", "/v1/models"), ("b", "POST", "/admin/x")):
+            record = stats_record(self.NOW - 1, request, method=method, path=path)
+            self.assertFalse(self.stats.add_request(record, now=self.NOW))
+        self.assertEqual(self.windows()["24h"]["requests"], 0)
+
+    def test_replays_and_restarts_count_once(self):
+        record = stats_record(self.NOW - 100, "r7")
+        self.assertTrue(self.stats.add_request(dict(record), now=self.NOW))
+        self.assertFalse(self.stats.add_request(dict(record), now=self.NOW))  # pending
+        self.stats.flush(self.NOW)
+        self.assertFalse(self.stats.add_request(dict(record), now=self.NOW))  # stored
+        # The same id at another time is another request (Gufo restarted).
+        self.assertTrue(self.stats.add_request(stats_record(self.NOW - 50, "r7"), now=self.NOW))
+        self.stats.flush(self.NOW)
+        self.stats.conn.close()
+        self.stats = gm.StatsStore(self.path)  # a monitor restart
+        self.assertFalse(self.stats.add_request(dict(record), now=self.NOW))
+        self.assertEqual(self.windows()["24h"]["requests"], 2)
+
+    def test_backfill_reads_the_rotated_log_once_and_the_tail_adds_nothing(self):
+        now = time.time()
+        log = Path(self.dir.name) / "gufo.log"
+        Path(str(log) + ".1").write_text(
+            log_line(now - 7200, "r1", 5) + "garbage line\n" + log_line(now - 7100, "r2", 7))
+        log.write_text(log_line(now - 3600, "r1", 11, status=500)
+                       + log_line(now - 60, "r3", 13).replace("method=POST", "method=GET"))
+        self.assertTrue(self.stats.needs_backfill(now))
+        self.assertEqual(gm.backfill_stats(self.stats, log, log_utc=True), 3)
+        self.assertEqual(gm.backfill_stats(self.stats, log, log_utc=True), 0)
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        monitor.stats = self.stats
+        tail = gm.LogTail(f"file:{log}", monitor, show_clients=False, log_utc=True)
+        for line in log.read_text().splitlines():
+            tail.feed(line)
+        self.assertEqual(len(monitor.requests), 2)  # the tail lists the file's own lines
+        long = self.stats.long_window(now)
+        week = long["windows"]["168h"]
+        self.assertEqual((week["requests"], week["errors"], week["generated_tokens"]), (3, 1, 23))
+        self.assertEqual(long["since"], float(int(now - 7200)))  # the rotated file's first line
+        self.assertAlmostEqual(week["data_hours"], (now - int(now - 7200)) / 3600)
+        self.assertAlmostEqual(week["tokens_per_hour"], 23 / week["data_hours"])
+        self.assertTrue(self.stats.needs_backfill(now))  # the log is younger than 7 days
+        self.stats.note_log_time(now - 169 * 3600)
+        self.assertFalse(self.stats.needs_backfill(now))
+
+    def test_pruning_after_eight_days(self):
+        old = self.NOW - 8 * 86400 + 600
+        self.assertTrue(self.stats.add_request(stats_record(old, "old"), now=self.NOW))
+        self.stats.add_sample(old, {"gpu_busy_pct": 50.0})
+        self.stats.flush(self.NOW)
+        count = lambda table: self.stats.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        self.assertEqual((count("hours"), count("seen")), (1, 1))
+        later = self.NOW + 3600
+        self.stats.flush(later)
+        self.assertEqual((count("hours"), count("seen")), (0, 0))
+        # Older than the retention: never counted, so a replay cannot revive it.
+        self.assertFalse(self.stats.add_request(stats_record(old, "old"), now=later))
+
+    def test_gpu_samples_and_serving_time(self):
+        samples = ({"running": 1, "queued": 0, "gpu_busy_pct": 10.0, "gpu_power_w": 20.0},
+                   {"running": 0, "queued": 0, "gpu_busy_pct": 30.0, "gpu_power_w": 40.0,
+                    "gpu_temp_c": 50.0},
+                   {"running": None, "queued": 2, "gpu_busy_pct": None, "gpu_power_w": None})
+        for i, sample in enumerate(samples):
+            self.stats.add_sample(self.NOW - 10 + i, sample)
+        self.stats.flush(self.NOW)
+        self.stats.add_sample(self.NOW - 2 * 86400, {"gpu_busy_pct": 90.0})  # 168 h only
+        long = self.stats.long_window(self.NOW)
+        day, week = long["windows"]["24h"], long["windows"]["168h"]
+        self.assertAlmostEqual(day["serving_pct"], 200 / 3)
+        self.assertAlmostEqual(day["gpu_busy_pct"], 20.0)
+        self.assertAlmostEqual(day["gpu_power_w"], 30.0)
+        self.assertAlmostEqual(day["gpu_temp_c"], 50.0)
+        self.assertAlmostEqual(day["gpu_hours"], 3 / 3600)
+        self.assertAlmostEqual(week["gpu_busy_pct"], 130 / 3)
+        self.assertAlmostEqual(week["serving_pct"], 50.0)
+        self.assertEqual(long["gpu_since"], self.NOW - 2 * 86400)
+        self.assertEqual(day["gpu_since"], day["start"])
+        self.assertIsNone(day["decode_tps"])  # no requests: no rate, not zero
+        self.assertIsNone(day["tokens_per_hour"])  # no log seen
+        json.dumps(long, allow_nan=False)
+
+    def test_image_sums(self):
+        image = {"images": 2, "image_tokens": 3000, "encoder_images": 1, "encode_ms": 400.0,
+                 "image_tokens_reused": 1500, "image_bytes": 999}
+        self.stats.add_request({**stats_record(self.NOW - 30, "a"), **image}, now=self.NOW)
+        self.stats.flush(self.NOW)
+        # Without encode_ms: an image request, left out of the per-request encoder time.
+        self.stats.add_request({**stats_record(self.NOW - 20, "b"), "images": 1,
+                                "image_tokens": 1000}, now=self.NOW)
+        self.stats.add_request({**stats_record(self.NOW - 10, "c"), "images": 1,
+                                "encode_ms": 100.0, "encoder_images": 1}, now=self.NOW)
+        self.stats.add_request(stats_record(self.NOW - 5, "text"), now=self.NOW)
+        day = self.windows()["24h"]
+        self.assertEqual((day["requests"], day["image_requests"], day["images"],
+                          day["image_tokens"], day["encoder_images"], day["image_tokens_reused"]),
+                         (4, 3, 4, 4000, 2, 1500))
+        self.assertAlmostEqual(day["encode_ms"], 500.0)
+        self.assertAlmostEqual(day["encode_ms_per_request"], 250.0)
+        self.assertNotIn("image_bytes", day)
+
+    def test_text_only_windows_have_no_encoder_time(self):
+        self.stats.add_request(stats_record(self.NOW - 5, "text"), now=self.NOW)
+        day = self.windows()["24h"]
+        self.assertEqual((day["image_requests"], day["images"]), (0, 0))
+        self.assertIsNone(day["encode_ms_per_request"])
+
+    def test_migrates_a_store_without_image_columns(self):
+        self.stats.conn.close()
+        old = Path(self.dir.name) / "old.sqlite"
+        legacy = gm.STATS_SUMS[:gm.STATS_SUMS.index("image_requests")]
+        conn = gm.sqlite3.connect(str(old))
+        conn.executescript(
+            "CREATE TABLE hours (hour INTEGER PRIMARY KEY, "
+            + ", ".join(f"{name} REAL NOT NULL DEFAULT 0" for name in legacy) + ");\n"
+            + gm.STATS_SCHEMA.split(";\n", 1)[1])
+        conn.execute("INSERT INTO hours (hour, requests, generated_tokens) VALUES (?, 3, 30)",
+                     (self.HOUR,))
+        conn.commit()
+        conn.close()
+        self.stats = gm.StatsStore(old)
+        columns = [row[1] for row in self.stats.conn.execute("PRAGMA table_info(hours)")]
+        self.assertEqual(columns, ["hour", *gm.STATS_SUMS])
+        day = self.windows()["24h"]
+        self.assertEqual((day["requests"], day["generated_tokens"]), (3, 30))  # kept
+        self.assertEqual((day["image_requests"], day["encode_ms"]), (0, 0.0))  # old rows: 0
+        self.assertIsNone(day["encode_ms_per_request"])
+        self.stats.add_request({**stats_record(self.NOW - 5, "img"), "images": 1,
+                                "encode_ms": 80.0}, now=self.NOW)
+        self.stats.flush(self.NOW)
+        self.stats.conn.close()
+        self.stats = gm.StatsStore(old)  # migrated already: nothing to add
+        columns = [row[1] for row in self.stats.conn.execute("PRAGMA table_info(hours)")]
+        self.assertEqual(columns, ["hour", *gm.STATS_SUMS])
+        day = self.windows()["24h"]
+        self.assertEqual((day["requests"], day["image_requests"]), (4, 1))
+        self.assertAlmostEqual(day["encode_ms_per_request"], 80.0)
+
+    def test_monitor_feeds_the_store(self):
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        monitor.stats = self.stats
+        now = time.time()
+        monitor.poll_once(now)  # Gufo is down: still a (not serving) sample
+        monitor.add_request(stats_record(now - 1, "r5"))
+        day = self.stats.long_window(now)["windows"]["24h"]
+        self.assertEqual((day["requests"], day["serving_pct"]), (1, 0.0))
+
+
+class LongStatsHttpTest(unittest.TestCase):
+    def setUp(self):
+        self.monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        self.server = serve(gm.Server(("127.0.0.1", 0), self.monitor, gm.AdminAuth(ADMIN_TOKEN),
+                                      False))
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def get(self, headers):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
                                                 timeout=5)
-        connection.request(method, path, body=body, headers=headers or {})
+        connection.request("GET", "/api/stats/long", headers=headers)
         response = connection.getresponse()
         data = response.read()
         connection.close()
-        return response, data
+        return response.status, data
 
-    def test_browser_on_this_host_needs_no_token(self):
-        port = self.server.server_address[1]
-        for host in (f"127.0.0.1:{port}", f"localhost:{port}", "LOCALHOST", f"[::1]:{port}"):
-            response, _ = self.request("GET", "/api/state", {"Host": host})
-            self.assertEqual(response.status, 200, host)
-        response, data = self.request("GET", "/")
-        self.assertEqual(response.status, 200)
-        self.assertIn(b'id="logout" hidden', data)
-        response, _ = self.request("GET", "/login")
-        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
-
-    def test_rebound_names_and_relayed_clients_still_need_the_token(self):
-        for headers in ({"Host": "evil.example"}, {"Host": "ai.d-popov.com:8099"},
-                        {"Host": "127.0.0.1.evil.example"}, {"X-Forwarded-For": "203.0.113.9"},
-                        {"CF-Connecting-IP": "203.0.113.9"}, {"Forwarded": "for=203.0.113.9"}):
-            response, _ = self.request("GET", "/api/state", headers)
-            self.assertEqual(response.status, 401, headers)
-        response, _ = self.request("GET", "/", {"Host": "evil.example"})
-        self.assertEqual((response.status, response.getheader("Location")), (303, "/login"))
-
-    def test_changing_keys_still_needs_the_admin_token(self):
-        response, _ = self.request("POST", "/api/keys", {"Content-Type": "application/json"},
-                                   json.dumps({"name": "alice"}))
-        self.assertEqual(response.status, 403)
-        self.assertNotIn("alice", self.keys.read_text())
+    def test_admin_only_and_shape(self):
+        admin = {"X-Admin-Token": ADMIN_TOKEN}
+        self.assertEqual(self.get(admin)[0], 404)  # no store
+        self.monitor.stats = gm.StatsStore(":memory:")
+        self.monitor.stats.add_request(stats_record(time.time() - 60))
+        for headers in ({}, {"X-Admin-Token": "wrong"}, {"Authorization": "Bearer wrong"}):
+            self.assertEqual(self.get(headers), (401, b'{"error":"unauthorized"}'))
+        status, data = self.get(admin)
+        self.assertEqual(status, 200)
+        body = json.loads(data)
+        self.assertEqual(set(body["windows"]), {"24h", "168h"})
+        self.assertEqual(body["windows"]["24h"]["requests"], 1)
+        self.assertEqual(body["windows"]["168h"]["decode_tps"], 50.0)
+        status, _ = self.get({"Authorization": "Bearer " + ADMIN_TOKEN})
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":
