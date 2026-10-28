@@ -1164,6 +1164,12 @@ Use appropriate HTTP status codes:
 - `409` incompatible session state
 - `413` request or prompt too large
 - `429` admission queue full or rate limit exceeded
+  (`queue_full` once 16 requests wait in a session class, `client_queue_full`
+  once one client has 8 waiting; a client is the API key name, else the peer
+  address). Running requests do not count against the queue. Tune with
+  `--max-pending` and `--max-pending-per-client`. Separately, the server
+  serves at most `--max-connections` (16) connections at once and answers the
+  rest `503 overloaded` with `Retry-After: 1`.
 - `499` internally recorded client cancellation
 - `500` internal failure
 - `503` model or backend unavailable, or GPU context lost (`device_lost`)

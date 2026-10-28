@@ -32,6 +32,12 @@ inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
     static_cast<std::size_t>(256) * 1024;
 
+/// Queued requests allowed per session class, and per client within it. One
+/// client (a key, or a peer address) cannot fill the whole queue and starve
+/// the others.
+inline constexpr std::size_t kDefaultMaxPendingRequests = 16;
+inline constexpr std::size_t kDefaultMaxPendingRequestsPerClient = 8;
+
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
   /// Decode rounds every active decoder runs after each prefill chunk that
@@ -46,8 +52,9 @@ struct TextSchedulerPolicy {
   /// Internal bound after which a still-queued stream reports its start, so
   /// transports can keep the connection alive while it waits.
   std::chrono::milliseconds stream_start_delay{std::chrono::seconds(5)};
-  std::size_t max_pending_requests{16};
-  std::size_t max_pending_requests_per_client{4};
+  std::size_t max_pending_requests{kDefaultMaxPendingRequests};
+  std::size_t max_pending_requests_per_client{
+      kDefaultMaxPendingRequestsPerClient};
   std::size_t max_output_bytes_per_request{kDefaultMaxOutputBytes};
   std::size_t max_buffered_output_bytes_per_request{
       kDefaultMaxBufferedOutputBytes};

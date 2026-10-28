@@ -1444,6 +1444,35 @@ void TestNonIncrementalRunnerFallsBackSafely() {
       "non-incremental runners report their full-prefill fallback");
 }
 
+void TestDefaultPolicyKeepsQueueRoomForOtherClients() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1);
+
+  auto active = scheduler->Submit({1}, 2, 0.0F, {}, false,
+                                  ClientMetadata("active-client"));
+  control->WaitForAdvance(1);
+  std::vector<TextGenerationScheduler::Request> queued;
+  for (std::size_t i = 0; i < gufo::server::kDefaultMaxPendingRequestsPerClient;
+       ++i)
+    queued.push_back(
+        scheduler->Submit({2}, 1, 0.0F, {}, false, ClientMetadata("greedy")));
+  bool quota = false;
+  try {
+    (void)scheduler->Submit({3}, 1, 0.0F, {}, false, ClientMetadata("greedy"));
+  } catch (const TextGenerationError& error) {
+    quota = error.code() == TextGenerationErrorCode::kClientQueueFull;
+  }
+  Expect(quota, "default policy caps one client below the whole queue");
+  queued.push_back(
+      scheduler->Submit({4}, 1, 0.0F, {}, false, ClientMetadata("other")));
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  for (auto& request : queued)
+    (void)request.Wait();
+}
+
 void TestPendingLimitsRejectBeforeStateAdmission() {
   auto control = std::make_shared<FakeControl>();
   control->block_advance_label = 1;
@@ -3135,6 +3164,7 @@ int main() {
     }
   }
   TestNonIncrementalRunnerFallsBackSafely();
+  TestDefaultPolicyKeepsQueueRoomForOtherClients();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();
   TestExpiredQueuedRequestNeverConsumesState();

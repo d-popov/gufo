@@ -761,7 +761,8 @@ void PrintServeHelp(std::string_view program_name,
                      "Scheduling", &max_pending_requests);
     parser.AddOption(
         "", "--max-pending-per-client", "N",
-        "Maximum queued requests per client IP (default: --max-pending)",
+        "Maximum queued requests per client key or IP (default: 8, at most "
+        "--max-pending)",
         "Scheduling", &max_pending_requests_per_client);
     parser.AddOption(
         "", "--request-timeout-ms", "MS",
@@ -1286,8 +1287,8 @@ int RunServe(std::span<const char* const> args) {
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t decode_rounds = 1;
-    std::size_t max_pending_requests = 16;
-    // Defaults to --max-pending after parsing unless supplied.
+    std::size_t max_pending_requests = server::kDefaultMaxPendingRequests;
+    // Defaults to min(--max-pending, 8) after parsing unless supplied.
     std::size_t max_pending_requests_per_client = 0;
     std::uint64_t request_timeout_ms = 0;
     std::uint64_t stall_timeout_ms = 0;
@@ -1410,7 +1411,8 @@ int RunServe(std::span<const char* const> args) {
                          "Scheduling", &max_pending_requests);
     llm_parser.AddOption(
         "", "--max-pending-per-client", "N",
-        "Maximum queued requests per client IP (default: --max-pending)",
+        "Maximum queued requests per client key or IP (default: 8, at most "
+        "--max-pending)",
         "Scheduling", &max_pending_requests_per_client);
     llm_parser.AddOption(
         "", "--request-timeout-ms", "MS",
@@ -1467,7 +1469,8 @@ int RunServe(std::span<const char* const> args) {
       return 0;
     }
     if (!llm_parser.WasSupplied("--max-pending-per-client")) {
-      max_pending_requests_per_client = max_pending_requests;
+      max_pending_requests_per_client = std::min(
+          max_pending_requests, server::kDefaultMaxPendingRequestsPerClient);
     }
     if (!session_classes.empty()) {
       for (const std::string_view replaced :
