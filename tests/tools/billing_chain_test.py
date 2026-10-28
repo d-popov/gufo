@@ -254,6 +254,84 @@ class SolanaTxTest(unittest.TestCase):
         self.assertEqual(raw[1 + 64:], message)
         self.assertTrue(crypto.ed25519_verify(owner_raw, message, key.sign(message)))
 
+    def test_create_receiver_account_layout(self):
+        wallet = NEW_RECEIVER_OWNER
+        ata = crypto.associated_token_address(wallet, USDC_MINT)[0]
+        args, raw = self.build(dest_token_account=ata, create_dest_for=wallet)
+        tx = decode_legacy_tx(raw)
+        self.assertEqual(tx["sigs"], [b"\0" * 64])
+        keys = tx["keys"]
+        self.assertEqual(keys, [args["owner"], args["source_token_account"], ata, USDC_MINT,
+                                TOKEN_PROGRAM, wallet, SYSTEM_PROGRAM, ATA_PROGRAM])
+        num_sig, ro_signed, ro_unsigned = tx["header"]
+        self.assertEqual((num_sig, ro_signed, ro_unsigned), (1, 0, 5))
+        writable = keys[:len(keys) - ro_unsigned]
+        self.assertEqual(writable, [args["owner"], args["source_token_account"], ata])
+        self.assertEqual(len(tx["instructions"]), 2)
+        (prog, accs, data), (prog2, accs2, data2) = tx["instructions"]
+        self.assertEqual(keys[prog], ATA_PROGRAM)
+        self.assertEqual([keys[i] for i in accs],  # payer, account, wallet, mint, system, token
+                         [args["owner"], ata, wallet, USDC_MINT, SYSTEM_PROGRAM, TOKEN_PROGRAM])
+        self.assertEqual(data, b"\x01")  # CreateIdempotent
+        self.assertEqual(keys[prog2], TOKEN_PROGRAM)
+        self.assertEqual([keys[i] for i in accs2],
+                         [args["source_token_account"], USDC_MINT, ata, args["owner"]])
+        self.assertEqual(struct.unpack("<BQB", data2), (12, 12_340_000, 6))
+        # Only the wallet's canonical account may be created; the wallet is not the payer.
+        with self.assertRaises(ValueError):
+            self.build(dest_token_account=pk(3), create_dest_for=wallet)
+        with self.assertRaises(ValueError):
+            payer_ata = crypto.associated_token_address(pk(1), USDC_MINT)[0]
+            self.build(dest_token_account=payer_ata, create_dest_for=pk(1))
+
+
+NEW_RECEIVER_OWNER = "6Rpvu3zEcUK1QWLqZm8MhMKTZZCqc1qLqQEQmisWGeN9"
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+
+
+class AssociatedTokenAddressTest(unittest.TestCase):
+    def test_known_vectors(self):
+        self.assertEqual(crypto.associated_token_address(
+            "7QXGLRjvyFAmxdRaP9Wk18KwWTMfspF4Na2sr3o3PzxV", USDC_MINT),
+            ("5rYBCPjppwZntGzmqMUgC1NVnSc2JdeWXLbZHssE1UyY", 254))
+        self.assertEqual(crypto.associated_token_address(NEW_RECEIVER_OWNER, USDC_MINT),
+                         ("C3LHV6bZdTM3k6VZxbrdaufqCvMLiZo3AKDYL4n8GbdZ", 250))
+        self.assertEqual((crypto.TOKEN_PROGRAM_ID, crypto.ASSOCIATED_TOKEN_PROGRAM_ID,
+                          crypto.SYSTEM_PROGRAM_ID), (TOKEN_PROGRAM, ATA_PROGRAM, SYSTEM_PROGRAM))
+        self.assertEqual(crypto.b58decode(SYSTEM_PROGRAM), b"\0" * 32)
+
+    def pda_candidate(self, owner, bump):
+        seeds = (crypto.b58decode(owner) + crypto.b58decode(TOKEN_PROGRAM)
+                 + crypto.b58decode(USDC_MINT) + bytes([bump]))
+        return hashlib.sha256(seeds + crypto.b58decode(ATA_PROGRAM) + b"ProgramDerivedAddress").digest()
+
+    def test_on_curve_is_solanas_decompression_not_the_subgroup_check(self):
+        # Bump 255 of this owner is a curve point (outside the prime-order subgroup, which
+        # libsodium would reject), so the address is bump 254.
+        owner = "7QXGLRjvyFAmxdRaP9Wk18KwWTMfspF4Na2sr3o3PzxV"
+        on_curve = self.pda_candidate(owner, 255)
+        self.assertTrue(crypto.solana_on_curve(on_curve))
+        self.assertFalse(crypto.solana_on_curve(self.pda_candidate(owner, 254)))
+        y = int.from_bytes(on_curve, "little") & ((1 << 255) - 1)
+        x = crypto._ed_recover_x(y % crypto._P, 0)
+        point = (x, y % crypto._P, 1, x * y % crypto._P)
+        self.assertFalse(crypto._ed_equal(crypto._ed_mul(crypto._L, point), (0, 1, 1, 0)))
+        for bump in range(251, 256):  # NEW_RECEIVER_OWNER's earlier bumps are all on curve
+            self.assertTrue(crypto.solana_on_curve(self.pda_candidate(NEW_RECEIVER_OWNER, bump)))
+        # Real keys are points; the sign bit and y >= p (reduced) do not matter.
+        self.assertTrue(crypto.solana_on_curve(crypto.b58decode(NEW_RECEIVER_OWNER)))
+        base = (crypto._G_Y).to_bytes(32, "little")
+        self.assertTrue(crypto.solana_on_curve(base[:31] + bytes([base[31] | 0x80])))
+        self.assertTrue(crypto.solana_on_curve((1 + crypto._P).to_bytes(32, "little")))  # y = 1
+
+    @unittest.skipUnless(HAVE_CRYPTOGRAPHY, "cryptography not installed")
+    def test_wallet_keys_are_on_curve(self):
+        for _ in range(8):
+            raw = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            self.assertTrue(crypto.solana_on_curve(raw))
+
 
 class FakeRpc:
     """Canned JSON-RPC transport: method -> result, Exception, or callable(params)."""
@@ -371,6 +449,84 @@ class SolanaCheckTest(unittest.TestCase):
         tx["transaction"]["message"]["accountKeys"].append({"pubkey": pk(78), "signer": False, "writable": True})
         self.assertEqual(self.check(tx).status, "confirmed")
 
+    def test_audit_balances_from_the_transaction(self):
+        tx = good_sol_tx(5_000_000)
+        tx["slot"], tx["blockTime"] = 321_000_000, 1_800_000_000
+        got = self.check(tx)
+        self.assertEqual((got.status, got.receiver_before_micro, got.receiver_after_micro,
+                          got.slot, got.block_time), ("confirmed", 100, 5_000_100, 321_000_000,
+                                                     1_800_000_000))
+        # Not part of equality: verdicts compare as before.
+        self.assertEqual(got, chain.DepositCheck("confirmed", SENDER, 5_000_000, "ok"))
+
+    def test_transfer_that_created_the_receiver_account(self):
+        # CreateIdempotent then TransferChecked: no pre balance entry for the receiver.
+        tx = sol_tx(pre=[tb(1, 9_000_000, SENDER)], post=[tb(1, 0, SENDER), tb(2, 9_000_000, RECV_OWNER)])
+        got = self.check(tx)
+        self.assertEqual((got.status, got.sender, got.amount_micro, got.receiver_before_micro,
+                          got.receiver_after_micro, got.receiver_created),
+                         ("confirmed", SENDER, 9_000_000, 0, 9_000_000, True))
+        self.assertEqual(got.slot, 1)
+        self.assertIsNone(got.block_time)  # no blockTime in the reply
+        self.assertFalse(self.check(good_sol_tx()).receiver_created)
+        # Created, but for someone else or of another mint: still refused.
+        for reason, entry in (("wrong_receiver_owner", tb(2, 9_000_000, OTHER)),
+                              ("wrong_mint", tb(2, 9_000_000, RECV_OWNER, mint=pk(99)))):
+            got = self.check(sol_tx(pre=[tb(1, 9_000_000, SENDER)], post=[tb(1, 0, SENDER), entry]))
+            self.assertEqual((got.status, got.reason), ("rejected", reason))
+        tx = good_sol_tx()
+        tx["slot"] = "1"  # not an integer: unknown, never guessed
+        self.assertIsNone(self.check(tx).slot)
+
+    def test_account_exists(self):
+        def info(value):
+            def reply(params):
+                self.assertEqual(params[0], RECV_ATA)
+                self.assertEqual(params[1]["commitment"], "confirmed")
+                return {"context": {"slot": 1}, "value": value}
+            return reply
+        self.assertFalse(self.solana(FakeRpc(getAccountInfo=info(None))).account_exists(RECV_ATA))
+        self.assertTrue(self.solana(FakeRpc(getAccountInfo=info({"lamports": 2039280, "data": ["", "base64"]})))
+                        .account_exists(RECV_ATA))
+        for broken in (OSError("down"), None, {"error": {"code": 429, "message": "slow"}}):
+            with self.assertRaises(chain.ChainError):
+                self.solana(FakeRpc(getAccountInfo=broken)).account_exists(RECV_ATA)
+
+    def test_audit_with_many_token_balances_and_other_mints(self):
+        keys = [SENDER, SENDER_ATA, RECV_ATA, USDC_MINT, TOKEN_PROGRAM, OTHER_ATA, pk(78)]
+        # The receiver's pre entry is of another mint: filtered out, so before is unknown.
+        tx = sol_tx(pre=[tb(1, 9_000_000, SENDER), tb(2, 777, RECV_OWNER, mint=pk(99)),
+                         tb(5, 40, OTHER), tb(6, 50, OTHER, mint=pk(77))],
+                    post=[tb(6, 10, OTHER, mint=pk(77)), tb(5, 40, OTHER),
+                          tb(2, 3_000_000, RECV_OWNER), tb(1, 6_000_000, SENDER)], keys=keys)
+        got = self.check(tx)
+        self.assertEqual((got.status, got.amount_micro, got.receiver_before_micro,
+                          got.receiver_after_micro), ("confirmed", 3_000_000, None, 3_000_000))
+        tx = sol_tx(pre=[tb(6, 50, OTHER, mint=pk(77)), tb(5, 40, OTHER), tb(2, 1_000, RECV_OWNER),
+                         tb(1, 9_000_000, SENDER)],
+                    post=[tb(1, 6_000_000, SENDER), tb(2, 3_001_000, RECV_OWNER), tb(5, 40, OTHER),
+                          tb(6, 10, OTHER, mint=pk(77))], keys=keys)
+        got = self.check(tx)
+        self.assertEqual((got.receiver_before_micro, got.receiver_after_micro), (1_000, 3_001_000))
+
+    def test_unconfirmed_checks_carry_no_audit(self):
+        for result in (None, OSError("down"), sol_tx(pre=[tb(1, 9, SENDER), tb(2, 5, RECV_OWNER)],
+                                                     post=[tb(1, 9, SENDER), tb(2, 5, RECV_OWNER)])):
+            got = self.check(result)
+            self.assertNotEqual(got.status, "confirmed")
+            self.assertEqual((got.receiver_before_micro, got.receiver_after_micro, got.slot,
+                              got.block_time), (None, None, None, None))
+
+    def test_receiver_balance(self):
+        def balance(params):
+            self.assertEqual(params, [RECV_ATA, {"commitment": "finalized"}])
+            return {"context": {"slot": 5}, "value": {"amount": "12345", "decimals": 6}}
+        self.assertEqual(self.solana(FakeRpc(getTokenAccountBalance=balance)).receiver_balance(), 12345)
+        for broken in ({"value": {}}, {"value": {"amount": 1.5}}, OSError("down"),
+                       {"error": {"code": 429, "message": "slow down"}}):
+            with self.assertRaises(chain.ChainError):
+                self.solana(FakeRpc(getTokenAccountBalance=broken)).receiver_balance()
+
     def test_token_accounts_and_blockhash(self):
         def accounts(params):
             self.assertEqual(params[0], SENDER)
@@ -458,6 +614,41 @@ class BaseCheckTest(unittest.TestCase):
         base = chain.Base("http://base", BASE_RECV, BASE_USDC, post=FakeRpc())
         for bad in ("0x1234", "9f" * 32, "0x" + "zz" * 32, None):
             self.assertEqual(base.check(bad).status, "rejected")
+
+
+class BaseAuditTest(unittest.TestCase):
+    def base(self, **responses):
+        rpc = FakeRpc(eth_getTransactionReceipt=receipt([transfer_log(BASE_FROM, BASE_RECV, 2_500_000)]),
+                      eth_blockNumber=hex(200), **responses)
+        return chain.Base("http://base", BASE_RECV, BASE_USDC, post=rpc), rpc
+
+    def test_balances_at_the_block_before_and_of_the_transfer(self):
+        def balance_of(params):
+            call, tag = params
+            self.assertEqual(call, {"to": BASE_USDC.lower(),
+                                    "data": "0x70a08231" + "0" * 24 + BASE_RECV[2:]})
+            return {hex(99): "0x%064x" % 7_000_000, hex(100): "0x%064x" % 9_500_000,
+                    "latest": "0x%064x" % 9_600_000}[tag]
+        base, rpc = self.base(eth_call=balance_of,
+                              eth_getBlockByNumber=lambda p: {"number": p[0], "timestamp": hex(1_800_000_000)})
+        got = base.check(TX_HASH)
+        self.assertEqual((got.status, got.amount_micro, got.receiver_before_micro,
+                          got.receiver_after_micro, got.slot, got.block_time),
+                         ("confirmed", 2_500_000, 7_000_000, 9_500_000, 100, 1_800_000_000))
+        self.assertEqual(base.receiver_balance(), 9_600_000)
+
+    def test_no_historic_state_is_none_never_a_guess(self):
+        base, _ = self.base(eth_call={"error": {"code": -32000, "message": "missing trie node"}},
+                            eth_getBlockByNumber=OSError("down"))
+        got = base.check(TX_HASH)
+        self.assertEqual((got.status, got.amount_micro, got.receiver_before_micro,
+                          got.receiver_after_micro, got.slot, got.block_time),
+                         ("confirmed", 2_500_000, None, None, 100, None))
+        base, _ = self.base(eth_call="0xzz", eth_getBlockByNumber={})
+        got = base.check(TX_HASH)
+        self.assertEqual((got.status, got.receiver_before_micro, got.block_time), ("confirmed", None, None))
+        with self.assertRaises(chain.ChainError):
+            base.receiver_balance()
 
 
 if __name__ == "__main__":

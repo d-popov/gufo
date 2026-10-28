@@ -2,13 +2,15 @@
 
 Every RPC goes through an injectable `post(url, payload) -> dict` so tests can
 feed canned responses. Transport and RPC errors never reject a deposit: they
-yield status "pending" so the caller retries later. Python 3.11+ standard
-library only.
+yield status "pending" so the caller retries later. A confirmed check also carries
+the receiver's USDC balance before and after the deposit, for the owner's audit;
+those are None whenever the chain cannot tell, and never change the verdict.
+Python 3.11+ standard library only.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 import urllib.request
@@ -29,6 +31,17 @@ class DepositCheck:
     sender: str | None
     amount_micro: int
     reason: str
+    # Audit facts of a confirmed deposit, None when the chain does not give them: the
+    # receiver's balance right before and after (Solana: the transaction's own token
+    # balances; Base: balanceOf at blocks N-1 and N), the slot (Base: block number) and
+    # its Unix time; receiver_created when the transaction created the receiving
+    # account (Solana: no pre balance entry; before is then 0). Not compared: two checks
+    # are equal when their verdicts are.
+    receiver_before_micro: int | None = field(default=None, compare=False)
+    receiver_after_micro: int | None = field(default=None, compare=False)
+    slot: int | None = field(default=None, compare=False)
+    block_time: int | None = field(default=None, compare=False)
+    receiver_created: bool = field(default=False, compare=False)
 
 
 def _pending(reason: str) -> DepositCheck:
@@ -80,6 +93,12 @@ def _int_amount(value) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError("bad amount")
     return int(value)
+
+
+def _optional_int(value) -> int | None:
+    """VALUE when it is a plain non-negative integer, else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 \
+        else None
 
 
 class Solana:
@@ -157,7 +176,23 @@ class Solana:
             return _rejected("no_sender")
         if len(senders) > 1:
             return _rejected("mixed_senders")
-        return DepositCheck("confirmed", senders.pop(), received, "ok")
+
+        def recorded(table, i):  # the receiver's own entry; None when of another mint
+            entry = table.get(i)
+            if entry is None or entry.get("mint") != self.mint:
+                return None
+            return _int_amount(entry["uiTokenAmount"]["amount"])
+
+        after = recorded(post, recv_i)
+        # No pre entry but a USDC post entry (owner checked above): this transaction
+        # created the receiving account (e.g. CreateIdempotent first), so it held 0.
+        created = recv_i not in pre and after is not None
+        return DepositCheck("confirmed", senders.pop(), received, "ok",
+                            receiver_before_micro=0 if created else recorded(pre, recv_i),
+                            receiver_after_micro=after,
+                            slot=_optional_int(tx.get("slot")),
+                            block_time=_optional_int(tx.get("blockTime")),
+                            receiver_created=created)
 
     def token_accounts(self, owner: str) -> list[str]:
         """Owner's token accounts for the configured mint, largest balance first."""
@@ -184,6 +219,25 @@ class Solana:
         if not isinstance(blockhash, str):
             raise ChainError("getLatestBlockhash: malformed reply")
         return blockhash
+
+    def account_exists(self, address: str) -> bool:
+        """Whether ADDRESS holds an account ("confirmed" commitment): getAccountInfo
+        answers null for one that was never created or was closed."""
+        result = self._rpc.call("getAccountInfo", [
+            address, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0},
+                      "commitment": "confirmed"}])
+        if not isinstance(result, dict) or "value" not in result:
+            raise ChainError("getAccountInfo: malformed reply")
+        return result["value"] is not None
+
+    def receiver_balance(self) -> int:
+        """The receiver token account's balance now, at the configured commitment."""
+        result = self._rpc.call("getTokenAccountBalance", [
+            self.receiver_token_account, {"commitment": self.commitment}])
+        try:
+            return _int_amount(result["value"]["amount"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ChainError(f"getTokenAccountBalance: malformed reply: {exc}") from None
 
 
 _TX_HASH_RE = re.compile(r"0x[0-9a-fA-F]{64}")
@@ -213,9 +267,37 @@ class Base:
             block = int(receipt["blockNumber"], 16)
             if block + self.confirmations > latest:
                 return _pending(f"confirmations {max(0, latest - block)}/{self.confirmations}")
-            return self._evaluate(receipt)
+            result = self._evaluate(receipt)
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             return _pending(f"malformed_receipt: {type(exc).__name__}: {exc}")
+        if result.status == "confirmed":
+            # Block granularity: other transfers to the receiver in block N show in the
+            # delta too. Nodes without historic state answer errors: those stay None.
+            result.slot = block
+            result.receiver_before_micro = self._optional(lambda: self.receiver_balance(block - 1))
+            result.receiver_after_micro = self._optional(lambda: self.receiver_balance(block))
+            result.block_time = self._optional(lambda: self._block_time(block))
+        return result
+
+    @staticmethod
+    def _optional(read):
+        try:
+            return read()
+        except (ChainError, KeyError, TypeError, ValueError, AttributeError):
+            return None
+
+    def receiver_balance(self, block: int | None = None) -> int:
+        """USDC balanceOf(receiver) at BLOCK, or at the latest block."""
+        data = "0x70a08231" + "0" * 24 + self.receiver[2:]
+        tag = "latest" if block is None else hex(block)
+        result = self._rpc.call("eth_call", [{"to": self.usdc, "data": data}, tag])
+        if not isinstance(result, str) or not re.fullmatch(r"0x[0-9a-fA-F]{1,64}", result):
+            raise ChainError("eth_call: malformed reply")
+        return int(result, 16)
+
+    def _block_time(self, block: int) -> int:
+        header = self._rpc.call("eth_getBlockByNumber", [hex(block), False])
+        return int(header["timestamp"], 16)
 
     def _evaluate(self, receipt: dict) -> DepositCheck:
         if receipt.get("status") != "0x1":

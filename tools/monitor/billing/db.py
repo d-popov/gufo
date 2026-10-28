@@ -120,7 +120,23 @@ CREATE TABLE IF NOT EXISTS usage_log (
 );
 CREATE INDEX IF NOT EXISTS usage_log_time ON usage_log(kind, t);
 CREATE INDEX IF NOT EXISTS ledger_kind_time ON ledger(kind, t);
+CREATE INDEX IF NOT EXISTS deposits_status_time ON deposits(status, updated);
 """
+
+# Audit columns of deposits, added in place to databases from before them (old rows
+# keep NULL): the receiver wallet's USDC balance before and after the deposit, from the
+# chain (Solana: the transaction's token balances; Base: balanceOf at blocks N-1 and N),
+# its slot (Base: block number) and Unix time, a live balance read when it was credited
+# (not authoritative) and a note when the balance delta differs from the credit.
+DEPOSIT_AUDIT_COLUMNS = (
+    ("receiver_before_micro", "INTEGER"),
+    ("receiver_after_micro", "INTEGER"),
+    ("slot", "INTEGER"),
+    ("block_time", "INTEGER"),
+    ("receiver_live_micro", "INTEGER"),
+    ("live_at", "REAL"),
+    ("audit_note", "TEXT"),
+)
 
 
 class BillingError(Exception):
@@ -184,6 +200,15 @@ class Database:
             self.conn.execute("PRAGMA synchronous=FULL")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self):
+        """Add the deposit audit columns a database lacks; a no-op once they are there."""
+        with self.write() as conn:
+            have = {row["name"] for row in conn.execute("PRAGMA table_info(deposits)")}
+            for name, kind in DEPOSIT_AUDIT_COLUMNS:
+                if name not in have:
+                    conn.execute(f"ALTER TABLE deposits ADD COLUMN {name} {kind}")
 
     def close(self):
         with self.lock:

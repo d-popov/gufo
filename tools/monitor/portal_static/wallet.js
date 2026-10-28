@@ -216,7 +216,10 @@ window.GufoWallet = (() => {
     const amount = readAmount();
     setStatus('Preparing the transaction…');
     const prepared = await ctx.api('POST', 'solana/prepare', { owner: account.address, amount_micro: amount });
-    setStatus(`Approve the payment of ${ctx.fmtUsd(amount)} USDC in ${wallet.name}.`);
+    // The receiving USDC account does not exist yet: this payment creates it, at the
+    // payer's expense (rent), which the server says in rent_note.
+    const rent = prepared.creates_account && prepared.rent_note ? ` ${prepared.rent_note}` : '';
+    setStatus(`Approve the payment of ${ctx.fmtUsd(amount)} USDC in ${wallet.name}.${rent}`);
     const [output] = await wallet.features['solana:signAndSendTransaction'].signAndSendTransaction({
       account, transaction: base64ToBytes(prepared.transaction), chain: SOLANA_CHAIN });
     if (!output?.signature?.length) throw new Error('The wallet did not return a transaction signature.');

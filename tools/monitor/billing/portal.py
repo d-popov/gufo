@@ -28,6 +28,10 @@ PORTAL_HEADER = "X-Gufo-Portal"
 CHALLENGE_TTL_S = 600.0
 MIN_DEPOSIT, MAX_DEPOSIT = 1_000_000, 1_000_000_000
 USDC_DECIMALS = 6
+# What a top-up that creates the receiving USDC account costs the payer on top of the fee:
+# rent-exempt minimum of a 165-byte token account.
+RENT_NOTE = ("This first payment also creates the receiving USDC account: your wallet pays "
+             "its one-time rent of about 0.00204 SOL on top of the network fee.")
 BASE_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 BASE_SIGNATURE = re.compile(r"0x[0-9a-fA-F]{130}")
 
@@ -74,6 +78,7 @@ class Portal:
         self.billing = billing
         self.secure_cookie = secure_cookie
         self.limiter = limiter  # the monitor's sign-in RateLimiter, shared with admin sign-in
+        self.receiver_exists = False  # the Solana receiving token account, once seen on chain
 
     def handle(self, handler, method: str):
         """Answer the /api/portal/* request of HANDLER, the monitor's request handler."""
@@ -381,23 +386,39 @@ class PortalRequest:
                 MIN_DEPOSIT <= amount <= MAX_DEPOSIT):
             return self._error(400, "bad_amount", "deposit between 1 and 1000 USDC")
         solana = billing.config["solana"]
+        dest = solana["receiver_token_account"]
         try:
             accounts = client.token_accounts(owner)
             if not accounts:
                 return self._error(400, "no_usdc_account", "this wallet holds no USDC")
             blockhash = client.latest_blockhash()
+            # Once there, the account stays: only a missing one is asked about again.
+            exists = self.server.receiver_exists or client.account_exists(dest)
         except Exception as error:
             print(f"gufo-monitor: portal: Solana RPC: {error}", file=sys.stderr)
             return self._error(502, "chain_unavailable", "the Solana RPC did not answer")
+        create_for = None
+        if exists:
+            self.server.receiver_exists = True
+        elif dest == crypto.associated_token_address(solana["receiver_owner"], solana["mint"])[0]:
+            create_for = solana["receiver_owner"]  # the payment creates it first
+        else:
+            print(f"gufo-monitor: portal: solana.receiver_token_account {dest} does not exist",
+                  file=sys.stderr)
+            return self._error(503, "receiver_account_missing",
+                               "the receiving USDC account does not exist; tell the admin")
         source = accounts[0]
         try:
             transaction = crypto.solana_transfer_checked_tx(
-                owner, source, solana["mint"], solana["receiver_token_account"], amount,
-                USDC_DECIMALS, blockhash)
+                owner, source, solana["mint"], dest, amount, USDC_DECIMALS, blockhash,
+                create_dest_for=create_for)
         except ValueError as error:
             return self._error(400, "bad_transaction", str(error))
-        self._json(200, {"transaction": base64.b64encode(transaction).decode(),
-                         "source_token_account": source})
+        reply = {"transaction": base64.b64encode(transaction).decode(),
+                 "source_token_account": source, "creates_account": create_for is not None}
+        if create_for is not None:
+            reply["rent_note"] = RENT_NOTE
+        self._json(200, reply)
 
     def _deposit(self, body: dict):
         user = self._require_approved()

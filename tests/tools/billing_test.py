@@ -30,6 +30,8 @@ from billing import chain, crypto, db as bdb, portal  # noqa: E402
 from billing.pricing import MAX_MODELS, MAX_PRICE, PriceList, Pricing, PricingError  # noqa: E402
 
 ADMIN_TOKEN = "admin-token-for-tests"
+NEW_RECEIVER_OWNER = "6Rpvu3zEcUK1QWLqZm8MhMKTZZCqc1qLqQEQmisWGeN9"
+NEW_RECEIVER_ATA = "C3LHV6bZdTM3k6VZxbrdaufqCvMLiZo3AKDYL4n8GbdZ"  # its USDC account
 OWNER_LINE = "owner sha256:" + "ab" * 32
 MODEL = "qwen3.8-27b"
 LINE = (
@@ -59,15 +61,29 @@ class FakeChain:
         self.answers = {}
         self.accounts = {}
         self.blockhash = crypto.b58encode(bytes(range(1, 33)))
+        self.live = None  # receiver_balance(): an int, None, or an exception to raise
+        self.checks = 0
+        self.missing = set()  # account_exists() is False for these addresses
+        self.exists_asked = 0
 
     def check(self, tx):
+        self.checks += 1
         return self.answers.get(tx, chain.DepositCheck("pending", None, 0, "not found"))
+
+    def receiver_balance(self):
+        if isinstance(self.live, Exception):
+            raise self.live
+        return self.live
 
     def token_accounts(self, owner):
         return self.accounts.get(owner, [])
 
     def latest_blockhash(self):
         return self.blockhash
+
+    def account_exists(self, address):
+        self.exists_asked += 1
+        return address not in self.missing
 
 
 def serve(server):
@@ -100,9 +116,19 @@ class PricingTest(unittest.TestCase):
 
     def test_example_files_load(self):
         Pricing.load(ROOT / "tools/monitor/pricing.example.json")
-        config = billing.load_config(ROOT / "tools/monitor/billing.example.json")
+        example = ROOT / "tools/monitor/billing.example.json"
+        # Until its placeholder is replaced, the example is refused (never a dummy wallet).
+        with self.assertRaisesRegex(billing.ConfigError, "receiver_owner"):
+            billing.load_config(example)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "billing.json"
+            path.write_text(example.read_text().replace(
+                "REPLACE_WITH_YOUR_SOLANA_WALLET_ADDRESS", NEW_RECEIVER_OWNER))
+            config = billing.load_config(path)
         self.assertEqual(config["signup_grant_micro"], 990_000)
         self.assertEqual(config["base"]["confirmations"], 12)
+        # receiver_token_account left out: the wallet's canonical USDC account.
+        self.assertEqual(config["solana"]["receiver_token_account"], NEW_RECEIVER_ATA)
 
     def test_validation(self):
         prices = {"input": 1, "cached_input": 0, "output": MAX_PRICE}
@@ -808,6 +834,68 @@ class DepositTest(BillingHarness):
                                               cookie)
         self.assertEqual((status, payload["error"]), (403, "wallet_not_linked"))
 
+    def prepare(self, cookie, address):
+        return self.portal_call("POST", "/api/portal/solana/prepare",
+                                {"owner": address, "amount_micro": 5_000_000}, cookie)
+
+    def test_prepare_creates_a_missing_canonical_receiver_account(self):
+        from billing_chain_test import decode_legacy_tx
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        fake = self.chains["solana"]
+        source = crypto.b58encode(b"\x0a" * 32)
+        fake.accounts[address] = [source]
+        solana = self.billing.config["solana"]
+        solana["receiver_owner"] = NEW_RECEIVER_OWNER
+        solana["receiver_token_account"] = NEW_RECEIVER_ATA
+        fake.missing.add(NEW_RECEIVER_ATA)
+        status, payload, _ = self.prepare(cookie, address)
+        self.assertEqual((status, payload["creates_account"]), (200, True))
+        self.assertIn("0.002", payload["rent_note"])
+        tx = decode_legacy_tx(base64.b64decode(payload["transaction"]))
+        self.assertEqual(tx["header"], (1, 0, 5))
+        self.assertEqual(tx["keys"], [address, source, NEW_RECEIVER_ATA, billing.USDC_MINT,
+                                      crypto.TOKEN_PROGRAM_ID,
+                                      NEW_RECEIVER_OWNER, crypto.SYSTEM_PROGRAM_ID,
+                                      crypto.ASSOCIATED_TOKEN_PROGRAM_ID])
+        (create_prog, create_accs, create_data), (prog, accs, data) = tx["instructions"]
+        self.assertEqual((create_prog, create_accs, create_data), (7, [0, 2, 5, 3, 6, 4], b"\x01"))
+        self.assertEqual((prog, accs, data[:1]), (4, [1, 3, 2, 0], b"\x0c"))
+
+        # Once the account exists: a plain transfer, and the RPC is not asked again.
+        fake.missing.clear()
+        status, payload, _ = self.prepare(cookie, address)
+        self.assertEqual((status, payload["creates_account"], "rent_note" in payload),
+                         (200, False, False))
+        tx = decode_legacy_tx(base64.b64decode(payload["transaction"]))
+        self.assertEqual((tx["header"], len(tx["instructions"])), ((1, 0, 2), 1))
+        asked = fake.exists_asked
+        fake.missing.add(NEW_RECEIVER_ATA)  # (never happens: cached as existing)
+        self.assertEqual(self.prepare(cookie, address)[1]["creates_account"], False)
+        self.assertEqual(fake.exists_asked, asked)
+
+    def test_prepare_refuses_a_missing_non_canonical_receiver_account(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        fake = self.chains["solana"]
+        fake.accounts[address] = [crypto.b58encode(b"\x0a" * 32)]
+        fake.missing.add(self.billing.config["solana"]["receiver_token_account"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            status, payload, _ = self.prepare(cookie, address)
+        self.assertEqual((status, payload["error"]), (503, "receiver_account_missing"))
+
+    def test_existing_explicit_receiver_account_gets_no_create(self):
+        from billing_chain_test import decode_legacy_tx
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        self.chains["solana"].accounts[address] = [crypto.b58encode(b"\x0a" * 32)]
+        status, payload, _ = self.prepare(cookie, address)
+        self.assertEqual((status, payload["creates_account"]), (200, False))
+        tx = decode_legacy_tx(base64.b64decode(payload["transaction"]))
+        self.assertEqual(len(tx["instructions"]), 1)
+        self.assertNotIn(crypto.ASSOCIATED_TOKEN_PROGRAM_ID, tx["keys"])
+        self.assertEqual(tx["keys"][2], crypto.b58encode(b"\x08" * 32))
+
     def test_unapproved_accounts_cannot_deposit(self):
         cookie = self.signup_and_login()
         status, payload, _ = self.portal_call("POST", "/api/portal/deposit",
@@ -823,6 +911,296 @@ class DepositTest(BillingHarness):
         self.billing.recheck_pending()
         row = self.billing.db.one("SELECT status, reason FROM deposits")
         self.assertEqual((row["status"], row["reason"]), ("rejected", "expired"))
+
+
+class DepositAuditTest(BillingHarness):
+    """The receiving wallet's balances recorded with each credit, the admin's deposit
+    list, CSV and the read-only re-check against the chain."""
+
+    def setUp(self):
+        super().setUp()
+        self.billing.verify_pace_s = 0
+
+    def audited(self, sender, amount, before=10_000_000, after=None, slot=777,
+                block_time=1_800_000_000):
+        return chain.DepositCheck("confirmed", sender, amount, "ok", receiver_before_micro=before,
+                                  receiver_after_micro=before + amount if after is None else after,
+                                  slot=slot, block_time=block_time)
+
+    def deposit(self, cookie, tx, check, chain_name="solana"):
+        self.chains[chain_name].answers[tx] = check
+        return self.portal_call("POST", "/api/portal/deposit", {"chain": chain_name, "tx": tx},
+                                cookie)[1]
+
+    def stored(self, tx):
+        return dict(self.billing.db.one("SELECT * FROM deposits WHERE tx=?", (tx,)))
+
+    def snapshot(self):
+        db = self.billing.db
+        return ([dict(r) for r in db.query("SELECT * FROM deposits ORDER BY rowid")],
+                [dict(r) for r in db.query("SELECT * FROM ledger ORDER BY id")],
+                [dict(r) for r in db.query("SELECT id, balance_micro FROM users ORDER BY id")])
+
+    def test_credit_records_chain_balances_and_live_reading(self):
+        cookie, user_id, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        self.chains["solana"].live = 12_600_000
+        payload = self.deposit(cookie, tx, self.audited(address, 2_500_000))
+        self.assertEqual(payload["status"], "credited")
+        row = self.stored(tx)
+        self.assertEqual((row["receiver_before_micro"], row["receiver_after_micro"], row["slot"],
+                          row["block_time"], row["receiver_live_micro"], row["audit_note"]),
+                         (10_000_000, 12_500_000, 777, 1_800_000_000, 12_600_000, None))
+        self.assertIsNotNone(row["live_at"])
+
+        status, data, _ = self.admin_call("GET", "/api/admin/deposits")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["totals"], {"credited_micro": 2_500_000, "deposits": 1})
+        (entry,) = data["deposits"]
+        self.assertEqual({k: entry[k] for k in (
+            "user_id", "email", "chain", "tx", "sender", "amount_micro", "receiver_before_micro",
+            "receiver_after_micro", "receiver_live_micro", "slot", "block_time", "audit_note",
+            "explorer")}, {
+            "user_id": user_id, "email": "friend@example.com", "chain": "solana", "tx": tx,
+            "sender": address, "amount_micro": 2_500_000, "receiver_before_micro": 10_000_000,
+            "receiver_after_micro": 12_500_000, "receiver_live_micro": 12_600_000, "slot": 777,
+            "block_time": 1_800_000_000, "audit_note": None,
+            "explorer": "https://solscan.io/tx/" + tx})
+        self.assertIsInstance(entry["id"], int)
+        self.assertIsInstance(entry["t"], float)
+
+        # Replays credit nothing more and leave the recorded values alone.
+        before = self.snapshot()
+        self.chains["solana"].answers[tx] = self.audited(address, 2_500_000, before=1, slot=9)
+        self.chains["solana"].live = 1
+        payload = self.portal_call("POST", "/api/portal/deposit", {"chain": "solana", "tx": tx},
+                                   cookie)[1]
+        self.assertEqual(payload, {"status": "credited", "amount_micro": 2_500_000, "reason": ""})
+        self.assertEqual(self.billing.check_deposit("solana", tx)["status"], "credited")
+        self.billing.recheck_pending()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_base_deposits_link_to_basescan(self):
+        cookie, user_id, _ = self.approved_user()
+        sender = "0x" + "ab" * 20
+        with self.billing.db.write() as conn:
+            conn.execute("INSERT INTO wallets (chain, address, user_id, linked) VALUES "
+                         "('base', ?, ?, 0)", (sender, user_id))
+        tx = "0x" + "cd" * 32
+        # A node without historic state: no balances, the block number all the same.
+        check = chain.DepositCheck("confirmed", sender, 1_000_000, "ok", slot=123)
+        self.assertEqual(self.deposit(cookie, tx, check, "base")["status"], "credited")
+        entry = self.admin_call("GET", "/api/admin/deposits")[1]["deposits"][0]
+        self.assertEqual(entry["explorer"], "https://basescan.org/tx/" + tx)
+        self.assertEqual((entry["receiver_before_micro"], entry["receiver_after_micro"],
+                          entry["slot"], entry["audit_note"]), (None, None, 123, None))
+
+    def test_failed_live_read_still_credits(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        self.chains["solana"].live = OSError("rpc down")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            payload = self.deposit(cookie, tx, self.audited(address, 2_500_000))
+        self.assertIn("live balance", err.getvalue())
+        self.assertEqual(payload["status"], "credited")
+        self.assertEqual(self.me(cookie)["balance_micro"], 1000 + 2_500_000)
+        row = self.stored(tx)
+        self.assertEqual((row["receiver_live_micro"], row["live_at"], row["receiver_after_micro"]),
+                         (None, None, 12_500_000))
+
+    def test_deposit_that_created_the_receiver_account_is_noted(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        check = self.audited(address, 2_000_000, before=0)
+        check.receiver_created = True
+        self.chains["solana"].live = OSError("could not find account")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.deposit(cookie, tx, check)["status"], "credited")
+        row = self.stored(tx)
+        self.assertEqual((row["receiver_before_micro"], row["receiver_after_micro"],
+                          row["audit_note"]), (0, 2_000_000, "account created by this deposit"))
+        self.assertEqual(billing.audit_note(0, 3, 2, True),
+                         "account created by this deposit; balance delta 0.000003 != credited "
+                         "0.000002")
+
+    def test_balance_delta_mismatch_is_flagged_but_credited(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        payload = self.deposit(cookie, tx, self.audited(address, 990_000, before=0, after=1_000_000))
+        self.assertEqual((payload["status"], payload["amount_micro"]), ("credited", 990_000))
+        self.assertEqual(self.stored(tx)["audit_note"], "balance delta 1.00 != credited 0.99")
+        self.assertEqual(self.me(cookie)["balance_micro"], 1000 + 990_000)
+        self.assertEqual(billing.audit_note(5, 1_234_572, 1_000_000),
+                         "balance delta 1.234567 != credited 1.00")
+        self.assertIsNone(billing.audit_note(None, 5, 1))
+
+    def test_unconfirmed_and_rejected_deposits_store_no_audit(self):
+        cookie, _, _ = self.approved_user()
+        self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        stranger = crypto.b58encode(b"\x09" * 32)
+        payload = self.deposit(cookie, tx, self.audited(stranger, 1_000_000))
+        self.assertEqual(payload["reason"], "sender_not_linked")
+        row = self.stored(tx)
+        self.assertEqual([row[name] for name, _ in bdb.DEPOSIT_AUDIT_COLUMNS], [None] * 7)
+        self.assertEqual(self.admin_call("GET", "/api/admin/deposits")[1],
+                         {"deposits": [], "totals": {"credited_micro": 0, "deposits": 0}})
+
+    def test_admin_only_and_limits(self):
+        cookie, _, _ = self.approved_user()
+        for path in ("/api/admin/deposits", "/api/admin/deposits.csv",
+                     "/api/admin/deposits/verify"):
+            for headers in ({}, {"Cookie": "gufo_portal=" + cookie}, {"X-Admin-Token": "wrong"}):
+                status, payload, _ = self.admin_call("GET", path, admin=False, headers=headers)
+                self.assertEqual((status, payload), (401, {"error": "unauthorized"}), path)
+        for bad in ("0", "1001", "-1", "abc", "1&limit=2"):
+            status, payload, _ = self.admin_call("GET", "/api/admin/deposits?limit=" + bad)
+            self.assertEqual((status, payload["error"]), (400, "bad_limit"), bad)
+        status, payload, _ = self.admin_call("GET", "/api/admin/deposits/verify?limit=51")
+        self.assertEqual((status, payload["error"]), (400, "bad_limit"))
+        self.assertEqual(self.admin_call("GET", "/api/admin/deposits?limit=1000")[0], 200)
+
+    def test_csv_export_escapes_formulas(self):
+        cookie, user_id, _ = self.approved_user("=hyperlink(1)@example.com")
+        address, _ = self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        self.deposit(cookie, tx, self.audited(address, 990_000, before=0, after=1_000_000))
+        status, raw, response = self.admin_call("GET", "/api/admin/deposits.csv")
+        self.assertEqual(status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "text/csv; charset=utf-8")
+        self.assertIn("attachment", response.getheader("Content-Disposition"))
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        import csv
+        header, row = list(csv.reader(io.StringIO(raw.decode())))
+        self.assertEqual(tuple(header), billing.CSV_COLUMNS)
+        cells = dict(zip(header, row))
+        self.assertEqual(cells["email"], "'=hyperlink(1)@example.com")
+        self.assertEqual((cells["user_id"], cells["tx"], cells["amount_micro"],
+                          cells["receiver_before_micro"], cells["receiver_live_micro"],
+                          cells["block_time_utc"], cells["audit_note"]),
+                         (str(user_id), tx, "990000", "0", "", "2027-01-15T08:00:00Z",
+                          "balance delta 1.00 != credited 0.99"))
+        for text in ("=1+1", "+1", "-1", "@SUM(A1)", "\tx", "\rx"):
+            self.assertEqual(billing.csv_cell(text), "'" + text)
+        self.assertEqual((billing.csv_cell("a=b"), billing.csv_cell(-5), billing.csv_cell(None)),
+                         ("a=b", -5, ""))
+        self.assertEqual(self.admin_call("GET", "/api/admin/deposits.csv", admin=False)[0], 401)
+
+    def test_verify_reports_mismatches_and_changes_nothing(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        fake = self.chains["solana"]
+        txs = [crypto.b58encode(bytes([i]) * 64) for i in (5, 6, 7)]
+        for i, tx in enumerate(txs):
+            self.deposit(cookie, tx, self.audited(address, 1_000_000 * (i + 1), slot=100 + i))
+        before = self.snapshot()
+        fake.answers[txs[1]] = self.audited(address, 2_000_000, before=10_000_001, slot=101)
+        fake.answers[txs[2]] = chain.DepositCheck("pending", None, 0, "rpc_error: 429")
+        checks = fake.checks
+        status, report, _ = self.admin_call("GET", "/api/admin/deposits/verify")
+        self.assertEqual(status, 200)
+        self.assertEqual({k: report[k] for k in ("checked", "ok", "mismatch", "unavailable",
+                                                 "skipped")},
+                         {"checked": 3, "ok": 1, "mismatch": 1, "unavailable": 1, "skipped": 0})
+        self.assertEqual(fake.checks - checks, 3)
+        by_tx = {r["tx"]: r for r in report["results"]}
+        self.assertEqual([r["tx"] for r in report["results"]], txs[::-1])  # newest first
+        self.assertEqual(by_tx[txs[1]]["problems"], [
+            "receiver_before_micro: stored 10000000, chain 10000001",
+            "receiver_after_micro: stored 12000000, chain 12000001"])
+        self.assertEqual(by_tx[txs[2]]["result"], "unavailable")
+        self.assertEqual((by_tx[txs[0]]["result"], by_tx[txs[0]]["explorer"]),
+                         ("ok", "https://solscan.io/tx/" + txs[0]))
+        self.assertEqual(self.snapshot(), before)
+
+        # Rejected now, a different amount, or sender: mismatches; still nothing changes.
+        fake.answers[txs[2]] = chain.DepositCheck("rejected", None, 0, "transaction_failed")
+        fake.answers[txs[0]] = self.audited(crypto.b58encode(b"\x09" * 32), 1, slot=100)
+        report = self.admin_call("GET", "/api/admin/deposits/verify?limit=3")[1]
+        self.assertEqual(report["mismatch"], 3)
+        by_tx = {r["tx"]: r for r in report["results"]}
+        self.assertEqual(by_tx[txs[2]]["problems"],
+                         ["chain now says rejected: transaction_failed"])
+        self.assertEqual([p.split(":")[0] for p in by_tx[txs[0]]["problems"]],
+                         ["sender", "amount_micro", "receiver_after_micro"])
+        self.assertEqual(self.snapshot(), before)
+
+        # One run at a time; the limit bounds the work.
+        with self.billing._verify_lock:
+            status, payload, _ = self.admin_call("GET", "/api/admin/deposits/verify")
+        self.assertEqual((status, payload["error"]), (409, "busy"))
+        self.assertEqual(self.admin_call("GET", "/api/admin/deposits/verify?limit=1")[1]["checked"], 1)
+
+    def test_verify_notes_values_the_chain_no_longer_gives_and_stops_on_rpc_failures(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        fake = self.chains["solana"]
+        txs = [crypto.b58encode(bytes([i]) * 64) for i in range(10, 15)]
+        for tx in txs:
+            self.deposit(cookie, tx, self.audited(address, 1_000_000))
+        newest = txs[-1]
+        fake.answers[newest] = chain.DepositCheck("confirmed", address, 1_000_000, "ok")
+        for tx in txs[:-1]:
+            fake.answers[tx] = chain.DepositCheck("pending", None, 0, "rpc_error: down")
+        checks = fake.checks
+        report = self.admin_call("GET", "/api/admin/deposits/verify")[1]
+        self.assertEqual({k: report[k] for k in ("ok", "unavailable", "skipped")},
+                         {"ok": 1, "unavailable": 3, "skipped": 1})
+        self.assertEqual(fake.checks - checks, 4)
+        self.assertEqual(report["results"][0]["notes"], [
+            "receiver_before_micro: stored 10000000, chain gave none",
+            "receiver_after_micro: stored 11000000, chain gave none",
+            "slot: stored 777, chain gave none",
+            "block_time: stored 1800000000, chain gave none"])
+
+
+class DepositMigrationTest(unittest.TestCase):
+    OLD_SCHEMA = """
+    CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+      password TEXT NOT NULL, status TEXT NOT NULL, email_verified INTEGER NOT NULL DEFAULT 0,
+      verify_token TEXT UNIQUE, balance_micro INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
+      approved_at REAL);
+    CREATE TABLE deposits (chain TEXT NOT NULL, tx TEXT NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL,
+      amount_micro INTEGER NOT NULL DEFAULT 0, sender TEXT, reason TEXT NOT NULL DEFAULT '',
+      created REAL NOT NULL, updated REAL NOT NULL, PRIMARY KEY (chain, tx));
+    INSERT INTO users (id, email, password, status, balance_micro, created)
+      VALUES (1, 'old@example.com', 'x', 'approved', 5000000, 1);
+    INSERT INTO deposits VALUES ('solana', 'oldsig', 1, 'credited', 5000000, 'wallet', '', 1, 2);
+    """
+
+    def test_old_database_gains_columns_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "billing.sqlite"
+            conn = sqlite3.connect(path)
+            conn.executescript(self.OLD_SCHEMA)
+            conn.close()
+            for _ in range(2):  # idempotent
+                database = bdb.Database(path)
+                columns = [r["name"] for r in database.query("PRAGMA table_info(deposits)")]
+                database.close()
+            self.assertEqual(columns[-7:], [name for name, _ in bdb.DEPOSIT_AUDIT_COLUMNS])
+            self.assertEqual(len(columns), len(set(columns)))
+            config = {"db": path, "pricing": Path(tmp) / "pricing.json", "signup_grant_micro": 0,
+                      "public_base_url": "https://gufo.test", "solana": None, "base": None}
+            (Path(tmp) / "pricing.json").write_text(json.dumps({"default": {
+                "input": 1, "cached_input": 1, "output": 1}}))
+            service = billing.Billing(config, None, chains={})
+            try:
+                report = service.admin_deposits()
+            finally:
+                service.db.close()
+            self.assertEqual(report["totals"], {"credited_micro": 5_000_000, "deposits": 1})
+            entry = report["deposits"][0]
+            self.assertEqual((entry["tx"], entry["amount_micro"], entry["email"], entry["t"]),
+                             ("oldsig", 5_000_000, "old@example.com", 2))
+            self.assertEqual([entry[k] for k in ("receiver_before_micro", "receiver_after_micro",
+                                                 "receiver_live_micro", "slot", "block_time",
+                                                 "audit_note")], [None] * 6)
 
 
 class SecurityTest(BillingHarness):
@@ -1065,6 +1443,28 @@ class ConfigTest(unittest.TestCase):
             path.write_text(json.dumps({"db": "a", "pricing": "p", "signup_grant_micro": 0.99}))
             with self.assertRaises(billing.ConfigError):
                 billing.load_config(path)
+
+    def test_solana_receiver_token_account_defaults_to_the_canonical_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "billing.json"
+
+            def load(**solana):
+                path.write_text(json.dumps({"db": "a", "pricing": "p", "solana": solana}))
+                return billing.load_config(path)["solana"]
+
+            got = load(receiver_owner=NEW_RECEIVER_OWNER)
+            self.assertEqual((got["receiver_token_account"], got["mint"]),
+                             (NEW_RECEIVER_ATA, billing.USDC_MINT))
+            explicit = crypto.b58encode(b"\x08" * 32)  # an older, non-associated account
+            self.assertEqual(load(receiver_owner=NEW_RECEIVER_OWNER,
+                                  receiver_token_account=explicit)["receiver_token_account"],
+                             explicit)
+            for bad in ({"receiver_owner": "not-base58!"}, {"receiver_owner": "abc"},
+                        {"receiver_owner": NEW_RECEIVER_OWNER, "mint": "0OIl"},
+                        {"receiver_owner": NEW_RECEIVER_OWNER, "receiver_token_account": "x"},
+                        {"receiver_owner": NEW_RECEIVER_OWNER, "receiver_token_account": ""}):
+                with self.assertRaises(billing.ConfigError, msg=bad):
+                    load(**bad)
 
     def test_public_urls(self):
         with tempfile.TemporaryDirectory() as tmp:

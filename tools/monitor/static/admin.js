@@ -1,8 +1,9 @@
 'use strict';
 
 // Admin panels shared by the monitor page (/monitor) and the portal page (/): Gufo's
-// API keys, the credits-portal accounts and the price list. Both pages carry the same
-// markup (ids admin-key*, accounts*, credit-*, admin-pricing-*) and call
+// API keys, the credits-portal accounts, the price list, usage and the deposit audit.
+// Both pages carry the same markup (ids admin-key*, accounts*, credit-*, admin-pricing-*,
+// admin-usage-*, admin-deposits-*) and call
 // GufoAdmin.init(). The monitor page passes its live state, for per-key usage and the
 // model list; elsewhere this file fetches /api/state itself. Every route here needs the
 // admin sign-in (cookie from /api/admin/login, which the shared page header, header.js,
@@ -144,6 +145,7 @@ window.GufoAdmin = (() => {
     await loadAccounts();
     await loadPricing();
     await loadUsage();
+    await loadDeposits();
     if (wasAdmin !== keysAdmin) options.onChange?.(keysAdmin);
   }
 
@@ -780,6 +782,108 @@ window.GufoAdmin = (() => {
       : null);
   }
 
+  // ---------------------------------------------------------------- deposits (receiving wallet audit)
+  // Credited deposits with the receiving wallet's balance before and after each, from
+  // the chain, to check the books against it. Emails and stored values are text nodes.
+
+  const EXPLORERS = ['https://solscan.io/tx/', 'https://basescan.org/tx/'];
+
+  const shortTx = (tx) => (tx.length > 18 ? `${tx.slice(0, 8)}…${tx.slice(-6)}` : tx);
+
+  async function loadDeposits() {
+    const section = $('admin-deposits-section');
+    if (!keysAdmin) {
+      section.hidden = true;
+      return;
+    }
+    try {
+      const data = await request('GET', '/api/admin/deposits?limit=200');
+      section.hidden = false;
+      showAccountsNote('admin-deposits-error', null);
+      renderDeposits(data);
+    } catch (error) {
+      section.hidden = error.status === 404 || error.status === 401;
+      showAccountsNote('admin-deposits-error', error);
+    }
+  }
+
+  // The explorer link the server built, only if it points at a known explorer.
+  function txLink(tx, explorer) {
+    const text = shortTx(String(tx));
+    if (typeof explorer !== 'string' || !EXPLORERS.some((prefix) => explorer.startsWith(prefix))) return text;
+    return el('a', { href: explorer, target: '_blank', rel: 'noopener noreferrer', title: String(tx) }, text);
+  }
+
+  // A note with "!=" is a mismatch; others (an account created by the deposit) inform.
+  function deltaCell(deposit) {
+    const note = deposit.audit_note ?? '';
+    if (note.includes('!=')) return el('td', { class: 'bad wrap' }, note);
+    if (deposit.receiver_before_micro == null || deposit.receiver_after_micro == null) {
+      return el('td', { class: 'muted wrap', title: 'The chain gave no balances for this deposit.' },
+        note ? `no data; ${note}` : 'no data');
+    }
+    const cell = el('td', { class: 'wrap', title: 'After minus before equals the amount.' },
+      el('span', { class: 'state-busy' }, '✓'));
+    if (note) cell.append(' ', el('span', { class: 'muted' }, note));
+    return cell;
+  }
+
+  function renderDeposits(data) {
+    const list = data.deposits ?? [];
+    const totals = data.totals ?? {};
+    $('admin-deposits-totals').replaceChildren(...[
+      ['Deposits', fmt(totals.deposits, 0)],
+      ['Credited', fmtUsd(totals.credited_micro)],
+      ['Flagged (shown)', fmt(list.filter((d) => (d.audit_note ?? '').includes('!=')).length, 0)],
+    ].map(([label, value]) => el('div', {}, el('dt', {}, label), el('dd', {}, value))));
+    const rows = list.map((deposit) => {
+      const live = el('td', { class: 'num' }, fmtUsd(deposit.receiver_live_micro));
+      if (deposit.live_at != null) live.title = `Read ${fmtTime(deposit.live_at)}`;
+      const time = el('td', {}, fmtTime(deposit.t));
+      if (deposit.slot != null) time.title = `Slot/block ${deposit.slot}`;
+      return el('tr', {},
+        time,
+        el('td', { class: 'wrap' }, `#${deposit.user_id} ${deposit.email}`),
+        el('td', {}, deposit.chain),
+        el('td', { class: 'num' }, fmtUsd(deposit.amount_micro)),
+        el('td', { class: 'num' }, fmtUsd(deposit.receiver_before_micro)),
+        el('td', { class: 'num' }, fmtUsd(deposit.receiver_after_micro)),
+        live,
+        deltaCell(deposit),
+        el('td', {}, txLink(deposit.tx, deposit.explorer)));
+    });
+    if (!rows.length) rows.push(el('tr', {}, el('td', { colspan: '9', class: 'muted' }, 'No deposits yet.')));
+    $('admin-deposits').tBodies[0].replaceChildren(...rows);
+  }
+
+  // Re-fetches the newest 50 credited deposits from the chain; changes nothing.
+  async function verifyDeposits() {
+    const button = $('admin-deposits-verify');
+    button.disabled = true;
+    $('admin-deposits-verify-state').textContent = 'Checking the newest deposits against the chain…';
+    try {
+      const report = await request('GET', '/api/admin/deposits/verify');
+      const skipped = report.skipped ? `, ${fmt(report.skipped, 0)} skipped` : '';
+      $('admin-deposits-verify-summary').textContent = `Checked ${fmt(report.checked, 0)}: `
+        + `${fmt(report.ok, 0)} match, ${fmt(report.mismatch, 0)} mismatch, `
+        + `${fmt(report.unavailable, 0)} unavailable${skipped}.`;
+      $('admin-deposits-verify-list').replaceChildren(...(report.results ?? [])
+        .filter((r) => r.result !== 'ok' || r.notes.length)
+        .map((r) => el('li', { class: r.result === 'mismatch' ? 'bad' : '' },
+          `#${r.id} ${r.chain} `, txLink(r.tx, r.explorer), ` ${r.result}: `,
+          [...r.problems, ...r.notes].join('; '))));
+      const result = $('admin-deposits-verify-result');
+      result.classList.toggle('mismatch', report.mismatch > 0);
+      result.hidden = false;
+      showAccountsNote('admin-deposits-error', null);
+    } catch (error) {
+      showAccountsNote('admin-deposits-error', error);
+    } finally {
+      button.disabled = false;
+      $('admin-deposits-verify-state').textContent = '';
+    }
+  }
+
   // ---------------------------------------------------------------- setup
 
   function init(settings = {}) {
@@ -816,6 +920,7 @@ window.GufoAdmin = (() => {
     });
     $('admin-pricing-revert').addEventListener('click', revertPricing);
     $('admin-usage-days').addEventListener('change', () => loadUsage());
+    $('admin-deposits-verify').addEventListener('click', verifyDeposits);
     // Picks up edits made outside the page and the admin sign-in ending.
     setInterval(() => {
       if (!options.active || options.active()) load().catch(() => {});

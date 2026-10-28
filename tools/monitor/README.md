@@ -213,9 +213,10 @@ in. Signed out, the portal page shows the sign-in form, with a **Sign up** tab n
 it (`/?signup` opens that tab). Signed in as admin, the portal page shows an **Admin**
 area with tabs: **Accounts** (sign-ups, verification links with **Verify**, balances,
 wallets and keys; approve, reject, suspend, credit), **API keys** (all keys of
-Gufo's key file), **Pricing** (the editable price list, see [Pricing](#pricing)) and
-**Usage** (internal vs user costs, see [Usage](#usage-admin-only)). The monitor page
-shows the same panels.
+Gufo's key file), **Pricing** (the editable price list, see [Pricing](#pricing)),
+**Usage** (internal vs user costs, see [Usage](#usage-admin-only)) and **Deposits**
+(the receiving wallet audit, see [Deposit audit](#deposit-audit-admin-only)). The
+monitor page shows the same panels.
 
 ### Setup
 
@@ -300,7 +301,7 @@ makes every request look local, so the monitor admits the admin only, whoever co
 | `signup_grant_micro` | `990000` | credit granted once on approval, micro-USD |
 | `max_keys_per_user` | `5` | active keys per account |
 | `model` | served model | model the portal keys are limited to (`models=` in the key file); by default the model Gufo reports |
-| `solana` | absent: disabled | `rpc`, `receiver_owner` (your wallet), `receiver_token_account` (its USDC token account), `mint` (USDC), `commitment` (`finalized`) |
+| `solana` | absent: disabled | `rpc`, `receiver_owner` (your wallet), `receiver_token_account` (its USDC token account; optional, default: the wallet's associated USDC account), `mint` (USDC), `commitment` (`finalized`) |
 | `base` | absent: disabled | `rpc`, `receiver` (your address), `usdc` (USDC contract), `confirmations` (`12`) |
 
 Deposits are checked against your receiving account only: a Solana deposit counts when
@@ -308,6 +309,16 @@ the USDC balance of `receiver_token_account` grows in a successful transaction a
 configured commitment; a Base deposit counts when the USDC contract logs a `Transfer` to
 `receiver` and the block has `confirmations` blocks on top of it. Public RPC endpoints
 are rate limited; a private RPC URL works better for many users.
+
+Without `receiver_token_account`, deposits go to the associated token account of
+`receiver_owner` for `mint` (the address wallets use, as `spl-token address --owner`
+shows). It may not exist yet, e.g. for a new wallet that never held USDC: the
+transaction the portal prepares for a top-up then first creates it with the Associated
+Token Account program's `CreateIdempotent`, the payer paying its one-time rent (about
+0.00204 SOL; the portal says so before the wallet asks for approval), and the deposit is
+accepted with "before" recorded as 0. An explicit `receiver_token_account` is used as it
+is; if it does not exist, top-ups fail with `receiver_account_missing`, as only the
+associated account can be created on the fly.
 
 ### Pricing
 
@@ -405,6 +416,52 @@ values return 400 with a message. The response has `internal` (`totals`, `by_key
 `cached`, `generated`, `cost_micro`; user aggregates additionally carry
 `tokens_unknown_requests`. Keys use `key`, days use `day` (`YYYY-MM-DD`, UTC).
 
+### Deposit audit (admin only)
+
+Each credited deposit records the receiving wallet's USDC balance right before and
+right after it, so the books can be checked against the chain later:
+
+- **Solana:** from the deposit transaction itself, the `preTokenBalances` and
+  `postTokenBalances` entries of `receiver_token_account` (USDC mint only) at the
+  configured commitment, plus its `slot` and `blockTime`. Exact for that transaction.
+  When the transaction created the account (no pre entry, a USDC post entry with the
+  receiver as owner), "before" is 0 and the note says `account created by this deposit`.
+- **Base:** USDC `balanceOf(receiver)` at blocks N-1 and N, N being the receipt's block
+  (stored as `slot`), plus the block's timestamp. Block granularity: other transfers to
+  the receiver in block N show in the delta. Many public nodes serve no historic state;
+  their errors leave the values empty (never estimated).
+- **At credit:** the receiver's balance read live when crediting
+  (`getTokenAccountBalance` / `balanceOf` at `latest`) and its time; for reference only,
+  as later transfers move it. A failed read leaves it empty and never delays a credit.
+- **Delta check:** when both balances are known and after minus before differs from the
+  credited amount (several transfers in one transaction or block, fees), the deposit is
+  still credited by the usual rules and gets an `audit_note` such as
+  `balance delta 1.00 != credited 0.99`.
+
+The `deposits` table gains the columns `receiver_before_micro`, `receiver_after_micro`,
+`slot`, `block_time`, `receiver_live_micro`, `live_at` and `audit_note` in place at
+startup (`ALTER TABLE ... ADD COLUMN`, once); deposits credited before have them empty.
+They are written in the credit's transaction and never change afterwards.
+
+The **Deposits** tab on the portal, the monitor's Deposits section and **Admin:
+deposits** in the profile menu list them, newest first, with a **Download CSV** link and
+a **Re-verify against chain** button. Routes (admin authentication, like the others):
+
+- `GET /api/admin/deposits?limit=N` (1 to 1000, default 200): `deposits` rows with `id`,
+  `t` (credit time), `user_id`, `email`, `chain`, `tx`, `sender`, `amount_micro`,
+  `receiver_before_micro`, `receiver_after_micro`, `receiver_live_micro`, `live_at`,
+  `slot`, `block_time`, `audit_note` and `explorer` (Solscan or Basescan URL), and
+  `totals` (`credited_micro`, `deposits`) over all credited deposits.
+- `GET /api/admin/deposits.csv`: every credited deposit as CSV (UTC ISO times). Text
+  starting with `=`, `+`, `-`, `@`, tab or carriage return gets a leading `'` so a
+  spreadsheet does not run it as a formula.
+- `GET /api/admin/deposits/verify?limit=N` (1 to 50, default 50): fetches the newest
+  credited deposits from the chain again, one at a time, 0.25 s apart, and compares
+  sender, amount, balances, slot and block time with what is stored. Each result is
+  `ok`, `mismatch` (with `problems`), `unavailable` (RPC failure, chain disabled) or
+  `skipped` (the run stops checking after 3 RPC failures in a row); `notes` list values
+  only one side has, such as balances a Base node no longer serves. One run at a time
+  (409 `busy` otherwise). It never changes credits or stored values.
 
 ### Operations
 

@@ -1789,6 +1789,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._account_error(error.status, error.code, error.message)
         self._json(200, json.dumps(report).encode())
 
+    def _query_int(self, name: str, default: int) -> int:
+        """?NAME=N as an integer, DEFAULT when absent, 0 (refused later) when malformed."""
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+        values = query.get(name, [str(default)])
+        return int(values[0]) if len(values) == 1 and re.fullmatch(r"\d{1,4}", values[0]) else 0
+
+    def _deposits(self, kind: str):
+        """Credited deposits with the receiver's balances (?limit=N, default 200), the
+        same as CSV, or a read-only re-check against the chain (?limit=N, at most 50)."""
+        billing = self.server.billing
+        if billing is None:
+            return self._account_error(404, "not_found", "billing is not configured")
+        try:
+            if kind == "csv":
+                return self._send(200, billing.deposits_csv().encode(), "text/csv; charset=utf-8", (
+                    ("Content-Disposition", 'attachment; filename="gufo-deposits.csv"'),))
+            if kind == "verify":
+                report = billing.verify_deposits(self._query_int("limit", 50))
+            else:
+                report = billing.admin_deposits(self._query_int("limit", 200))
+        except billing.Error as error:
+            return self._account_error(error.status, error.code, error.message)
+        self._json(200, json.dumps(report).encode())
+
     def _long_stats(self):
         """The last 24 h / 7 days tile: StatsStore.long_window, O(hours)."""
         stats = self.server.monitor.stats
@@ -1868,6 +1892,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._pricing("GET")
         if path == "/api/admin/usage":
             return self._usage_get()
+        if path == "/api/admin/deposits":
+            return self._deposits("list")
+        if path == "/api/admin/deposits.csv":
+            return self._deposits("csv")
+        if path == "/api/admin/deposits/verify":
+            return self._deposits("verify")
         if self._keys_route(path) == "" and self.server.keys is not None:
             return self._keys_get()
         self._json(404, b'{"error":"not_found"}')

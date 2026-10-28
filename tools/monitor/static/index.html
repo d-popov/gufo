@@ -219,6 +219,40 @@
       <p id="admin-usage-note" class="muted keys-note" hidden></p>
     </section>
 
+    <section id="admin-deposits-section" hidden>
+      <div class="section-head">
+        <h2>Deposits</h2>
+        <span class="muted">receiving wallet audit</span>
+      </div>
+      <p class="muted keys-note">Credited USDC deposits with the receiving wallet's balance right before and
+        after each one, from the chain: on Solana the transaction's own token balances, on Base balanceOf at
+        the blocks before and of the transfer. "At credit" is the balance read when the deposit was
+        credited, for reference only. Delta check: after minus before equals the credited amount.</p>
+      <dl id="admin-deposits-totals" class="totals"></dl>
+      <div class="inline-form">
+        <button type="button" id="admin-deposits-verify">Re-verify against chain</button>
+        <a id="admin-deposits-csv" href="/api/admin/deposits.csv" download="gufo-deposits.csv">Download CSV</a>
+        <span id="admin-deposits-verify-state" class="muted"></span>
+      </div>
+      <p id="admin-deposits-error" class="bad" hidden></p>
+      <div id="admin-deposits-verify-result" class="accounts-message" hidden>
+        <p id="admin-deposits-verify-summary"></p>
+        <ul id="admin-deposits-verify-list" class="verify-list"></ul>
+      </div>
+      <div class="table-wrap">
+        <table id="admin-deposits" class="data">
+          <thead>
+            <tr>
+              <th>Time</th><th>User</th><th>Chain</th><th class="num">Amount</th>
+              <th class="num">Wallet before</th><th class="num">Wallet after</th>
+              <th class="num">At credit</th><th>Delta check</th><th>Tx</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <section>
       <h2>Totals</h2>
       <dl id="totals" class="totals"></dl>

@@ -511,7 +511,8 @@ function onSession(session) {
 
 function showAdminSection(name) {
   const section = $({ accounts: 'accounts-section', keys: 'admin-keys-section',
-    pricing: 'admin-pricing-section', usage: 'admin-usage-section' }[name]);
+    pricing: 'admin-pricing-section', usage: 'admin-usage-section',
+    deposits: 'admin-deposits-section' }[name]);
   if (!section.hidden) section.scrollIntoView({ block: 'start' });
 }
 

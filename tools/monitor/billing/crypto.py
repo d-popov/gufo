@@ -1,5 +1,6 @@
 """Pure-Python crypto for the credits portal: base58, Ed25519 verification,
-Keccak-256, EIP-191 address recovery and unsigned Solana USDC transfers.
+Keccak-256, EIP-191 address recovery, Solana associated token addresses and
+unsigned Solana USDC transfers.
 
 Verification only: no private keys are ever handled here. Python 3.11+
 standard library only.
@@ -295,7 +296,41 @@ def eth_recover_personal(message: str, sig_hex: str) -> str | None:
 # ---------------------------------------------------------------- Solana transaction
 
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 _TRANSFER_CHECKED = 12
+_ATA_CREATE_IDEMPOTENT = 1
+
+
+def solana_on_curve(raw: bytes) -> bool:
+    """Solana's "on curve" test for 32 bytes (curve25519-dalek's
+    CompressedEdwardsY::decompress): the sign bit is ignored, y is reduced mod p, and the
+    bytes are a point when x^2 = (y^2 - 1) / (d*y^2 + 1) is a square. No subgroup or
+    canonical-encoding check, unlike libsodium's crypto_core_ed25519_is_valid_point."""
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    y %= _P
+    # d*y^2 + 1 is never 0: -1/d is not a square mod p.
+    x2 = (y * y - 1) * pow(_D * y * y + 1, -1, _P) % _P
+    return x2 == 0 or pow(x2, (_P - 1) // 2, _P) == 1
+
+
+def find_program_address(seeds: list[bytes], program_id: str) -> tuple[str, int]:
+    """Solana's PDA: the first bump from 255 down whose
+    sha256(seeds || bump || program || "ProgramDerivedAddress") is off the curve."""
+    program = _pubkey(program_id, "program_id")
+    for bump in range(255, -1, -1):
+        digest = hashlib.sha256(b"".join(seeds) + bytes([bump]) + program
+                                + b"ProgramDerivedAddress").digest()
+        if not solana_on_curve(digest):
+            return b58encode(digest), bump
+    raise ValueError("no program address found")
+
+
+def associated_token_address(owner: str, mint: str,
+                             token_program: str = TOKEN_PROGRAM_ID) -> tuple[str, int]:
+    """The canonical (associated) token account of OWNER for MINT, and its bump."""
+    return find_program_address([_pubkey(owner, "owner"), _pubkey(token_program, "token program"),
+                                 _pubkey(mint, "mint")], ASSOCIATED_TOKEN_PROGRAM_ID)
 
 
 def _compact_u16(n: int) -> bytes:
@@ -322,10 +357,14 @@ def _pubkey(s: str, what: str) -> bytes:
 
 def solana_transfer_checked_tx(owner: str, source_token_account: str, mint: str,
                                dest_token_account: str, amount: int, decimals: int,
-                               recent_blockhash: str) -> bytes:
+                               recent_blockhash: str, create_dest_for: str | None = None) -> bytes:
     """Unsigned legacy transaction (one zeroed signature slot) moving `amount`
     base units of `mint` from the owner's token account with SPL Token
-    TransferChecked; the owner is fee payer and sole signer."""
+    TransferChecked; the owner is fee payer and sole signer.
+
+    With CREATE_DEST_FOR (a wallet address), the transaction first creates the
+    destination, which must be that wallet's associated token account for `mint`, with
+    the Associated Token Account program's CreateIdempotent; the owner pays its rent."""
     if not isinstance(amount, int) or isinstance(amount, bool) or not 0 < amount < 2**64:
         raise ValueError("amount must be a positive u64")
     if not isinstance(decimals, int) or isinstance(decimals, bool) or not 0 <= decimals < 256:
@@ -338,18 +377,33 @@ def solana_transfer_checked_tx(owner: str, source_token_account: str, mint: str,
         _pubkey(mint, "mint"),
         _pubkey(TOKEN_PROGRAM_ID, "token program"),
     ]
+    if create_dest_for is not None:
+        if associated_token_address(create_dest_for, mint)[0] != dest_token_account:
+            raise ValueError("the destination is not the associated token account of the "
+                             "receiving wallet")
+        keys += [_pubkey(create_dest_for, "receiving wallet"),
+                 _pubkey(SYSTEM_PROGRAM_ID, "system program"),
+                 _pubkey(ASSOCIATED_TOKEN_PROGRAM_ID, "associated token program")]
     if len(set(keys)) != len(keys):
-        raise ValueError("owner, source, destination and mint must be distinct accounts")
+        raise ValueError("owner, source, destination, mint and receiving wallet must be "
+                         "distinct accounts")
     blockhash = _pubkey(recent_blockhash, "recent_blockhash")
-    owner_i, source_i, dest_i, mint_i, program_i = range(5)
+    owner_i, source_i, dest_i, mint_i, token_i = range(5)
     data = bytes([_TRANSFER_CHECKED]) + amount.to_bytes(8, "little") + bytes([decimals])
-    accounts = bytes([source_i, mint_i, dest_i, owner_i])
+    instructions = [(token_i, bytes([source_i, mint_i, dest_i, owner_i]), data)]
+    if create_dest_for is not None:
+        wallet_i, system_i, ata_i = 5, 6, 7
+        # Accounts: payer, associated account, wallet, mint, system program, token program.
+        instructions.insert(0, (ata_i, bytes([owner_i, dest_i, wallet_i, mint_i, system_i,
+                                              token_i]), bytes([_ATA_CREATE_IDEMPOTENT])))
     message = (
-        bytes([1, 0, 2])  # required signatures, read-only signed, read-only unsigned
+        # required signatures, read-only signed, read-only unsigned (mint onwards)
+        bytes([1, 0, len(keys) - mint_i])
         + _compact_u16(len(keys)) + b"".join(keys)
         + blockhash
-        + _compact_u16(1)
-        + bytes([program_i]) + _compact_u16(len(accounts)) + accounts
-        + _compact_u16(len(data)) + data
+        + _compact_u16(len(instructions))
+        + b"".join(bytes([program]) + _compact_u16(len(accounts)) + accounts
+                   + _compact_u16(len(payload)) + payload
+                   for program, accounts, payload in instructions)
     )
     return _compact_u16(1) + b"\0" * 64 + message

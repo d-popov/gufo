@@ -167,8 +167,8 @@ function setUpAuthTabs() {
 // ---------------------------------------------------------------- admin area
 // The admin signs in from the profile menu (header.js); the session says what to show.
 
-const ADMIN_TABS = ['accounts', 'keys', 'pricing', 'usage'];
-const BILLING_TABS = ['accounts', 'pricing', 'usage'];  // need the credits portal
+const ADMIN_TABS = ['accounts', 'keys', 'pricing', 'usage', 'deposits'];
+const BILLING_TABS = ['accounts', 'pricing', 'usage', 'deposits'];  // need the credits portal
 
 function showTab(name) {
   if (BILLING_TABS.includes(name) && !portalEnabled) name = 'keys';
@@ -181,7 +181,7 @@ function showTab(name) {
 async function onSession(session, previous) {
   $('admin-area').hidden = !session.admin;
   $('accounts-off').hidden = portalEnabled;
-  for (const tab of ['pricing', 'usage']) $(`tab-${tab}`).hidden = !portalEnabled;
+  for (const tab of ['pricing', 'usage', 'deposits']) $(`tab-${tab}`).hidden = !portalEnabled;
   if (session.admin) {
     if (!previous?.admin) showTab('accounts');
     await window.GufoAdmin.load();

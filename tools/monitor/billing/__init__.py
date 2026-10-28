@@ -7,6 +7,8 @@ deposit checks on Solana and Base (chain, crypto) and the public portal (portal)
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import secrets
@@ -16,6 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from .crypto import associated_token_address, b58decode
 from .db import BillingError, Database
 from .meter import KeySync, Meter
 from .pricing import Pricing, PriceList, PricingError
@@ -28,6 +31,14 @@ RECHECK_S = 30.0
 PENDING_MAX_S = 24 * 3600.0
 MAX_ADMIN_CREDIT = 10 ** 12
 MAX_USAGE_DAYS = 365
+MAX_DEPOSIT_ROWS = 1000
+VERIFY_MAX = 50  # deposits re-fetched per verification run
+VERIFY_PACE_S = 0.25  # between RPC checks of one run, for public RPC rate limits
+VERIFY_GIVE_UP = 3  # consecutive unavailable answers end a run early
+AUDIT_FIELDS = ("receiver_before_micro", "receiver_after_micro", "slot", "block_time")
+CSV_COLUMNS = ("id", "time_utc", "user_id", "email", "chain", "tx", "sender", "amount_micro",
+               "receiver_before_micro", "receiver_after_micro", "receiver_live_micro",
+               "live_at_utc", "slot", "block_time_utc", "audit_note", "explorer")
 USAGE_FIELDS = ("requests", "prompt", "cached", "generated", "cost_micro")
 SOLANA_SIGNATURE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{64,90}")
 BASE_TX = re.compile(r"0x[0-9a-fA-F]{64}")
@@ -112,11 +123,26 @@ def load_config(path: Path, public_url: str | None = None, api_url: str | None =
     if solana is not None:
         if not isinstance(solana, dict):
             raise ConfigError("solana: expected an object")
+        owner = _str(solana, "receiver_owner", "solana")
+        mint = _str(solana, "mint", "solana", USDC_MINT)
+        try:  # the canonical (associated) USDC account of receiver_owner
+            canonical = associated_token_address(owner, mint)[0]
+        except ValueError as error:
+            raise ConfigError(f"solana.receiver_owner and solana.mint must be Solana "
+                              f"addresses: {error}") from None
+        # Optional: an explicit token account is used as it is (older non-associated ones).
+        token_account = _str(solana, "receiver_token_account", "solana", canonical)
+        try:
+            valid = len(b58decode(token_account)) == 32
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigError("solana.receiver_token_account: expected a Solana address")
         config["solana"] = {
             "rpc": _str(solana, "rpc", "solana", "https://api.mainnet-beta.solana.com"),
-            "receiver_owner": _str(solana, "receiver_owner", "solana"),
-            "receiver_token_account": _str(solana, "receiver_token_account", "solana"),
-            "mint": _str(solana, "mint", "solana", USDC_MINT),
+            "receiver_owner": owner,
+            "receiver_token_account": token_account,
+            "mint": mint,
             "commitment": _str(solana, "commitment", "solana", "finalized"),
         }
     chain_base = data.get("base")
@@ -168,6 +194,53 @@ def normalize_sender(chain_name: str, sender) -> str | None:
     return sender.lower() if chain_name == "base" else sender
 
 
+def _audit_int(value) -> int | None:
+    """VALUE when it is a plain non-negative integer (what the chain reported), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 \
+        else None
+
+
+def usdc_text(micro: int) -> str:
+    """1500000 -> "1.50", 1234567 -> "1.234567": exact, at least two decimals."""
+    whole, frac = divmod(abs(micro), 1_000_000)
+    digits = f"{frac:06d}".rstrip("0").ljust(2, "0")
+    return f"{'-' if micro < 0 else ''}{whole}.{digits}"
+
+
+def audit_note(before: int | None, after: int | None, credited: int,
+               created: bool = False) -> str | None:
+    """The deposit's audit note: "account created by this deposit" when its transaction
+    created the receiving account, and the mismatch when the receiver's balance moved by
+    other than the credit (several transfers in one transaction or block, fees); None
+    when there is nothing to note."""
+    notes = ["account created by this deposit"] if created else []
+    if before is not None and after is not None and after - before != credited:
+        notes.append(f"balance delta {usdc_text(after - before)} != credited "
+                     f"{usdc_text(credited)}")
+    return "; ".join(notes) or None
+
+
+def explorer_url(chain_name: str, tx: str) -> str | None:
+    base = {"solana": "https://solscan.io/tx/", "base": "https://basescan.org/tx/"}.get(chain_name)
+    return base + urllib.parse.quote(tx, safe="") if base else None
+
+
+def csv_cell(value):
+    """A CSV cell: blank for None; text a spreadsheet would run as a formula gets a
+    leading quote."""
+    if value is None:
+        return ""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
+
+
+def _utc(t) -> str:
+    if t is None:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
 class Billing:
     """The billing service. `keys` is the monitor's KeyStore for Gufo's key file and
     `served_model` returns the model Gufo serves (None while unknown); a `model` in
@@ -182,6 +255,8 @@ class Billing:
         self.prices = PriceList(config["pricing"])
         self.chains = chain_clients(config) if chains is None else chains
         self._served_model = served_model
+        self._verify_lock = threading.Lock()
+        self.verify_pace_s = VERIFY_PACE_S
         self.sync = KeySync(self.db, keys, self.model)
         self.meter = Meter(self.db, self.prices, self.sync)
 
@@ -263,7 +338,11 @@ class Billing:
     def check_deposit(self, chain_name: str, tx: str) -> dict:
         """Ask the chain about a stored deposit and settle it: credited once, kept
         pending (for at most a day) or rejected."""
-        check = self.chains[chain_name].check(tx)
+        client = self.chains[chain_name]
+        check = client.check(tx)
+        live = live_at = None
+        if check.status == "confirmed":  # outside the write: a network call
+            live, live_at = self._live_balance(chain_name, client)
         now = time.time()
         credited = None
         with self.db.write() as conn:
@@ -290,10 +369,21 @@ class Billing:
                 status, reason = "rejected", "expired"
             elif status not in ("pending", "rejected"):
                 status, reason = "rejected", f"unknown status {status}"
+            audit = (None,) * 7
+            if status == "credited":
+                before = _audit_int(getattr(check, "receiver_before_micro", None))
+                after = _audit_int(getattr(check, "receiver_after_micro", None))
+                audit = (before, after, _audit_int(getattr(check, "slot", None)),
+                         _audit_int(getattr(check, "block_time", None)),
+                         live, live_at, audit_note(
+                             before, after, amount,
+                             getattr(check, "receiver_created", False) is True))
             conn.execute("UPDATE deposits SET status=?, amount_micro=?, sender=?, reason=?, "
-                         "updated=? WHERE chain=? AND tx=?",
+                         "updated=?, receiver_before_micro=?, receiver_after_micro=?, slot=?, "
+                         "block_time=?, receiver_live_micro=?, live_at=?, audit_note=? "
+                         "WHERE chain=? AND tx=?",
                          (status, amount if status == "credited" else 0, sender, reason[:200],
-                          now, chain_name, tx))
+                          now, *audit, chain_name, tx))
         if credited is not None and credited[0] <= 0 < credited[1]:
             self.reconcile()
         return {"status": status, "amount_micro": amount if status == "credited" else 0,
@@ -308,6 +398,120 @@ class Billing:
                 self.check_deposit(row["chain"], row["tx"])
             except Exception as error:
                 print(f"gufo-monitor: billing: deposit check failed: {error}", file=sys.stderr)
+
+    @staticmethod
+    def _live_balance(chain_name: str, client) -> tuple[int | None, float | None]:
+        """The receiver's balance now and when it was read, or (None, None): a failed
+        read never holds up a credit."""
+        read = getattr(client, "receiver_balance", None)
+        if read is None:
+            return None, None
+        try:
+            value = _audit_int(read())
+        except Exception as error:  # the transport is injectable: any failure is a miss
+            print(f"gufo-monitor: billing: {chain_name} live balance: {error}", file=sys.stderr)
+            return None, None
+        return (value, time.time()) if value is not None else (None, None)
+
+    # -- deposit audit (admin)
+
+    def _credited(self, limit: int | None) -> list[dict]:
+        rows = self.db.query(
+            "SELECT d.rowid AS id, d.updated AS t, d.user_id, u.email, d.chain, d.tx, d.sender, "
+            "d.amount_micro, d.receiver_before_micro, d.receiver_after_micro, "
+            "d.receiver_live_micro, d.live_at, d.slot, d.block_time, d.audit_note "
+            "FROM deposits d JOIN users u ON u.id=d.user_id WHERE d.status='credited' "
+            "ORDER BY d.updated DESC, d.rowid DESC LIMIT ?", (-1 if limit is None else limit,))
+        return [{**dict(row), "explorer": explorer_url(row["chain"], row["tx"])} for row in rows]
+
+    def admin_deposits(self, limit: int = 200) -> dict:
+        """The newest LIMIT credited deposits with their audit facts, and totals over all."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or \
+                not 1 <= limit <= MAX_DEPOSIT_ROWS:
+            raise BillingError(400, "bad_limit", f"limit must be an integer from 1 to "
+                               f"{MAX_DEPOSIT_ROWS}")
+        totals = self.db.one("SELECT COALESCE(SUM(amount_micro), 0) AS credited_micro, "
+                             "COUNT(*) AS deposits FROM deposits WHERE status='credited'")
+        return {"deposits": self._credited(limit), "totals": dict(totals)}
+
+    def deposits_csv(self) -> str:
+        """Every credited deposit as CSV for a spreadsheet, newest first. Text cells that
+        a spreadsheet would read as a formula start with a quote."""
+        out = io.StringIO()
+        writer = csv.writer(out, lineterminator="\r\n")
+        writer.writerow(CSV_COLUMNS)
+        for row in self._credited(None):
+            row["time_utc"] = _utc(row["t"])
+            row["live_at_utc"] = _utc(row["live_at"])
+            row["block_time_utc"] = _utc(row["block_time"])
+            writer.writerow([csv_cell(row[name]) for name in CSV_COLUMNS])
+        return out.getvalue()
+
+    def verify_deposits(self, limit: int = VERIFY_MAX) -> dict:
+        """Re-fetch the newest LIMIT credited deposits from the chain and compare them
+        with what is stored. Read-only: credits and stored values never change. One run
+        at a time, paced for public RPC limits; it stops early when the RPC keeps failing."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= VERIFY_MAX:
+            raise BillingError(400, "bad_limit", f"limit must be an integer from 1 to "
+                               f"{VERIFY_MAX}")
+        if not self._verify_lock.acquire(blocking=False):
+            raise BillingError(409, "busy", "a verification is already running")
+        try:
+            rows = self.db.query(
+                "SELECT rowid AS id, chain, tx, sender, amount_micro, receiver_before_micro, "
+                "receiver_after_micro, slot, block_time FROM deposits WHERE status='credited' "
+                "ORDER BY updated DESC, rowid DESC LIMIT ?", (limit,))
+            counts = dict.fromkeys(("ok", "mismatch", "unavailable", "skipped"), 0)
+            results = []
+            misses = 0
+            asked = False
+            for row in rows:
+                client = self.chains.get(row["chain"])
+                if client is None:
+                    outcome, problems, notes = "unavailable", ["chain not enabled"], []
+                elif misses >= VERIFY_GIVE_UP:
+                    outcome, problems, notes = "skipped", ["stopped after repeated RPC failures"], []
+                else:
+                    if asked and self.verify_pace_s > 0:
+                        time.sleep(self.verify_pace_s)
+                    asked = True
+                    outcome, problems, notes = self._verify_one(row, client)
+                    misses = misses + 1 if outcome == "unavailable" else 0
+                counts[outcome] += 1
+                results.append({"id": row["id"], "chain": row["chain"], "tx": row["tx"],
+                                "explorer": explorer_url(row["chain"], row["tx"]),
+                                "result": outcome, "problems": problems, "notes": notes})
+        finally:
+            self._verify_lock.release()
+        return {"checked": len(results), **counts, "results": results}
+
+    @staticmethod
+    def _verify_one(row, client) -> tuple[str, list[str], list[str]]:
+        """"ok", "mismatch" or "unavailable", with the mismatches and other notes."""
+        try:
+            check = client.check(row["tx"])
+        except Exception as error:
+            return "unavailable", [f"check failed: {error}"], []
+        if check.status == "pending":
+            return "unavailable", [f"chain: {check.reason}"], []
+        if check.status != "confirmed":
+            return "mismatch", [f"chain now says {check.status}: {check.reason}"], []
+        problems, notes = [], []
+        sender = normalize_sender(row["chain"], check.sender)
+        if sender != row["sender"]:
+            problems.append(f"sender: stored {row['sender']}, chain {sender}")
+        if int(check.amount_micro or 0) != row["amount_micro"]:
+            problems.append(f"amount_micro: stored {row['amount_micro']}, "
+                            f"chain {check.amount_micro}")
+        for name in AUDIT_FIELDS:
+            stored, fresh = row[name], _audit_int(getattr(check, name, None))
+            if stored is not None and fresh is not None and stored != fresh:
+                problems.append(f"{name}: stored {stored}, chain {fresh}")
+            elif stored is None and fresh is not None:
+                notes.append(f"{name}: not stored, chain {fresh}")
+            elif stored is not None and fresh is None:
+                notes.append(f"{name}: stored {stored}, chain gave none")
+        return ("mismatch" if problems else "ok"), problems, notes
 
     # -- admin
 

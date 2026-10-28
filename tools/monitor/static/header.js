@@ -78,6 +78,7 @@ window.GufoHeader = (() => {
       menuItem('menu-admin-keys', 'Admin: API keys'),
       menuItem('menu-admin-pricing', 'Admin: pricing'),
       menuItem('menu-admin-usage', 'Admin: usage'),
+      menuItem('menu-admin-deposits', 'Admin: deposits'),
       menuItem('menu-admin-signout', 'Sign out of admin'),
       menuItem('menu-signout', 'Sign out'));
     menu.hidden = true;
@@ -123,7 +124,7 @@ window.GufoHeader = (() => {
     for (const id of ['menu-admin-info', 'menu-admin-accounts', 'menu-admin-keys']) {
       $(id).hidden = !session.admin;
     }
-    for (const id of ['menu-admin-pricing', 'menu-admin-usage']) {
+    for (const id of ['menu-admin-pricing', 'menu-admin-usage', 'menu-admin-deposits']) {
       $(id).hidden = !session.admin || !portalEnabled;  // need the credits portal
     }
     $('menu-admin-signout').hidden = !session.admin;
@@ -246,7 +247,7 @@ window.GufoHeader = (() => {
       showLoginError(null);
     });
     $('admin-login-form').addEventListener('submit', adminSignIn);
-    for (const name of ['accounts', 'keys', 'pricing', 'usage']) {
+    for (const name of ['accounts', 'keys', 'pricing', 'usage', 'deposits']) {
       $(`menu-admin-${name}`).addEventListener('click', () => {
         openMenu(false);
         options.onAdminTab?.(name);

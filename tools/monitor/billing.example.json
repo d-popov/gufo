@@ -6,7 +6,6 @@
   "solana": {
     "rpc": "https://api.mainnet-beta.solana.com",
     "receiver_owner": "REPLACE_WITH_YOUR_SOLANA_WALLET_ADDRESS",
-    "receiver_token_account": "REPLACE_WITH_ITS_USDC_TOKEN_ACCOUNT",
     "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "commitment": "finalized"
   },

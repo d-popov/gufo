@@ -36,6 +36,9 @@ table.data td.wrap { white-space: normal; overflow-wrap: anywhere; min-width: 16
 .account-actions button + button { margin-left: 12px; }
 .accounts-message { margin: 0 0 10px; padding: 6px 10px; border-left: 3px solid var(--ok); background: var(--panel); border-radius: 4px; }
 .credit-form { padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.accounts-message.mismatch { border-left-color: var(--bad); }
+.accounts-message > p { margin: 0; }
+.verify-list { margin: 4px 0 0; padding-left: 18px; font-size: 0.85rem; overflow-wrap: anywhere; }
 
 .pricing-edit input {
   font: inherit; font-variant-numeric: tabular-nums; text-align: right; width: 8em;
