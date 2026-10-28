@@ -50,16 +50,18 @@ details.thinking div { margin-top: 6px; }
   #status { order: 5; width: 100%; margin-left: 0; }
 }
 
-/* The Browser switch: a real checkbox (focusable, keyboard-operable) drawn as a track and thumb. */
-.switch { position: relative; display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; user-select: none; color: var(--muted); font-size: var(--text-sm); }
-.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
-.switch .track { position: relative; flex: none; width: 40px; height: 22px; border-radius: 999px; background: color-mix(in srgb, var(--muted) 38%, var(--surface)); transition: background .18s ease; }
-.switch .thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #0000004d; transition: transform .18s cubic-bezier(.4, 0, .2, 1); }
-.switch:hover .track { background: color-mix(in srgb, var(--muted) 50%, var(--surface)); }
-.switch input:checked + .track { background: var(--accent); }
-.switch input:checked + .track .thumb { transform: translateX(18px); }
-.switch input:checked ~ .switch-text { color: var(--text); font-weight: 600; }
-.switch input:focus-visible + .track { outline: 2px solid var(--focus); outline-offset: 2px; }
+/* The Tools menu: a button with a count of what is allowed, opening a list of checkboxes above the composer. */
+.tools { position: relative; }
+.tools > button { display: inline-flex; align-items: center; gap: var(--space-2); }
+.tools .count { min-width: 20px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--surface); font-size: var(--text-xs); font-weight: 700; line-height: 20px; text-align: center; }
+.tools .count:empty { display: none; }
+.tools-menu { position: absolute; z-index: 20; left: 0; bottom: calc(100% + 8px); width: 320px; max-width: calc(100vw - 32px); padding: 6px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-float); }
+.tool-option { display: grid; grid-template-columns: 18px 1fr; gap: 2px 10px; align-items: start; padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; }
+.tool-option:hover { background: var(--panel); }
+.tool-option input { grid-row: 1 / span 2; width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--accent); }
+.tool-option .name { font-weight: 600; }
+.tool-option .hint { color: var(--muted); font-size: var(--text-xs); }
+.tool-option.off { opacity: .55; cursor: not-allowed; }
 
 /* One tool call in the thread: a dot for its state, what it did, and its result on demand. */
 details.step { margin-bottom: var(--space-2); padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); font-size: var(--text-sm); }
@@ -71,5 +73,13 @@ details.step.bad .dot { background: var(--bad); }
 details.step.run .dot { background: var(--accent); animation: step-pulse 1s ease-in-out infinite; }
 details.step .via { margin-left: auto; color: var(--muted); font-size: var(--text-xs); }
 details.step pre { margin: var(--space-2) 0 0; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); font: inherit; font-size: var(--text-xs); }
+details.step pre.code { margin-bottom: var(--space-2); padding: 8px 10px; border-radius: var(--radius-sm); background: var(--panel); color: var(--text); }
+
+/* Charts and other figures a tool drew, shown in full under the step that made them. */
+.message .figures { display: grid; gap: var(--space-3); margin: 0 0 var(--space-2); }
+.message .figures figure { margin: 0; }
+.message .figures img { display: block; width: 100%; max-width: 600px; max-height: none; height: auto; margin: 0; background: #fff; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.message .figures figcaption, .message .note { margin-top: 4px; color: var(--muted); font-size: var(--text-xs); white-space: normal; }
+.message .figures a { color: var(--accent); }
 @keyframes step-pulse { 50% { opacity: .3; } }
-@media (prefers-reduced-motion: reduce) { .switch .track, .switch .thumb { transition: none; } details.step.run .dot { animation: none; } }
+@media (prefers-reduced-motion: reduce) { details.step.run .dot { animation: none; } }

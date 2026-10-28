@@ -10,6 +10,8 @@
   <link rel="stylesheet" href="/static/chat.css">
   <script src="/static/icons.js" defer></script>
   <script src="/static/webtools.js" defer></script>
+  <script src="/static/pybox.js" defer></script>
+  <script src="/static/tools.js" defer></script>
   <script src="/static/header.js" defer></script>
   <script src="/static/chat.js" defer></script>
 </head>
@@ -44,11 +46,13 @@
             <option value="max">Max</option>
           </select>
         </label>
-        <label class="switch" title="Let the model search the web and read pages. The requests are made by your browser, not by the server.">
-          <input id="browser" type="checkbox" role="switch">
-          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-          <span class="switch-text">Browser</span>
-        </label>
+        <div id="tools" class="tools">
+          <button id="tools-button" type="button" class="secondary" aria-haspopup="true" aria-expanded="false"
+                  aria-controls="tools-menu" title="Choose the tools the model may use">
+            <span>Tools</span><span id="tools-count" class="count"></span>
+          </button>
+          <div id="tools-menu" class="tools-menu" role="group" aria-label="Tools the model may use" hidden></div>
+        </div>
         <span id="status" role="status"></span>
         <button id="send" type="submit">Send</button>
       </div>

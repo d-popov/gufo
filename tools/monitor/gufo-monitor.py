@@ -65,6 +65,9 @@ STATIC_FILES = {
     "portal.js": (PORTAL_STATIC_DIR, _JS),
     "wallet.js": (PORTAL_STATIC_DIR, _JS),
     "webtools.js": (STATIC_DIR, _JS),
+    "pybox.js": (STATIC_DIR, _JS),
+    "pyworker.js": (STATIC_DIR, _JS),
+    "tools.js": (STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),
 }
 # Settings read from the environment or --env-file.
@@ -98,6 +101,24 @@ CHAT_SECURITY_HEADERS = tuple(
     (name, value.replace("connect-src 'self';", "connect-src 'self' https:;"))
     if name == "Content-Security-Policy" else (name, value)
     for name, value in SECURITY_HEADERS)
+
+# The chat's Python tool (static/pybox.js, pyworker.js). tools/monitor/fetch-pyodide.py puts
+# the runtime in PYODIDE_DIR; it is served only to signed-in chat users. The worker file gets
+# a CSP that allows no network at all, which is what keeps the model's Python in its box.
+PYODIDE_DIR = STATIC_DIR / "pyodide"
+PYODIDE_FILE = re.compile(r"[\w+-][\w.+-]*")
+PYODIDE_TYPES = {".js": _JS, ".mjs": _JS, ".wasm": "application/wasm", ".json": "application/json"}
+PYODIDE_REQUIRED = ("pyodide.mjs", "pyodide.asm.mjs", "pyodide.asm.wasm", "python_stdlib.zip",
+                    "pyodide-lock.json")
+PYWORKER_SECURITY_HEADERS = tuple(
+    (name, "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'none'; "
+           "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    if name == "Content-Security-Policy" else (name, value)
+    for name, value in SECURITY_HEADERS)
+
+
+def python_installed() -> bool:
+    return all((PYODIDE_DIR / name).is_file() for name in PYODIDE_REQUIRED)
 
 # Series recorded once per poll; the page draws one sparkline per key.
 SERIES = (
@@ -1942,6 +1963,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "pricing": None if billing is None else {
                 model: dict(billing.pricing.for_model(model)) for model in ids},
             "billed": not self._admin(),
+            "python": python_installed(),
         }).encode())
 
     def _relay_stream(self, upstream):
@@ -2018,6 +2040,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/static/pyodide/"):
+            return self._pyodide(path[len("/static/pyodide/"):])
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
         if path in ("/", "/index.html"):
@@ -2066,26 +2090,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json(404, b'{"error":"not_found"}')
 
 
-    def _file(self, path: Path, content_type: str, cache: str = "no-store"):
+    def _file(self, path: Path, content_type: str, cache: str = "no-store",
+              security: tuple[tuple[str, str], ...] = SECURITY_HEADERS):
         try:
             body = path.read_bytes()
         except OSError:
             return self._json(404, b'{"error":"not_found"}')
-        self._send(200, body, content_type, cache=cache)
+        self._send(200, body, content_type, cache=cache, security=security)
 
     def _chat_page(self):
-        try:
-            body = (STATIC_DIR / "chat.html").read_bytes()
-        except OSError:
-            return self._json(404, b'{"error":"not_found"}')
-        self._send(200, body, "text/html; charset=utf-8", security=CHAT_SECURITY_HEADERS)
+        self._file(STATIC_DIR / "chat.html", "text/html; charset=utf-8", security=CHAT_SECURITY_HEADERS)
 
     def _static(self, name: str):
         entry = STATIC_FILES.get(name)
         if entry is None:
             return self._json(404, b'{"error":"not_found"}')
         directory, content_type = entry
-        self._file(directory / name, content_type, cache="no-cache")
+        security = PYWORKER_SECURITY_HEADERS if name == "pyworker.js" else SECURITY_HEADERS
+        self._file(directory / name, content_type, cache="no-cache", security=security)
+
+    def _pyodide(self, name: str):
+        """One file of the Python runtime, for the chat: signed-in chat users and the admin."""
+        if not (self._admin() or self._chat_user() is not None):
+            return self._json(401, b'{"error":"unauthorized"}')
+        path = PYODIDE_DIR / name
+        if not PYODIDE_FILE.fullmatch(name) or not path.is_file():
+            return self._json(404, b'{"error":"not_found"}')
+        try:
+            body = path.read_bytes()
+        except OSError:
+            return self._json(404, b'{"error":"not_found"}')
+        self._send(200, body, PYODIDE_TYPES.get(path.suffix, "application/octet-stream"),
+                   cache="private, max-age=86400")
 
     def _stream(self, until: float):
         """Ticks until the client leaves, the server stops or, at time UNTIL, the admin

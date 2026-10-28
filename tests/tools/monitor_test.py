@@ -318,7 +318,12 @@ class MonitorHttpTest(unittest.TestCase):
         for path in ("/monitor", "/", "/static/chat.js"):
             other, _ = self.request("GET", path, {"X-Admin-Token": ADMIN_TOKEN})
             self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
-        self.assertIn(b'src="/static/webtools.js"', data)
+        scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "chat")
+                   if f'src="/static/{name}.js"'.encode() in data]
+        self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "chat"])
+        self.assertEqual([data.index(f'src="/static/{n}.js"'.encode()) for n in scripts],
+                         sorted(data.index(f'src="/static/{n}.js"'.encode()) for n in scripts),
+                         "tools.js and chat.js need the scripts they build on loaded first")
 
         payload = {
             "model": "fn",
@@ -364,13 +369,15 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertNotIn(GUFO_KEY.encode(), data)
 
     def test_chat_models_without_billing_have_no_prices(self):
-        response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
-        self.assertEqual(json.loads(data),
-                         {"models": ["fn", "fn-sub"], "pricing": None, "billed": False})
+        with tempfile.TemporaryDirectory() as empty, mock.patch.object(gm, "PYODIDE_DIR", Path(empty)):
+            response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(json.loads(data), {"models": ["fn", "fn-sub"], "pricing": None,
+                                            "billed": False, "python": False})
 
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
-                     "icons.js", "chat.js", "webtools.js", "chat.css", "favicon.svg", "portal.js",
+                     "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
+                     "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
             self.assertEqual(response.status, 200, name)
@@ -393,6 +400,78 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertNotIn(GUFO_KEY.encode(), data)
         self.assertEqual(json.loads(data[6:])["status"]["state"], "ready")
         connection.close()
+
+
+class PythonRuntimeTest(unittest.TestCase):
+    """The chat's Python tool as the server sees it: its runtime files go only to signed-in
+    users, and its worker is the one file that may not touch the network."""
+
+    FILES = {"pyodide.mjs": b"export {}", "pyodide.asm.mjs": b"export {}", "pyodide.asm.wasm": b"\0asm",
+             "python_stdlib.zip": b"PK", "pyodide-lock.json": b"{}", "numpy-2.0-cp314.whl": b"wheel"}
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.runtime = Path(self.directory.name)
+        for name, body in self.FILES.items():
+            (self.runtime / name).write_bytes(body)
+        (self.runtime / ".hidden").write_bytes(b"secret")
+        patch = mock.patch.object(gm, "PYODIDE_DIR", self.runtime)
+        patch.start()
+        self.addCleanup(patch.stop)
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False))
+        self.addCleanup(lambda: (self.server.shutdown(), self.server.server_close()))
+
+    def get(self, path, admin=True):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        connection.request("GET", path, headers={"X-Admin-Token": ADMIN_TOKEN} if admin else {})
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response, data
+
+    def test_runtime_files_need_a_signed_in_user_and_are_served_private(self):
+        response, _ = self.get("/static/pyodide/pyodide.js", admin=False)
+        self.assertEqual(response.status, 401)
+        for name, content_type in (("pyodide.mjs", "text/javascript; charset=utf-8"),
+                                   ("pyodide.asm.mjs", "text/javascript; charset=utf-8"),  # a module needs a JS type
+                                   ("pyodide.asm.wasm", "application/wasm"),
+                                   ("pyodide-lock.json", "application/json"),
+                                   ("numpy-2.0-cp314.whl", "application/octet-stream")):
+            response, data = self.get("/static/pyodide/" + name)
+            self.assertEqual((response.status, response.getheader("Content-Type"), data),
+                             (200, content_type, self.FILES[name]), name)
+            self.assertEqual(response.getheader("Cache-Control"), "private, max-age=86400", name)
+
+    def test_only_runtime_files_are_reachable(self):
+        for path in ("/static/pyodide/absent.whl", "/static/pyodide/.hidden", "/static/pyodide/",
+                     "/static/pyodide/../gufo-monitor.py", "/static/pyodide/%2e%2e/gufo-monitor.py",
+                     "/static/pyodide/a/b", "/static/pyodide/..%2fgufo-monitor.py"):
+            response, data = self.get(path)
+            self.assertEqual(response.status, 404, path)
+            self.assertNotIn(b"secret", data)
+
+    def test_models_say_whether_python_is_installed(self):
+        response, data = self.get("/api/chat/models")
+        self.assertTrue(json.loads(data)["python"])
+        (self.runtime / "pyodide.asm.wasm").unlink()
+        response, data = self.get("/api/chat/models")
+        self.assertFalse(json.loads(data)["python"])
+
+    def test_the_worker_may_not_touch_the_network_and_other_files_keep_their_policy(self):
+        response, data = self.get("/static/pyworker.js", admin=False)
+        policy = response.getheader("Content-Security-Policy")
+        self.assertEqual(response.status, 200)
+        self.assertIn("default-src 'none'", policy)
+        self.assertIn("connect-src 'none'", policy)
+        self.assertIn("'wasm-unsafe-eval'", policy)
+        self.assertNotIn("https:", policy)
+        self.assertNotIn("'unsafe-eval'", policy.replace("'wasm-unsafe-eval'", ""))
+        self.assertIn(b"Python box", data)
+        other, _ = self.get("/static/pybox.js", admin=False)
+        self.assertEqual(other.status, 200)
+        self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"))
 
 
 class AdminChatKeyTest(unittest.TestCase):

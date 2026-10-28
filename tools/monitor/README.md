@@ -39,22 +39,36 @@ server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images a
 the button or by pasting (Ctrl+V). The browser keeps the last 10 conversations (**Delete**
 removes the open one, after a second click to confirm); image bytes are not kept.
 
-The **Browser** switch (off by default, remembered) lets the model search the web and read
-pages. When it is on, the chat sends the model two tools, `web_search` and `fetch_url`, and
-a short system note, runs the tool calls itself, and sends what they found back until the
-model answers (at most six model calls per message). **Every web request is made by your
-browser; the inference server and the monitor fetch nothing.** A browser can only read a
-response when the site allows it (CORS), so `fetch_url` asks the site directly, without
-cookies, and works for Wikipedia, GitHub, Hacker News and other public APIs. A site that
-does not allow it, and every search, is read through the public reader
-[r.jina.ai](https://r.jina.ai) (DuckDuckGo Lite for search), which then sees that URL or
-query; those steps are labelled "via r.jina.ai" in the thread, and it limits anonymous use
-to about 20 requests a minute. Set `READER` to `''` in `static/webtools.js` to use only
-sites that allow direct reads (and no search). Local, private and IP-address URLs are never
-fetched, page text is marked as untrusted in the system note, and **Stop** cancels the reply
-and its requests. Only this page may connect to https sites (`connect-src 'self' https:`);
-every other page keeps `connect-src 'self'`. Each tool step costs a model call, so a
-browsing answer is billed for every call it made.
+The **Tools** menu above the message box chooses what the model may use (nothing by default;
+the choice is remembered). The chat sends the model only the ticked tools, with a short system
+note, runs its tool calls itself, and sends what they found back until it answers (at most
+six model calls per message, each billed like any other). A tool the model asks for that was
+not ticked is refused. **Stop** cancels the reply and whatever its tools were doing.
+
+**Web search** and **Read pages.** Every web request is made by your browser; the inference
+server and the monitor fetch nothing. A browser can only read a response when the site allows
+it (CORS), so `fetch_url` asks the site directly, without cookies, and works for Wikipedia,
+GitHub, Hacker News and other public APIs. A site that does not allow it, and every search,
+is read through the public reader [r.jina.ai](https://r.jina.ai) (DuckDuckGo Lite for
+search), which then sees that URL or query; those steps are labelled "via r.jina.ai" in the
+thread, and it limits anonymous use to about 20 requests a minute. Set `READER` to `''` in
+`static/webtools.js` to use only sites that allow direct reads (and no search). Local,
+private and IP-address URLs are never fetched, and page text is marked as untrusted in the
+system note. Only the chat page may connect to https sites (`connect-src 'self' https:`);
+every other page keeps `connect-src 'self'`.
+
+**Python** runs the model's code in your browser, in a sandbox, and shows the charts it
+draws (matplotlib) under the step, each with a **Save PNG** link. numpy, pandas and
+matplotlib are there; variables stay between calls until the box is reset by a timeout (30 s)
+or **Stop**. It needs the Pyodide runtime (CPython in WebAssembly), which is not in the
+repository: run `python3 tools/monitor/fetch-pyodide.py` once (about 30 MB, pinned and
+checked against SHA-256 sums; it adds no host to the page's policy) and restart the monitor.
+Until then the menu shows Python as not installed. The first use downloads the runtime into
+the browser, which then keeps it. The box is a module worker, `static/pyworker.js`, served
+with a policy of its own, `default-src 'none'; connect-src 'none'`, so the model's code has
+no network (not `fetch`, `XMLHttpRequest`, `WebSocket` or the prototype's `fetch`), no
+cookies or storage of the monitor, and no files of the host. The page hands it the runtime's
+files, which only signed-in chat users can download. Figures are not kept after a reload.
 
 ## Run
 

@@ -589,6 +589,17 @@ class ChatTest(BillingHarness):
         self.assertIn("connect-src 'self' https:;", page.getheader("Content-Security-Policy"))
         self.assertEqual(self.portal_call("GET", "/chat")[0], 303)
 
+    def test_python_runtime_goes_to_approved_users_only(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(gm, "PYODIDE_DIR", Path(directory)):
+            (Path(directory) / "pyodide.js").write_bytes(b"loader")
+            pending = self.signup_and_login()
+            self.assertEqual(self.portal_call("GET", "/static/pyodide/pyodide.js", cookie=pending)[0], 401)
+            self.assertEqual(self.portal_call("GET", "/static/pyodide/pyodide.js")[0], 401)
+            cookie, _, _ = self.approved_user("second@example.com")
+            status, body, response = self.portal_call("GET", "/static/pyodide/pyodide.js", cookie=cookie)
+            self.assertEqual((status, body), (200, b"loader"))
+            self.assertEqual(response.getheader("Cache-Control"), "private, max-age=86400")
+
     def test_models_carry_the_prices_a_chat_is_billed_at(self):
         self.monitor.models = [{"id": MODEL}, {"id": "other"}]
         cookie, _, _ = self.approved_user()

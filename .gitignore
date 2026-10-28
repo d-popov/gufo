@@ -124,3 +124,6 @@ tests/quality/compsec.json
 # Claude Code local settings
 .claude/settings.local.json
 /tools/monitor/.dev/
+
+# Pyodide runtime for the chat's Python tool: tools/monitor/fetch-pyodide.py downloads it
+/tools/monitor/static/pyodide/
