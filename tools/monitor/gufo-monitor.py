@@ -1585,12 +1585,14 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, monitor: Monitor, admin: AdminAuth, secure_cookie: bool,
-                 keys: KeyStore | None = None, billing=None):
+                 keys: KeyStore | None = None, billing=None, chat_key: str | None = None):
         super().__init__(address, Handler)
         self.monitor = monitor
         self.admin = admin
         self.secure_cookie = secure_cookie
         self.keys = keys  # None: no --keys-file, the key routes answer 404
+        # The inference key of the admin's chat (--chat-key-file); None uses the monitor's own.
+        self.chat_key = chat_key
         # Sign-in attempts (admin, portal login and signup), budgeted per kind and client.
         self.limiter = RateLimiter()
         # None without --billing-config: the account and portal routes answer 404.
@@ -1963,8 +1965,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _chat_completion(self):
         """The chat page's requests, sent with a key the server holds: the browser never
-        has one. The admin's go with the monitor's own key (--gufo-key-file), which must
-        allow inference; a portal user's go with their billed Web chat key."""
+        has one. The admin's go with --chat-key-file (else the monitor's own key, which
+        must then allow inference); a portal user's go with their billed Web chat key."""
         admin = self._admin()
         user = None if admin else self._chat_user()
         if user is None and not admin:
@@ -1975,7 +1977,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body is None or not isinstance(body.get("messages"), list):
             return self._error(400, "expected a JSON object with messages, at most 12 MiB")
         try:
-            key, fresh = (None, False) if admin else self._chat_key(user)
+            key, fresh = (self.server.chat_key, False) if admin else self._chat_key(user)
             payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         except (TypeError, ValueError):
             return self._error(400, "invalid chat request")
@@ -1991,7 +1993,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if status == 200 and body.get("stream") is True:
                 return self._relay_stream(upstream)
-            self._send(status, upstream.read(4 << 20), "application/json")
+            answer = upstream.read(4 << 20)
+            if admin and key is None and status == 403 and b"may only read" in answer:
+                # The monitor's own key is access=monitor, which Gufo refuses for inference.
+                return self._error(403, "The monitor's key is read-only, so it cannot chat. "
+                                        "Start the monitor with --chat-key-file FILE, a file "
+                                        "holding an inference key.")
+            self._send(status, answer, "application/json")
         finally:
             upstream.close()
 
@@ -2122,6 +2130,10 @@ def parse_args(argv=None):
     parser.add_argument("--gufo", default="http://127.0.0.1:8080", help="Gufo base URL")
     parser.add_argument("--gufo-key-file", type=Path,
                         help="file holding Gufo's --api-key; read and used only by this process")
+    parser.add_argument("--chat-key-file", type=Path,
+                        help="file holding an inference key for the admin's chat; the "
+                             "monitor's own --gufo-key-file key is often read-only "
+                             "(access=monitor), which Gufo refuses for chat")
     parser.add_argument("--bind", default="127.0.0.1",
                         help="listen address, for the monitor and the portal")
     parser.add_argument("--port", type=int, default=8099)
@@ -2200,6 +2212,11 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as error:
         print(f"gufo-monitor: --gufo-key-file: {error}", file=sys.stderr)
         return 2
+    try:
+        chat_key = read_api_key(args.chat_key_file) if args.chat_key_file else None
+    except (OSError, ValueError) as error:
+        print(f"gufo-monitor: --chat-key-file: {error}", file=sys.stderr)
+        return 2
     monitor = Monitor(GufoClient(args.gufo, api_key), Telemetry(args.gpu_card),
                       poll_s=args.poll, history_s=args.history)
     try:
@@ -2229,7 +2246,8 @@ def main(argv=None) -> int:
             print(f"gufo-monitor: --billing-config: {error}", file=sys.stderr)
             return 2
         monitor.billing = service
-    server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service)
+    server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
+                    chat_key)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":

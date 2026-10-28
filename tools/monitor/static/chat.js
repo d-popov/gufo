@@ -63,10 +63,35 @@ function renderHistoryList() {
 }
 
 function newChat() {
+  disarmDelete();
   const item = { id: crypto.randomUUID(), title: 'New chat', updated: Date.now(), messages: [] };
   histories.unshift(item);
   histories = histories.slice(0, MAX_HISTORIES);
   activeId = item.id;
+  pendingImages = [];
+  renderPreview();
+  renderHistoryList();
+  renderMessages();
+  renderTotal();
+  saveHistories();
+}
+
+// Deleting takes two clicks: the first arms the button for three seconds, the second deletes.
+let disarmTimer = null;
+
+function disarmDelete() {
+  clearTimeout(disarmTimer);
+  disarmTimer = null;
+  const button = $('delete-chat');
+  button.textContent = 'Delete';
+  button.classList.remove('danger');
+}
+
+// Removes the open chat and opens the most recent one left, or a fresh one if none is.
+function deleteChat() {
+  histories = histories.filter((item) => item.id !== activeId);
+  activeId = histories[0]?.id ?? null;
+  if (!activeId) { newChat(); return; }
   pendingImages = [];
   renderPreview();
   renderHistoryList();
@@ -333,6 +358,8 @@ function setBusy(on) {
   busy = on;
   $('send').textContent = on ? 'Stop' : 'Send';
   $('send').classList.toggle('secondary', on);
+  $('delete-chat').disabled = on;  // not while a reply is being written into it
+  if (on) disarmDelete();
 }
 
 async function send() {
@@ -477,7 +504,19 @@ async function send() {
 }
 
 $('new-chat').addEventListener('click', newChat);
+$('delete-chat').addEventListener('click', () => {
+  if (busy) return;
+  if (disarmTimer === null) {
+    $('delete-chat').textContent = 'Delete chat?';
+    $('delete-chat').classList.add('danger');
+    disarmTimer = setTimeout(disarmDelete, 3000);
+    return;
+  }
+  disarmDelete();
+  deleteChat();
+});
 $('history').addEventListener('change', () => {
+  disarmDelete();
   activeId = $('history').value;
   pendingImages = [];
   renderPreview();

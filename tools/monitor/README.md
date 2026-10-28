@@ -26,8 +26,9 @@ load nothing from other hosts.
 The pages include a chat at `/chat` (**Chat** in the top menu) for the admin and, with
 `--billing-config`, for approved portal users with a positive balance. It sends text and
 image attachments through the monitor, so no API key reaches the browser. The admin chats
-with the monitor's `--gufo-key-file` key, which must allow inference (not `access=monitor`);
-without a usable key, chat shows Gufo's error. A user chats with a server-held **Web chat** key, derived from
+with the key in `--chat-key-file` (an inference key, such as the owner's), or else the
+monitor's own `--gufo-key-file` key, which then must allow inference: a read-only
+`access=monitor` key makes Gufo refuse chat, and the chat says so. A user chats with a server-held **Web chat** key, derived from
 the admin token and listed with their keys, so those requests are metered and billed like
 any other. Replies stream as they are generated, with the model's thinking when it has
 any, and each reply shows its speed (tok/s), time to first token, token counts and, with
@@ -35,8 +36,8 @@ any, and each reply shows its speed (tok/s), time to first token, token counts a
 users are charged). The chat's running total (cost and tokens) stays in view above the
 conversation. **Thinking** sets the model's reasoning effort (Default leaves it to the
 server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images attach with
-the button or by pasting (Ctrl+V). The browser keeps the last 10 conversations; image
-bytes are not kept.
+the button or by pasting (Ctrl+V). The browser keeps the last 10 conversations (**Delete**
+removes the open one, after a second click to confirm); image bytes are not kept.
 
 The **Browser** switch (off by default, remembered) lets the model search the web and read
 pages. When it is on, the chat sends the model two tools, `web_search` and `fetch_url`, and
@@ -75,6 +76,7 @@ Scripts send the admin token as `X-Admin-Token: <token>` or
 |---|---|---|
 | `--gufo URL` | `http://127.0.0.1:8080` | Gufo base URL |
 | `--gufo-key-file FILE` | none | file holding the server's `--api-key`; read and used only by the monitor |
+| `--chat-key-file FILE` | the monitor's key | file holding an inference key for the admin's chat; keeps `--gufo-key-file` read-only |
 | `--bind`, `--port` | `127.0.0.1`, `8099` | listen address of the monitor and the portal |
 | `--log-source` | `none` | `podman:CONTAINER`, `file:PATH` or `none` |
 | `--log-since` | `1h` | podman log backlog read at start |

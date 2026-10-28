@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("gufo_monitor", ROOT / "tools/monitor/gufo-monitor.py")
@@ -392,6 +393,52 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertNotIn(GUFO_KEY.encode(), data)
         self.assertEqual(json.loads(data[6:])["status"]["state"], "ready")
         connection.close()
+
+
+class AdminChatKeyTest(unittest.TestCase):
+    """Which key the admin's chat is sent with, and what the admin is told when Gufo refuses
+    the monitor's own read-only one."""
+
+    BODY = {"model": "fn", "messages": [{"role": "user", "content": "hi"}]}
+
+    def chat(self, chat_key, upstream):
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", "monitor-key"), NoTelemetry())
+        server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False,
+                                 chat_key=chat_key))
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        body = json.dumps(self.BODY).encode()
+        with mock.patch.object(monitor.gufo, "open_post",
+                               return_value=(upstream[0], io.BytesIO(upstream[1]))) as sent:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            connection.request("POST", "/api/chat/completions", body, {
+                "X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json",
+                "Content-Length": str(len(body))})
+            response = connection.getresponse()
+            data = response.read()
+            connection.close()
+        return response.status, json.loads(data), sent
+
+    def test_chat_key_file_key_is_used_and_the_monitors_own_is_the_default(self):
+        status, _, sent = self.chat("inference-key", (200, b'{"choices":[]}'))
+        self.assertEqual((status, sent.call_args.kwargs["api_key"]), (200, "inference-key"))
+        status, _, sent = self.chat(None, (200, b'{"choices":[]}'))
+        self.assertEqual((status, sent.call_args.kwargs["api_key"]), (200, None))  # monitor key
+
+    def test_a_read_only_monitor_key_is_explained_not_relayed(self):
+        refusal = (b'{"error":{"message":"this API key may only read health, models, props, '
+                   b'slots and metrics"}}')
+        status, payload, _ = self.chat(None, (403, refusal))
+        self.assertEqual(status, 403)
+        self.assertIn("--chat-key-file", payload["error"])
+        # With a chat key set the refusal is not about the monitor's key: shown as Gufo said it.
+        status, payload, _ = self.chat("inference-key", (403, refusal))
+        self.assertEqual((status, payload), (403, json.loads(refusal)))
+        status, payload, _ = self.chat(None, (403, b'{"error":{"message":"model not allowed"}}'))
+        self.assertEqual(payload["error"]["message"], "model not allowed")
+
+    def test_chat_key_file_option(self):
+        self.assertEqual(gm.parse_args(["--chat-key-file", "/tmp/k"]).chat_key_file, Path("/tmp/k"))
+        self.assertIsNone(gm.parse_args([]).chat_key_file)
 
 
 class GufoStatusTest(unittest.TestCase):
