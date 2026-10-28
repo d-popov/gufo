@@ -14,27 +14,37 @@
 </head>
 <body>
   <header id="site-header" class="site-header"></header>
-  <main>
-    <nav aria-label="Chat history">
-      <button id="new-chat" type="button">New chat</button>
-      <label for="history">Recent chats</label>
+  <main class="chat">
+    <div class="toolbar">
+      <button id="new-chat" type="button" class="secondary">New chat</button>
       <select id="history" aria-label="Recent chats"></select>
-      <span id="chat-total" class="chat-total"></span>
-    </nav>
+      <div id="chat-total" class="chat-total" title="Total for this chat"></div>
+    </div>
     <section class="conversation" aria-label="Conversation">
       <div id="messages"></div>
+      <p id="empty" class="empty">Ask anything. Attach or paste (Ctrl+V) images up to 4 MiB each.<br>
+        Enter sends, Shift+Enter adds a line. The last 10 chats are kept in this browser.</p>
     </section>
     <form id="composer">
-      <label for="model">Model</label>
-      <select id="model" required></select>
       <div id="preview" class="preview" aria-live="polite"></div>
-      <div class="compose-row">
-        <label class="attach" for="images">Attach images</label>
+      <textarea id="prompt" rows="1" placeholder="Message Gufo…" aria-label="Message"></textarea>
+      <div class="controls">
+        <label class="button secondary attach" for="images">Attach images</label>
         <input id="images" type="file" accept="image/*" multiple hidden>
-        <textarea id="prompt" rows="2" placeholder="Message Gufo… (Enter to send, Shift+Enter for a new line)"></textarea>
+        <select id="model" required aria-label="Model"></select>
+        <label class="effort">Thinking
+          <select id="effort">
+            <option value="">Default</option>
+            <option value="none">Off</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="max">Max</option>
+          </select>
+        </label>
+        <span id="status" role="status"></span>
         <button id="send" type="submit">Send</button>
       </div>
-      <p id="status" role="status">Attach or paste (Ctrl+V) images up to 4 MiB each; chat history is saved in this browser.</p>
     </form>
   </main>
 </body>

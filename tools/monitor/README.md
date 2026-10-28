@@ -32,8 +32,11 @@ the admin token and listed with their keys, so those requests are metered and bi
 any other. Replies stream as they are generated, with the model's thinking when it has
 any, and each reply shows its speed (tok/s), time to first token, token counts and, with
 `--billing-config`, its price at the model's rates (the admin sees list prices; only
-users are charged). The chat's running total is at the top. Images attach with the button
-or by pasting (Ctrl+V). The browser keeps the last 10 conversations; image bytes are not kept.
+users are charged). The chat's running total (cost and tokens) stays in view above the
+conversation. **Thinking** sets the model's reasoning effort (Default leaves it to the
+server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images attach with
+the button or by pasting (Ctrl+V). The browser keeps the last 10 conversations; image
+bytes are not kept.
 
 ## Run
 

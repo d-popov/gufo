@@ -1,6 +1,7 @@
 'use strict';
 
 const STORAGE_KEY = 'gufo-chat-histories-v1';
+const EFFORT_KEY = 'gufo-chat-effort';
 const MAX_HISTORIES = 10;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const $ = (id) => document.getElementById(id);
@@ -100,17 +101,26 @@ function describe(stats) {
   return parts.join(' · ');
 }
 
+// The chat's running total, always in view: what it has cost (with prices), and the tokens
+// billed so far. Every turn resends the history, so tokens count the whole prompts.
 function renderTotal() {
+  const root = $('chat-total');
+  root.replaceChildren();
   const answered = (active()?.messages ?? []).filter((message) => message.stats);
+  if (!prices && !answered.length) return;
   const tokens = answered.reduce((sum, message) => sum + (message.stats.prompt_tokens || 0)
     + (message.stats.completion_tokens || 0), 0);
   const cost = answered.reduce((sum, message) => sum + (message.stats.cost_micro || 0), 0);
-  let text = '';
-  if (answered.length) {
-    text = `This chat: ${tokens.toLocaleString()} tokens`;
-    if (prices) text += ` · ${fmtUsd(cost)}${billed ? '' : ' (not charged)'}`;
-  }
-  $('chat-total').textContent = text;
+  const part = (tag, text, className) => {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  };
+  root.append(part('span', 'Chat total'));
+  if (prices) root.append(part('strong', fmtUsd(cost)));
+  root.append(part('span', `${tokens.toLocaleString()} tokens`));
+  if (prices && !billed) root.append(part('span', 'not charged', 'note'));
 }
 
 // ---------------------------------------------------------------- messages
@@ -130,7 +140,10 @@ function fillMessage(block, message) {
     block.append(details);
   }
   const text = document.createElement('div');
-  text.textContent = message.content || (message.hadImages ? '[Image attached; image bytes are not retained after reload]' : '');
+  const waiting = message.pending && !message.content && !message.reasoning;
+  if (waiting) text.className = 'live';
+  text.textContent = waiting ? 'Waiting for the model…'
+    : message.content || (message.hadImages ? '[Image attached; image bytes are not retained after reload]' : '');
   block.append(text);
   for (const image of message.images ?? []) {
     const img = document.createElement('img');
@@ -149,13 +162,15 @@ function fillMessage(block, message) {
 function renderMessages() {
   const root = $('messages');
   root.replaceChildren();
-  for (const message of active()?.messages ?? []) {
+  const messages = active()?.messages ?? [];
+  for (const message of messages) {
     const block = document.createElement('article');
-    block.className = `message ${message.role}`;
+    block.className = `message ${message.role}${message.error ? ' error' : ''}`;
     fillMessage(block, message);
     root.append(block);
   }
-  root.scrollTop = root.scrollHeight;
+  $('empty').hidden = messages.length > 0;
+  root.parentElement.scrollTop = root.parentElement.scrollHeight;
 }
 
 // ---------------------------------------------------------------- images: pick or paste
@@ -214,10 +229,13 @@ document.addEventListener('paste', (event) => {
 
 // POSTs the chat and reads Gufo's server-sent events: onDelta gets each {content,
 // reasoning_content}; the usage and timings chunks come back at the end.
-async function streamCompletion(model, messages, onDelta) {
+async function streamCompletion(model, messages, effort, onDelta) {
   const response = await fetch('/api/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Gufo-Portal': '1' },
-    body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true } })
+    body: JSON.stringify({
+      model, messages, stream: true, stream_options: { include_usage: true },
+      ...(effort ? { reasoning_effort: effort } : {}),
+    })
   });
   if (!response.ok) {
     let detail;
@@ -273,10 +291,11 @@ async function send() {
   const chat = active();
   chat.messages.push({ role: 'user', content: text, images: pendingImages, hadImages: pendingImages.length > 0 });
   const outgoing = toApiMessages(chat.messages);
-  const reply = { role: 'assistant', content: '', reasoning: '' };
+  const reply = { role: 'assistant', content: '', reasoning: '', pending: true };
   chat.messages.push(reply);
   if (chat.title === 'New chat') chat.title = text.slice(0, 48) || 'Image chat';
   $('prompt').value = '';
+  autosize();
   pendingImages = [];
   renderPreview();
   renderMessages();
@@ -284,7 +303,7 @@ async function send() {
   updateHistory();
   busy = true;
   $('send').disabled = true;
-  $('status').textContent = 'Waiting for the model…';
+  $('status').textContent = '';
 
   const sentAt = performance.now();
   let firstAt = null;
@@ -292,7 +311,7 @@ async function send() {
   let queued = false;
   const paint = () => {
     queued = false;
-    const root = $('messages');
+    const root = $('messages').parentElement;
     const atEnd = root.scrollHeight - root.scrollTop - root.clientHeight < 40;
     fillMessage(block, reply);
     if (atEnd) root.scrollTop = root.scrollHeight;
@@ -302,7 +321,7 @@ async function send() {
     }
   };
   try {
-    const { usage, timings } = await streamCompletion(model, outgoing, (delta) => {
+    const { usage, timings } = await streamCompletion(model, outgoing, $('effort').value, (delta) => {
       if (!delta.content && !delta.reasoning_content) return;
       firstAt ??= performance.now();
       pieces += 1;
@@ -320,14 +339,15 @@ async function send() {
       completion_tokens: usage?.completion_tokens,
       cost_micro: costMicro(model, usage),
     };
-    $('status').textContent = 'Ready.';
+    $('status').textContent = '';
   } catch (error) {
     if (reply.content) reply.content += `\n\n[stopped: ${error.message}]`;
     else { reply.content = `Error: ${error.message}`; reply.error = true; }
-    $('status').textContent = 'Request failed.';
+    $('status').textContent = '';
   } finally {
     busy = false;
     $('send').disabled = false;
+    delete reply.pending;
     reply.reasoning = reply.reasoning || undefined;
     updateHistory();
     renderMessages();
@@ -352,6 +372,15 @@ $('composer').addEventListener('submit', (event) => {
   event.preventDefault();
   send();
 });
+// The box grows with its text, up to its CSS limit.
+function autosize() {
+  const box = $('prompt');
+  box.style.height = 'auto';
+  box.style.height = `${box.scrollHeight}px`;
+}
+$('prompt').addEventListener('input', autosize);
+$('effort').value = localStorage.getItem(EFFORT_KEY) || '';
+$('effort').addEventListener('change', () => localStorage.setItem(EFFORT_KEY, $('effort').value));
 
 async function loadModels() {
   try {
