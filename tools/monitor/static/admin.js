@@ -850,10 +850,23 @@ window.GufoAdmin = (() => {
         el('td', { class: 'num' }, fmtUsd(deposit.receiver_after_micro)),
         live,
         deltaCell(deposit),
+        receiverCell(deposit),
         el('td', {}, txLink(deposit.tx, deposit.explorer)));
     });
-    if (!rows.length) rows.push(el('tr', {}, el('td', { colspan: '9', class: 'muted' }, 'No deposits yet.')));
+    if (!rows.length) rows.push(el('tr', {}, el('td', { colspan: '10', class: 'muted' }, 'No deposits yet.')));
     $('admin-deposits').tBodies[0].replaceChildren(...rows);
+  }
+
+  // The receiver a deposit was verified against, stored with it; deposits credited before
+  // that was stored are re-verified against today's configured receiver.
+  function receiverCell(deposit) {
+    if (deposit.identity !== 'stored') {
+      return el('td', { class: 'muted', title: 'Credited before receivers were stored: re-verified '
+        + 'against the receiver configured now, so not independently pinned.' }, 'config');
+    }
+    const owner = String(deposit.receiver_owner);
+    return el('td', { title: `Owner ${owner}\nAccount ${deposit.receiver_account}\nAsset ${deposit.asset}` },
+      shortTx(owner));
   }
 
   // Re-fetches the newest 50 credited deposits from the chain; changes nothing.
@@ -864,9 +877,11 @@ window.GufoAdmin = (() => {
     try {
       const report = await request('GET', '/api/admin/deposits/verify');
       const skipped = report.skipped ? `, ${fmt(report.skipped, 0)} skipped` : '';
+      const fallback = (report.results ?? []).filter((r) => r.identity !== 'stored').length;
       $('admin-deposits-verify-summary').textContent = `Checked ${fmt(report.checked, 0)}: `
         + `${fmt(report.ok, 0)} match, ${fmt(report.mismatch, 0)} mismatch, `
-        + `${fmt(report.unavailable, 0)} unavailable${skipped}.`;
+        + `${fmt(report.unavailable, 0)} unavailable${skipped}.`
+        + (fallback ? ` ${fmt(fallback, 0)} checked against today's receiver (no stored receiver).` : '');
       $('admin-deposits-verify-list').replaceChildren(...(report.results ?? [])
         .filter((r) => r.result !== 'ok' || r.notes.length)
         .map((r) => el('li', { class: r.result === 'mismatch' ? 'bad' : '' },

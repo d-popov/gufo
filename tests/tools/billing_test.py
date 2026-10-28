@@ -65,6 +65,7 @@ class FakeChain:
         self.checks = 0
         self.missing = set()  # account_exists() is False for these addresses
         self.exists_asked = 0
+        self.identity = None  # (owner, account, asset) it verifies against; None: cannot say
 
     def check(self, tx):
         self.checks += 1
@@ -319,6 +320,11 @@ class BillingHarness(unittest.TestCase):
         # GUFO_PUBLIC_URL as it may come from .env, with a trailing slash.
         config = billing.load_config(base / "billing.json", self.PUBLIC_URL + "/")
         self.chains = {"solana": FakeChain(), "base": FakeChain()}
+        sol, base_cfg = config["solana"], config["base"]
+        self.chains["solana"].identity = (sol["receiver_owner"], sol["receiver_token_account"],
+                                          sol["mint"])
+        self.chains["base"].identity = (base_cfg["receiver"], base_cfg["receiver"],
+                                        base_cfg["usdc"])
         self.store = gm.KeyStore(self.keys_path)
         self.billing = billing.Billing(config, self.store, lambda: MODEL, self.chains)
         self.monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
@@ -974,6 +980,7 @@ class DepositAuditTest(BillingHarness):
         before = self.snapshot()
         self.chains["solana"].answers[tx] = self.audited(address, 2_500_000, before=1, slot=9)
         self.chains["solana"].live = 1
+        self.chains["solana"].identity = ("other-owner", "other-account", "other-mint")
         payload = self.portal_call("POST", "/api/portal/deposit", {"chain": "solana", "tx": tx},
                                    cookie)[1]
         self.assertEqual(payload, {"status": "credited", "amount_micro": 2_500_000, "reason": ""})
@@ -1046,7 +1053,8 @@ class DepositAuditTest(BillingHarness):
         payload = self.deposit(cookie, tx, self.audited(stranger, 1_000_000))
         self.assertEqual(payload["reason"], "sender_not_linked")
         row = self.stored(tx)
-        self.assertEqual([row[name] for name, _ in bdb.DEPOSIT_AUDIT_COLUMNS], [None] * 7)
+        self.assertEqual([row[name] for name, _ in bdb.DEPOSIT_AUDIT_COLUMNS
+                          + bdb.DEPOSIT_IDENTITY_COLUMNS], [None] * 10)
         self.assertEqual(self.admin_call("GET", "/api/admin/deposits")[1],
                          {"deposits": [], "totals": {"credited_micro": 0, "deposits": 0}})
 
@@ -1081,9 +1089,11 @@ class DepositAuditTest(BillingHarness):
         self.assertEqual(cells["email"], "'=hyperlink(1)@example.com")
         self.assertEqual((cells["user_id"], cells["tx"], cells["amount_micro"],
                           cells["receiver_before_micro"], cells["receiver_live_micro"],
-                          cells["block_time_utc"], cells["audit_note"]),
+                          cells["block_time_utc"], cells["audit_note"], cells["receiver_owner"],
+                          cells["receiver_account"], cells["asset"], cells["identity"]),
                          (str(user_id), tx, "990000", "0", "", "2027-01-15T08:00:00Z",
-                          "balance delta 1.00 != credited 0.99"))
+                          "balance delta 1.00 != credited 0.99", *self.chains["solana"].identity,
+                          "stored"))
         for text in ("=1+1", "+1", "-1", "@SUM(A1)", "\tx", "\rx"):
             self.assertEqual(billing.csv_cell(text), "'" + text)
         self.assertEqual((billing.csv_cell("a=b"), billing.csv_cell(-5), billing.csv_cell(None)),
@@ -1157,6 +1167,64 @@ class DepositAuditTest(BillingHarness):
             "slot: stored 777, chain gave none",
             "block_time: stored 1800000000, chain gave none"])
 
+    def test_reverify_uses_the_stored_receiver_after_a_switch(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        receiver_a = self.chains["solana"].identity
+        tx = crypto.b58encode(b"\x05" * 64)
+        check = self.audited(address, 2_000_000)
+        self.deposit(cookie, tx, check)
+        entry = self.admin_call("GET", "/api/admin/deposits")[1]["deposits"][0]
+        self.assertEqual((entry["receiver_owner"], entry["receiver_account"], entry["asset"],
+                          entry["identity"]), (*receiver_a, "stored"))
+
+        # The owner switches to receiver B: today's checker knows nothing of A's deposits.
+        receiver_b = FakeChain()
+        receiver_b.identity = (NEW_RECEIVER_OWNER, NEW_RECEIVER_ATA, billing.USDC_MINT)
+        self.billing.chains["solana"] = receiver_b
+        made = []
+        for_a = FakeChain()
+        for_a.answers[tx] = check
+
+        def factory(name, identity):
+            made.append((name, identity))
+            for_a.identity = identity
+            return for_a
+        self.billing.checker_factory = factory
+        before = self.snapshot()
+        for _ in range(2):  # the checker is built once per identity
+            report = self.admin_call("GET", "/api/admin/deposits/verify")[1]
+            self.assertEqual((report["ok"], report["results"][0]["identity"]), (1, "stored"))
+        self.assertEqual(made, [("solana", receiver_a)])
+        self.assertEqual((for_a.checks, receiver_b.checks), (2, 0))
+        self.assertEqual(self.snapshot(), before)
+
+        # The real factory: A's identity on today's RPC settings.
+        real = billing.checker_for(self.billing.config, "solana", receiver_a)
+        self.assertEqual(real.identity, receiver_a)
+        self.assertEqual(real.commitment, self.billing.config["solana"]["commitment"])
+        base = billing.checker_for(self.billing.config, "base", ("0x" + "22" * 20,) * 2 + ("0x" + "33" * 20,))
+        self.assertEqual((base.receiver, base.usdc, base.confirmations),
+                         ("0x" + "22" * 20, "0x" + "33" * 20, 12))
+        self.assertIsNone(billing.checker_for({**self.billing.config, "base": None}, "base",
+                                              receiver_a))
+
+    def test_deposits_without_identity_fall_back_to_the_configured_receiver(self):
+        cookie, _, _ = self.approved_user()
+        address, _ = self.link_solana(cookie)
+        tx = crypto.b58encode(b"\x05" * 64)
+        self.chains["solana"].identity = None  # a checker that cannot say (older credits)
+        self.deposit(cookie, tx, self.audited(address, 2_000_000))
+        self.assertEqual(self.admin_call("GET", "/api/admin/deposits")[1]["deposits"][0]["identity"],
+                         "config-fallback")
+        self.billing.checker_factory = lambda *a: self.fail("no stored identity to build from")
+        checks = self.chains["solana"].checks
+        report = self.admin_call("GET", "/api/admin/deposits/verify")[1]
+        self.assertEqual((report["ok"], report["results"][0]["identity"]), (1, "config-fallback"))
+        self.assertEqual(self.chains["solana"].checks - checks, 1)
+        status, raw, _ = self.admin_call("GET", "/api/admin/deposits.csv")
+        self.assertIn(b",config-fallback,", raw)
+
 
 class DepositMigrationTest(unittest.TestCase):
     OLD_SCHEMA = """
@@ -1183,7 +1251,8 @@ class DepositMigrationTest(unittest.TestCase):
                 database = bdb.Database(path)
                 columns = [r["name"] for r in database.query("PRAGMA table_info(deposits)")]
                 database.close()
-            self.assertEqual(columns[-7:], [name for name, _ in bdb.DEPOSIT_AUDIT_COLUMNS])
+            self.assertEqual(columns[-10:], [name for name, _ in bdb.DEPOSIT_AUDIT_COLUMNS
+                                             + bdb.DEPOSIT_IDENTITY_COLUMNS])
             self.assertEqual(len(columns), len(set(columns)))
             config = {"db": path, "pricing": Path(tmp) / "pricing.json", "signup_grant_micro": 0,
                       "public_base_url": "https://gufo.test", "solana": None, "base": None}
@@ -1200,7 +1269,30 @@ class DepositMigrationTest(unittest.TestCase):
                              ("oldsig", 5_000_000, "old@example.com", 2))
             self.assertEqual([entry[k] for k in ("receiver_before_micro", "receiver_after_micro",
                                                  "receiver_live_micro", "slot", "block_time",
-                                                 "audit_note")], [None] * 6)
+                                                 "audit_note", "receiver_owner",
+                                                 "receiver_account", "asset")], [None] * 9)
+            self.assertEqual(entry["identity"], "config-fallback")
+
+    def test_audit_era_database_gains_identity_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "billing.sqlite"
+            conn = sqlite3.connect(path)
+            conn.executescript(self.OLD_SCHEMA)
+            for name, kind in bdb.DEPOSIT_AUDIT_COLUMNS:  # the schema before identities
+                conn.execute(f"ALTER TABLE deposits ADD COLUMN {name} {kind}")
+            conn.execute("UPDATE deposits SET receiver_before_micro=1, receiver_after_micro=2")
+            conn.commit()
+            conn.close()
+            for _ in range(2):
+                database = bdb.Database(path)
+                row = dict(database.one("SELECT * FROM deposits"))
+                columns = [r["name"] for r in database.query("PRAGMA table_info(deposits)")]
+                database.close()
+            self.assertEqual(columns[-3:], [n for n, _ in bdb.DEPOSIT_IDENTITY_COLUMNS])
+            self.assertEqual(len(columns), len(set(columns)))
+            self.assertEqual((row["receiver_before_micro"], row["receiver_after_micro"],
+                              row["receiver_owner"], row["receiver_account"], row["asset"]),
+                             (1, 2, None, None, None))
 
 
 class SecurityTest(BillingHarness):

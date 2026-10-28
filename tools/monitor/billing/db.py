@@ -137,6 +137,15 @@ DEPOSIT_AUDIT_COLUMNS = (
     ("live_at", "REAL"),
     ("audit_note", "TEXT"),
 )
+# The receiver a credited deposit was verified against, from that checker (never from
+# later config), so re-verification keeps working after the receiver changes:
+# receiver_owner (Solana wallet / Base address), receiver_account (Solana token account /
+# Base address) and asset (Solana mint / Base USDC contract). NULL for older credits.
+DEPOSIT_IDENTITY_COLUMNS = (
+    ("receiver_owner", "TEXT"),
+    ("receiver_account", "TEXT"),
+    ("asset", "TEXT"),
+)
 
 
 class BillingError(Exception):
@@ -203,10 +212,11 @@ class Database:
             self._migrate()
 
     def _migrate(self):
-        """Add the deposit audit columns a database lacks; a no-op once they are there."""
+        """Add the deposit audit and identity columns a database lacks; a no-op once
+        they are there."""
         with self.write() as conn:
             have = {row["name"] for row in conn.execute("PRAGMA table_info(deposits)")}
-            for name, kind in DEPOSIT_AUDIT_COLUMNS:
+            for name, kind in DEPOSIT_AUDIT_COLUMNS + DEPOSIT_IDENTITY_COLUMNS:
                 if name not in have:
                     conn.execute(f"ALTER TABLE deposits ADD COLUMN {name} {kind}")
 

@@ -443,6 +443,17 @@ The `deposits` table gains the columns `receiver_before_micro`, `receiver_after_
 startup (`ALTER TABLE ... ADD COLUMN`, once); deposits credited before have them empty.
 They are written in the credit's transaction and never change afterwards.
 
+**Receiver identity.** Each credit also stores the receiver it was verified against,
+taken from the checker that verified it, never from later config: `receiver_owner`
+(Solana wallet / Base address), `receiver_account` (Solana token account / Base address)
+and `asset` (USDC mint / contract). Re-verification checks each deposit against its own
+stored receiver, using only today's RPC settings (URL, commitment, confirmations). So when
+you switch receiver wallets, old deposits stay verifiable against the old receiver and new
+deposits use the new one. Deposits credited before identities were stored have them
+empty (`identity: "config-fallback"`): they are re-verified against the receiver
+configured now, which is wrong for them after a switch; the pane marks them `config`.
+These three columns are added in place at startup the same way as the audit columns.
+
 The **Deposits** tab on the portal, the monitor's Deposits section and **Admin:
 deposits** in the profile menu list them, newest first, with a **Download CSV** link and
 a **Re-verify against chain** button. Routes (admin authentication, like the others):
@@ -450,7 +461,8 @@ a **Re-verify against chain** button. Routes (admin authentication, like the oth
 - `GET /api/admin/deposits?limit=N` (1 to 1000, default 200): `deposits` rows with `id`,
   `t` (credit time), `user_id`, `email`, `chain`, `tx`, `sender`, `amount_micro`,
   `receiver_before_micro`, `receiver_after_micro`, `receiver_live_micro`, `live_at`,
-  `slot`, `block_time`, `audit_note` and `explorer` (Solscan or Basescan URL), and
+  `slot`, `block_time`, `audit_note`, `receiver_owner`, `receiver_account`, `asset`,
+  `identity` (`stored` or `config-fallback`) and `explorer` (Solscan or Basescan URL), and
   `totals` (`credited_micro`, `deposits`) over all credited deposits.
 - `GET /api/admin/deposits.csv`: every credited deposit as CSV (UTC ISO times). Text
   starting with `=`, `+`, `-`, `@`, tab or carriage return gets a leading `'` so a
@@ -460,7 +472,8 @@ a **Re-verify against chain** button. Routes (admin authentication, like the oth
   sender, amount, balances, slot and block time with what is stored. Each result is
   `ok`, `mismatch` (with `problems`), `unavailable` (RPC failure, chain disabled) or
   `skipped` (the run stops checking after 3 RPC failures in a row); `notes` list values
-  only one side has, such as balances a Base node no longer serves. One run at a time
+  only one side has, such as balances a Base node no longer serves. Each result carries
+  its `identity` status. One run at a time
   (409 `busy` otherwise). It never changes credits or stored values.
 
 ### Operations

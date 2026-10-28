@@ -38,7 +38,8 @@ VERIFY_GIVE_UP = 3  # consecutive unavailable answers end a run early
 AUDIT_FIELDS = ("receiver_before_micro", "receiver_after_micro", "slot", "block_time")
 CSV_COLUMNS = ("id", "time_utc", "user_id", "email", "chain", "tx", "sender", "amount_micro",
                "receiver_before_micro", "receiver_after_micro", "receiver_live_micro",
-               "live_at_utc", "slot", "block_time_utc", "audit_note", "explorer")
+               "live_at_utc", "slot", "block_time_utc", "audit_note", "receiver_owner",
+               "receiver_account", "asset", "identity", "explorer")
 USAGE_FIELDS = ("requests", "prompt", "cached", "generated", "cost_micro")
 SOLANA_SIGNATURE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{64,90}")
 BASE_TX = re.compile(r"0x[0-9a-fA-F]{64}")
@@ -177,6 +178,37 @@ def chain_clients(config: dict) -> dict:
     return clients
 
 
+def checker_for(config: dict, chain_name: str, identity: tuple[str, str, str]):
+    """A deposit checker for a stored receiver IDENTITY (owner, account, asset) on the
+    configured RPC (RPC URL, commitment and confirmations are infrastructure, not
+    identity); None when the chain has no configuration now."""
+    from . import chain
+    owner, account, asset = identity
+    if chain_name == "solana" and config.get("solana"):
+        s = config["solana"]
+        return chain.Solana(s["rpc"], owner, account, asset, s["commitment"])
+    if chain_name == "base" and config.get("base"):
+        b = config["base"]
+        return chain.Base(b["rpc"], account, asset, b["confirmations"])
+    return None
+
+
+def checker_identity(client) -> tuple[str, str, str] | None:
+    """The (owner, account, asset) a checker verifies against, or None if it cannot say."""
+    identity = getattr(client, "identity", None)
+    if isinstance(identity, tuple) and len(identity) == 3 and all(
+            isinstance(part, str) and part for part in identity):
+        return identity
+    return None
+
+
+def identity_status(row) -> str:
+    """"stored" when the deposit carries its receiver identity, else "config-fallback"
+    (credited before identities were stored: checked against today's receiver)."""
+    return "stored" if all(row[name] for name in ("receiver_owner", "receiver_account",
+                                                  "asset")) else "config-fallback"
+
+
 def normalize_tx(chain_name: str, tx) -> str | None:
     if not isinstance(tx, str):
         return None
@@ -257,6 +289,9 @@ class Billing:
         self._served_model = served_model
         self._verify_lock = threading.Lock()
         self.verify_pace_s = VERIFY_PACE_S
+        # Builds re-verification checkers for stored receiver identities; replaceable in tests.
+        self.checker_factory = lambda name, identity: checker_for(self.config, name, identity)
+        self._checkers: dict[tuple, object] = {}
         self.sync = KeySync(self.db, keys, self.model)
         self.meter = Meter(self.db, self.prices, self.sync)
 
@@ -339,6 +374,7 @@ class Billing:
         """Ask the chain about a stored deposit and settle it: credited once, kept
         pending (for at most a day) or rejected."""
         client = self.chains[chain_name]
+        identity = checker_identity(client)  # what this check verified against
         check = client.check(tx)
         live = live_at = None
         if check.status == "confirmed":  # outside the write: a network call
@@ -369,7 +405,7 @@ class Billing:
                 status, reason = "rejected", "expired"
             elif status not in ("pending", "rejected"):
                 status, reason = "rejected", f"unknown status {status}"
-            audit = (None,) * 7
+            audit = (None,) * 10
             if status == "credited":
                 before = _audit_int(getattr(check, "receiver_before_micro", None))
                 after = _audit_int(getattr(check, "receiver_after_micro", None))
@@ -377,10 +413,12 @@ class Billing:
                          _audit_int(getattr(check, "block_time", None)),
                          live, live_at, audit_note(
                              before, after, amount,
-                             getattr(check, "receiver_created", False) is True))
+                             getattr(check, "receiver_created", False) is True),
+                         *(identity or (None, None, None)))
             conn.execute("UPDATE deposits SET status=?, amount_micro=?, sender=?, reason=?, "
                          "updated=?, receiver_before_micro=?, receiver_after_micro=?, slot=?, "
-                         "block_time=?, receiver_live_micro=?, live_at=?, audit_note=? "
+                         "block_time=?, receiver_live_micro=?, live_at=?, audit_note=?, "
+                         "receiver_owner=?, receiver_account=?, asset=? "
                          "WHERE chain=? AND tx=?",
                          (status, amount if status == "credited" else 0, sender, reason[:200],
                           now, *audit, chain_name, tx))
@@ -419,10 +457,12 @@ class Billing:
         rows = self.db.query(
             "SELECT d.rowid AS id, d.updated AS t, d.user_id, u.email, d.chain, d.tx, d.sender, "
             "d.amount_micro, d.receiver_before_micro, d.receiver_after_micro, "
-            "d.receiver_live_micro, d.live_at, d.slot, d.block_time, d.audit_note "
+            "d.receiver_live_micro, d.live_at, d.slot, d.block_time, d.audit_note, "
+            "d.receiver_owner, d.receiver_account, d.asset "
             "FROM deposits d JOIN users u ON u.id=d.user_id WHERE d.status='credited' "
             "ORDER BY d.updated DESC, d.rowid DESC LIMIT ?", (-1 if limit is None else limit,))
-        return [{**dict(row), "explorer": explorer_url(row["chain"], row["tx"])} for row in rows]
+        return [{**dict(row), "identity": identity_status(row),
+                 "explorer": explorer_url(row["chain"], row["tx"])} for row in rows]
 
     def admin_deposits(self, limit: int = 200) -> dict:
         """The newest LIMIT credited deposits with their audit facts, and totals over all."""
@@ -459,14 +499,16 @@ class Billing:
         try:
             rows = self.db.query(
                 "SELECT rowid AS id, chain, tx, sender, amount_micro, receiver_before_micro, "
-                "receiver_after_micro, slot, block_time FROM deposits WHERE status='credited' "
+                "receiver_after_micro, slot, block_time, receiver_owner, receiver_account, "
+                "asset FROM deposits WHERE status='credited' "
                 "ORDER BY updated DESC, rowid DESC LIMIT ?", (limit,))
             counts = dict.fromkeys(("ok", "mismatch", "unavailable", "skipped"), 0)
             results = []
             misses = 0
             asked = False
             for row in rows:
-                client = self.chains.get(row["chain"])
+                identity = identity_status(row)
+                client = self._verifier(row, identity)
                 if client is None:
                     outcome, problems, notes = "unavailable", ["chain not enabled"], []
                 elif misses >= VERIFY_GIVE_UP:
@@ -480,10 +522,26 @@ class Billing:
                 counts[outcome] += 1
                 results.append({"id": row["id"], "chain": row["chain"], "tx": row["tx"],
                                 "explorer": explorer_url(row["chain"], row["tx"]),
-                                "result": outcome, "problems": problems, "notes": notes})
+                                "identity": identity, "result": outcome, "problems": problems,
+                                "notes": notes})
         finally:
             self._verify_lock.release()
         return {"checked": len(results), **counts, "results": results}
+
+    def _verifier(self, row, identity: str):
+        """The checker for a credited deposit: one for the receiver identity stored with it
+        (today's checker when that is still the configured receiver), or today's checker
+        for deposits from before identities were stored; None when unavailable."""
+        current = self.chains.get(row["chain"])
+        if identity != "stored":
+            return current
+        stored = (row["receiver_owner"], row["receiver_account"], row["asset"])
+        if current is not None and checker_identity(current) == stored:
+            return current
+        key = (row["chain"], *stored)
+        if key not in self._checkers:
+            self._checkers[key] = self.checker_factory(row["chain"], stored)
+        return self._checkers[key]
 
     @staticmethod
     def _verify_one(row, client) -> tuple[str, list[str], list[str]]:

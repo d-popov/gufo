@@ -110,6 +110,11 @@ class Solana:
         self.commitment = commitment
         self._rpc = _Rpc(rpc_url, post)
 
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """What this checker verifies deposits against: (owner, token account, mint)."""
+        return self.receiver_owner, self.receiver_token_account, self.mint
+
     def check(self, signature: str) -> DepositCheck:
         try:
             if len(b58decode(signature)) != 64:
@@ -250,6 +255,11 @@ class Base:
         self.usdc = usdc.lower()
         self.confirmations = confirmations
         self._rpc = _Rpc(rpc_url, post)
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """What this checker verifies deposits against: (receiver, receiver, USDC)."""
+        return self.receiver, self.receiver, self.usdc
 
     def check(self, tx_hash: str) -> DepositCheck:
         if not isinstance(tx_hash, str) or not _TX_HASH_RE.fullmatch(tx_hash):

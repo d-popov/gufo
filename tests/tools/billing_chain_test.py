@@ -522,6 +522,7 @@ class SolanaCheckTest(unittest.TestCase):
             self.assertEqual(params, [RECV_ATA, {"commitment": "finalized"}])
             return {"context": {"slot": 5}, "value": {"amount": "12345", "decimals": 6}}
         self.assertEqual(self.solana(FakeRpc(getTokenAccountBalance=balance)).receiver_balance(), 12345)
+        self.assertEqual(self.solana(FakeRpc()).identity, (RECV_OWNER, RECV_ATA, USDC_MINT))
         for broken in ({"value": {}}, {"value": {"amount": 1.5}}, OSError("down"),
                        {"error": {"code": 429, "message": "slow down"}}):
             with self.assertRaises(chain.ChainError):
@@ -636,6 +637,7 @@ class BaseAuditTest(unittest.TestCase):
                           got.receiver_after_micro, got.slot, got.block_time),
                          ("confirmed", 2_500_000, 7_000_000, 9_500_000, 100, 1_800_000_000))
         self.assertEqual(base.receiver_balance(), 9_600_000)
+        self.assertEqual(base.identity, (BASE_RECV, BASE_RECV, BASE_USDC.lower()))
 
     def test_no_historic_state_is_none_never_a_guess(self):
         base, _ = self.base(eth_call={"error": {"code": -32000, "message": "missing trie node"}},
