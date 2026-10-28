@@ -275,8 +275,8 @@ def _utc(t) -> str:
 
 class Billing:
     """The billing service. `keys` is the monitor's KeyStore for Gufo's key file and
-    `served_model` returns the model Gufo serves (None while unknown); a `model` in
-    the config overrides it. `chains` maps "solana"/"base" to deposit checkers."""
+    `served_model` supplies the default displayed model (overridden by config `model`),
+    not a key restriction. `chains` maps "solana"/"base" to deposit checkers."""
 
     Error = BillingError  # raised by deposit() and admin_action(): .status, .code, .message
 
@@ -292,7 +292,7 @@ class Billing:
         # Builds re-verification checkers for stored receiver identities; replaceable in tests.
         self.checker_factory = lambda name, identity: checker_for(self.config, name, identity)
         self._checkers: dict[tuple, object] = {}
-        self.sync = KeySync(self.db, keys, self.model)
+        self.sync = KeySync(self.db, keys)
         self.meter = Meter(self.db, self.prices, self.sync)
 
     @property

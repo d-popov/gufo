@@ -309,13 +309,14 @@
           <div id="balance-sub" class="card-sub"></div>
         </div>
         <div class="card">
-          <div class="card-label with-icon"><span data-icon="cpu"></span>Model</div>
+          <div class="card-label with-icon"><span data-icon="cpu"></span>Default model</div>
           <div id="model" class="card-value small"></div>
-          <div class="card-sub">served by this endpoint</div>
+          <div class="card-sub">example requests and prices below</div>
         </div>
       </div>
 
       <h2 class="with-icon"><span data-icon="tag"></span>Prices</h2>
+      <p class="muted note">Prices below are for the default model. Requests use the prices of the model actually requested.</p>
       <div class="table-wrap">
         <table id="pricing" class="data narrow">
           <thead><tr><th>Tokens</th><th class="num">USD per 1M tokens</th></tr></thead>
@@ -329,6 +330,7 @@
 
       <section id="keys-section">
         <h2 class="with-icon"><span data-icon="key-round"></span>API keys</h2>
+        <p class="muted note">New keys allow all inference models served by this endpoint. An admin may restrict individual keys.</p>
         <p id="keys-locked" class="muted" hidden>API keys become available once the admin approves your account.</p>
         <div id="keys-body">
           <div class="table-wrap">

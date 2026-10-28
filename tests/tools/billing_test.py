@@ -8,6 +8,7 @@ import io
 import base64
 import hashlib
 import http.client
+import http.server
 import importlib.util
 import json
 from pathlib import Path
@@ -424,6 +425,135 @@ class BillingHarness(unittest.TestCase):
         return address, signer
 
 
+class ManagedKeyAccessTest(BillingHarness):
+    def create_key(self):
+        cookie, user_id, _ = self.approved_user()
+        status, key, _ = self.portal_call("POST", "/api/portal/keys", {}, cookie)
+        self.assertEqual(status, 201)
+        return cookie, user_id, key
+
+    def restart_billing(self):
+        old = self.billing
+        config = old.config
+        old.db.close()
+        self.billing = billing.Billing(config, self.store, lambda: MODEL, self.chains)
+        self.server.billing = self.billing
+        self.server.portal.billing = self.billing
+        self.monitor.billing = self.billing
+        self.billing.reconcile()
+
+    def test_restrictions_survive_reconcile_balance_restore_and_restart(self):
+        cookie, user_id, key = self.create_key()
+        name = key["name"]
+        self.assertEqual(self.store.list()[1]["models"], [])
+        self.assertEqual(self.me(cookie)["keys"][0]["models"], [])
+        restricted = ["session-sub"]
+        status, _, _ = self.admin_call("PUT", f"/api/keys/{name}",
+                                       {"access": "inference", "models": restricted})
+        self.assertEqual(status, 204)
+        self.billing.reconcile()
+        self.assertEqual(self.store.list()[1]["models"], restricted)
+        # Debit crosses zero and physically removes the file entry.
+        self.billing.on_request({"key": name, "request": "cutoff", "t": 1,
+                                 "model": "session-sub", "prompt_tokens": 2000})
+        self.assertEqual([k["name"] for k in self.store.list()], ["owner"])
+        self.admin_call("POST", f"/api/admin/accounts/{user_id}/credit",
+                        {"amount_micro": 5000})
+        self.assertEqual(self.store.list()[1]["models"], restricted)
+        self.restart_billing()
+        self.assertEqual(self.store.list()[1]["models"], restricted)
+        self.assertEqual(self.me(cookie)["keys"][0]["models"], restricted)
+        # All-model is also a durable explicit admin choice.
+        self.assertEqual(self.admin_call("PUT", f"/api/keys/{name}",
+                                         {"models": []})[0], 204)
+        self.restart_billing()
+        self.assertEqual(self.store.list()[1]["models"], [])
+
+    def test_admin_revocation_is_not_resurrected(self):
+        cookie, user_id, key = self.create_key()
+        name = key["name"]
+        self.assertEqual(self.admin_call("DELETE", f"/api/keys/{name}")[0], 204)
+        self.billing.reconcile()
+        self.admin_call("POST", f"/api/admin/accounts/{user_id}/credit",
+                        {"amount_micro": 5000})
+        self.restart_billing()
+        self.assertEqual([k["name"] for k in self.store.list()], ["owner"])
+        self.assertEqual(self.me(cookie)["keys"], [])
+        self.assertEqual(self.admin_call("PUT", f"/api/keys/{name}", {"models": []})[0], 404)
+
+    def test_inference_only_and_invalid_edit_leave_database_unchanged(self):
+        _, _, key = self.create_key()
+        for body in ({"access": "monitor"}, {"models": ["bad model"]},
+                     {"models": "not-a-list"}):
+            self.assertEqual(self.admin_call("PUT", "/api/keys/" + key["name"], body)[0], 400)
+        for name in (key["name"], "u999-1"):
+            self.assertEqual(self.admin_call("POST", "/api/keys",
+                                             {"name": name, "access": "monitor"})[0], 400)
+        self.billing.reconcile()
+        self.assertEqual(self.store.list()[1]["access"], "inference")
+        self.assertEqual(self.store.list()[1]["models"], [])
+        # Non-portal keys retain ordinary file-owned access editing.
+        self.assertEqual(self.admin_call("PUT", "/api/keys/owner",
+                                         {"access": "monitor"})[0], 204)
+        self.billing.reconcile()
+        self.assertEqual(self.store.list()[0]["access"], "monitor")
+
+    def test_old_database_migrates_existing_key_to_all_models(self):
+        _, _, key = self.create_key()
+        self.store.update(key["name"], "inference", [MODEL])
+        # Emulate the old schema, which did not store restrictions at all.
+        with self.billing.db.write() as conn:
+            conn.execute("ALTER TABLE keys DROP COLUMN models")
+        self.restart_billing()
+        self.assertEqual(self.store.list()[1]["models"], [])
+
+    def test_actual_requested_model_selects_meter_price(self):
+        _, user_id, key = self.create_key()
+        self.billing.save_pricing({
+            "default": {"input": 1_000_000, "cached_input": 0, "output": 0},
+            "models": {"session-sub": {"input": 2_000_000, "cached_input": 0, "output": 0}}})
+        for n, model in enumerate((MODEL, "session-sub")):
+            self.billing.on_request({"key": key["name"], "request": f"model-{n}",
+                                     "t": n + 1, "model": model, "prompt_tokens": 10})
+        self.assertEqual(self.billing.db.one("SELECT balance_micro FROM users WHERE id=?",
+                                             (user_id,))["balance_micro"], 970)
+
+    def test_isolated_http_smoke_same_key_both_session_models(self):
+        # Actual portal/admin HTTP above; this isolated fake inference backend
+        # consumes the real generated file, never any production key/config.
+        _, _, key = self.create_key()
+        store = self.store
+
+        class Backend(http.server.BaseHTTPRequestHandler):
+            def do_POST(handler):
+                body = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])))
+                token = handler.headers.get("Authorization", "").removeprefix("Bearer ")
+                digest = hashlib.sha256(token.encode()).hexdigest()
+                keys = [gm.parse_key_line(line) for line in store.path.read_text().splitlines()]
+                found = next((k for k in keys if k and k["digest"] == digest), None)
+                allowed = found and found["access"] == "inference" and (
+                    not found["models"] or body["model"] in found["models"])
+                handler.send_response(200 if allowed else 403)
+                handler.send_header("Content-Type", "application/json")
+                handler.end_headers()
+                handler.wfile.write(json.dumps({"model": body["model"]}).encode())
+
+            def log_message(self, *args):
+                pass
+
+        backend = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), Backend))
+        try:
+            for model in (MODEL, "session-sub"):
+                status, payload, _ = self.call(
+                    backend.server_address[1], "POST", "/v1/chat/completions",
+                    {"model": model, "messages": [{"role": "user", "content": "Hi"}]},
+                    {"Authorization": "Bearer " + key["token"]})
+                self.assertEqual((status, payload["model"]), (200, model))
+        finally:
+            backend.shutdown()
+            backend.server_close()
+
+
 class AccountFlowTest(BillingHarness):
     def test_signup_verify_approve_key_meter_cutoff_and_restore(self):
         cookie = self.signup_and_login()
@@ -464,7 +594,7 @@ class AccountFlowTest(BillingHarness):
         self.assertTrue(token.startswith("gufo-") and len(token) == 45)
         digest = hashlib.sha256(token.encode()).hexdigest()
         self.assertEqual(self.keys_path.read_text(), OWNER_LINE + "\n"
-                         + f"{name} sha256:{digest} models={MODEL}\n")
+                         + f"{name} sha256:{digest}\n")
         self.assertNotIn(token, self.keys_path.read_text())
         self.assertEqual(self.me(cookie)["keys"][0]["enabled"], True)
 

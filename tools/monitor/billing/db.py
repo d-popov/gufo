@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import sqlite3
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS keys (
   created REAL NOT NULL,
   last_used REAL,
   revoked INTEGER NOT NULL DEFAULT 0,
+  models TEXT NOT NULL DEFAULT '[]',
   UNIQUE (user_id, n)
 );
 CREATE TABLE IF NOT EXISTS wallets (
@@ -212,13 +214,15 @@ class Database:
             self._migrate()
 
     def _migrate(self):
-        """Add the deposit audit and identity columns a database lacks; a no-op once
-        they are there."""
+        """Add missing columns in place; old portal keys gain all-model access."""
         with self.write() as conn:
             have = {row["name"] for row in conn.execute("PRAGMA table_info(deposits)")}
             for name, kind in DEPOSIT_AUDIT_COLUMNS + DEPOSIT_IDENTITY_COLUMNS:
                 if name not in have:
                     conn.execute(f"ALTER TABLE deposits ADD COLUMN {name} {kind}")
+            have_keys = {row["name"] for row in conn.execute("PRAGMA table_info(keys)")}
+            if "models" not in have_keys:
+                conn.execute("ALTER TABLE keys ADD COLUMN models TEXT NOT NULL DEFAULT '[]'")
 
     def close(self):
         with self.lock:
@@ -393,11 +397,13 @@ class Database:
                                   "revoked=0", (user_id, name))
             return cursor.rowcount > 0
 
-    def wanted_keys(self) -> dict[str, str]:
-        """Keys that belong in Gufo's key file: {name: digest} of approved, funded users."""
-        rows = self.query("SELECT k.name, k.digest FROM keys k JOIN users u ON u.id=k.user_id "
+    def wanted_keys(self) -> dict[str, dict]:
+        """Approved, funded, unrevoked keys and their authoritative restrictions."""
+        rows = self.query("SELECT k.name, k.digest, k.models FROM keys k "
+                          "JOIN users u ON u.id=k.user_id "
                           "WHERE k.revoked=0 AND u.status='approved' AND u.balance_micro>0")
-        return {row["name"]: row["digest"] for row in rows}
+        return {row["name"]: {"digest": row["digest"], "models": json.loads(row["models"])}
+                for row in rows}
 
     # -- wallets
 

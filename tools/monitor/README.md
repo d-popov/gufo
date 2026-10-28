@@ -314,7 +314,7 @@ makes every request look local, so the monitor admits the admin only, whoever co
 | `pricing` | required | prices file, below |
 | `signup_grant_micro` | `990000` | credit granted once on approval, micro-USD |
 | `max_keys_per_user` | `5` | active keys per account |
-| `model` | served model | model the portal keys are limited to (`models=` in the key file); by default the model Gufo reports |
+| `model` | served model | default model displayed in the portal and its example prices; does not restrict key access |
 | `solana` | absent: disabled | `rpc`, `receiver_owner` (your wallet), `receiver_token_account` (its USDC token account; optional, default: the wallet's associated USDC account), `mint` (USDC), `commitment` (`finalized`) |
 | `base` | absent: disabled | `rpc`, `receiver` (your address), `usdc` (USDC contract), `confirmations` (`12`) |
 
@@ -355,8 +355,27 @@ ceil(((prompt_tokens - cached_tokens) * input + cached_tokens * cached_input
 micro-USD, from its `event=completed` log line. Gufo's `prompt_tokens` counts the whole
 prompt, so the cached part is billed only at the cached price. Requests with a model
 listed under `models` use its prices; others use `default`. The portal shows users the
-prices of the model their keys are limited to (`model` in the config, else the served
-model): its own entry when it has one, else `default`.
+prices for its default displayed model (`model` in the config, else the primary served
+model): its own entry when it has one, else `default`. Actual charges always use the
+model in each completed request, not the portal's display default.
+
+Portal keys default to **all inference models**, including both served session classes
+and models added later; they never grant monitoring access. The billing database owns
+their model restrictions and revocation state. Admin **Keys** edits (the existing
+`PUT /api/keys/NAME` and `DELETE /api/keys/NAME` endpoints) persist across the periodic
+sync, credit cutoff/restoration, suspension and monitor restart. Attempting to change
+a portal key to `access=monitor` is rejected. Ordinary owner and monitoring keys remain
+file-owned. Direct edits to a portal key's file line are overwritten by database sync.
+
+On the first start with this version, the database adds a `keys.models` JSON column
+in place. All older portal keys migrate to all-model access, intentionally replacing
+the previous implicit primary-only restriction (and any temporary file-only edits).
+Existing tokens stay valid: no key regeneration is needed. Back up the billing SQLite
+database and key file, then restart **only the monitor** with the same billing config,
+database and key file. Its initial reconciliation repairs existing funded, approved
+users' keys automatically; Gufo reloads the file without an inference-server restart.
+Apply any desired explicit restrictions afterwards through Admin **Keys**.
+
 
 #### Editing prices
 

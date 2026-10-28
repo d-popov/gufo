@@ -270,9 +270,10 @@ class PortalRequest:
             "balance_micro": user["balance_micro"],
             "wallets": db.wallets(user["id"]),
             "keys": [{"name": k["name"], "label": k["label"], "created": k["created"],
-                      "last_used": k["last_used"], "enabled": enabled}
+                      "last_used": k["last_used"], "enabled": enabled,
+                      "models": json.loads(k["models"])}
                      for k in db.keys(user["id"])],
-            # Portal keys are limited to MODEL, so its entry is what users pay.
+            # Example prices for the default displayed model; billing uses the request model.
             "pricing": dict(billing.pricing.for_model(model)),
             "model": model,
             "api_base_url": billing.config["api_base_url"],

@@ -1675,7 +1675,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         store = self.server.keys
         try:
             if method == "DELETE" and name:
-                store.delete(name)
+                billing = self.server.billing
+                if billing is None or not billing.sync.admin_change(name, revoke=True):
+                    store.delete(name)
                 return self._send(204, b"", "text/plain")
             body = self._read_json()
             if body is None:
@@ -1683,15 +1685,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             access = body.get("access", "inference")
             models = body.get("models", [])
             if method == "POST" and not name:
+                billing = self.server.billing
+                if billing is not None and billing.sync.managed_name(body.get("name")):
+                    raise KeyFileError("portal key names are reserved; create keys in the portal")
                 token = store.create(body.get("name"), access, models)
                 payload = {"name": body["name"], "token": token}
                 return self._json(201, json.dumps(payload).encode())
             if method == "PUT" and name:
-                store.update(name, access, models)
+                billing = self.server.billing
+                if billing is None or not billing.sync.admin_change(
+                        name, access=access, models=models):
+                    store.update(name, access, models)
                 return self._send(204, b"", "text/plain")
         except LookupError:
             return self._error(404, f"no key named '{name}'")
-        except KeyFileError as error:
+        except ValueError as error:
             return self._error(400, str(error))
         self._error(405, "method not allowed")
 

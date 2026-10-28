@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 
@@ -20,29 +21,57 @@ class KeySync:
     """Keeps the portal keys (`u<id>-<n>`) in Gufo's key file equal to the keys of
     approved users with a positive balance. Other keys in the file are never touched.
 
-    `store` is the monitor's KeyStore; its sync_managed() rewrites the file atomically
-    under the store's lock. `model` returns the served model the keys are limited to,
-    or None while it is unknown (the key then allows every model until the next pass).
+    `store` is the monitor's KeyStore. Per-key restrictions live in the database;
+    an empty model list allows every inference model, including future served models.
     """
 
-    def __init__(self, db: Database, store, model):
+    def __init__(self, db: Database, store):
         self.db = db
         self.store = store
-        self.model = model
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
-    def reconcile(self) -> bool:
+    @staticmethod
+    def managed_name(name) -> bool:
+        return key_owner(name) is not None
+
+    def reconcile(self, *, strict=False) -> bool:
         """Returns whether the file changed. Errors are reported and retried later."""
         with self._lock:  # a stale pass must not overwrite a newer one
-            model = self.model()
-            models = [model] if isinstance(model, str) and model else []
-            wanted = {name: {"digest": digest, "models": models}
-                      for name, digest in self.db.wanted_keys().items()}
+            wanted = self.db.wanted_keys()
             try:
                 return self.store.sync_managed(wanted, lambda name: key_owner(name) is not None)
             except (OSError, ValueError) as error:
+                if strict:
+                    raise
                 print(f"gufo-monitor: billing key sync failed: {error}", file=sys.stderr)
                 return False
+
+    def admin_change(self, name: str, *, models=None, access="inference", revoke=False) -> bool:
+        """Change a database-owned key, serialized with reconciliation.
+
+        False means this is an ordinary file-owned key. Inactive managed keys can
+        still be edited; credit restores their stored restrictions, not file defaults.
+        """
+        with self._lock:
+            with self.db.write() as conn:
+                key = conn.execute("SELECT revoked FROM keys WHERE name=?", (name,)).fetchone()
+                if key is None:
+                    return False
+                if key["revoked"]:
+                    raise LookupError(name)
+                if revoke:
+                    keys = self.store.list()
+                    if len(keys) == 1 and keys[0]["name"] == name:
+                        raise ValueError("cannot remove the last key")
+                    conn.execute("UPDATE keys SET revoked=1 WHERE name=?", (name,))
+                else:
+                    if access != "inference":
+                        raise ValueError("portal-managed keys must have inference access")
+                    self.store._validated(name, access, models)
+                    conn.execute("UPDATE keys SET models=? WHERE name=?",
+                                 (json.dumps(models), name))
+            self.reconcile(strict=True)
+            return True
 
 
 class Meter:
