@@ -584,7 +584,9 @@ class ChatTest(BillingHarness):
         self.assertEqual(self.chat(cookie)[0], 401)  # not approved
         cookie, _, _ = self.approved_user("second@example.com")
         self.assertEqual(self.chat(cookie, csrf=False)[0], 403)
-        self.assertEqual(self.portal_call("GET", "/chat", cookie=cookie)[0], 200)
+        page = self.portal_call("GET", "/chat", cookie=cookie)[2]  # a user's chat is the same page
+        self.assertEqual(page.status, 200)
+        self.assertIn("connect-src 'self' https:;", page.getheader("Content-Security-Policy"))
         self.assertEqual(self.portal_call("GET", "/chat")[0], 303)
 
     def test_models_carry_the_prices_a_chat_is_billed_at(self):

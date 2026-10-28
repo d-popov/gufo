@@ -311,6 +311,13 @@ class MonitorHttpTest(unittest.TestCase):
         response, data = self.request("GET", "/chat", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(response.status, 200)
         self.assertIn(b'id="images" type="file"', data)
+        # Only the chat page may read https sites (its browser tools); no other page may.
+        self.assertIn("connect-src 'self' https:;", response.getheader("Content-Security-Policy"))
+        self.assertIn("script-src 'self';", response.getheader("Content-Security-Policy"))
+        for path in ("/monitor", "/", "/static/chat.js"):
+            other, _ = self.request("GET", path, {"X-Admin-Token": ADMIN_TOKEN})
+            self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
+        self.assertIn(b'src="/static/webtools.js"', data)
 
         payload = {
             "model": "fn",
@@ -362,7 +369,7 @@ class MonitorHttpTest(unittest.TestCase):
 
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
-                     "icons.js", "chat.js", "chat.css", "favicon.svg", "portal.js",
+                     "icons.js", "chat.js", "webtools.js", "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
             self.assertEqual(response.status, 200, name)

@@ -64,6 +64,7 @@ STATIC_FILES = {
     "favicon.svg": (STATIC_DIR, "image/svg+xml"),
     "portal.js": (PORTAL_STATIC_DIR, _JS),
     "wallet.js": (PORTAL_STATIC_DIR, _JS),
+    "webtools.js": (STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),
 }
 # Settings read from the environment or --env-file.
@@ -90,6 +91,13 @@ SECURITY_HEADERS = (
     ("Cross-Origin-Opener-Policy", "same-origin"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
 )
+# The chat page alone may also read https sites: its browser tools (static/webtools.js) make
+# the model's web requests from the user's browser, with no credentials. Every other page
+# keeps `connect-src 'self'`.
+CHAT_SECURITY_HEADERS = tuple(
+    (name, value.replace("connect-src 'self';", "connect-src 'self' https:;"))
+    if name == "Content-Security-Policy" else (name, value)
+    for name, value in SECURITY_HEADERS)
 
 # Series recorded once per poll; the page draws one sparkline per key.
 SERIES = (
@@ -1611,9 +1619,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"gufo-monitor: {self.command} {path} -> {code}", file=sys.stderr)
 
     def _send(self, status: int, body: bytes, content_type: str,
-              headers: tuple[tuple[str, str], ...] = (), cache: str = "no-store"):
+              headers: tuple[tuple[str, str], ...] = (), cache: str = "no-store",
+              security: tuple[tuple[str, str], ...] = SECURITY_HEADERS):
         self.send_response(status)
-        for name, value in SECURITY_HEADERS:
+        for name, value in security:
             self.send_header(name, value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -2014,8 +2023,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         until = self._admin_until()
         if until is None:
             if path in ("/chat", "/api/chat/models") and self._chat_user() is not None:
-                return (self._file(STATIC_DIR / "chat.html", "text/html; charset=utf-8")
-                        if path == "/chat" else self._chat_models())
+                return (self._chat_page() if path == "/chat" else self._chat_models())
             if path in ("/monitor", "/chat"):
                 return self._redirect("/")  # sign in through the profile menu
             if path.startswith("/api/"):
@@ -2024,7 +2032,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/monitor":
             return self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if path == "/chat":
-            return self._file(STATIC_DIR / "chat.html", "text/html; charset=utf-8")
+            return self._chat_page()
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
@@ -2056,6 +2064,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return self._json(404, b'{"error":"not_found"}')
         self._send(200, body, content_type, cache=cache)
+
+    def _chat_page(self):
+        try:
+            body = (STATIC_DIR / "chat.html").read_bytes()
+        except OSError:
+            return self._json(404, b'{"error":"not_found"}')
+        self._send(200, body, "text/html; charset=utf-8", security=CHAT_SECURITY_HEADERS)
 
     def _static(self, name: str):
         entry = STATIC_FILES.get(name)

@@ -38,6 +38,23 @@ server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images a
 the button or by pasting (Ctrl+V). The browser keeps the last 10 conversations; image
 bytes are not kept.
 
+The **Browser** switch (off by default, remembered) lets the model search the web and read
+pages. When it is on, the chat sends the model two tools, `web_search` and `fetch_url`, and
+a short system note, runs the tool calls itself, and sends what they found back until the
+model answers (at most six model calls per message). **Every web request is made by your
+browser; the inference server and the monitor fetch nothing.** A browser can only read a
+response when the site allows it (CORS), so `fetch_url` asks the site directly, without
+cookies, and works for Wikipedia, GitHub, Hacker News and other public APIs. A site that
+does not allow it, and every search, is read through the public reader
+[r.jina.ai](https://r.jina.ai) (DuckDuckGo Lite for search), which then sees that URL or
+query; those steps are labelled "via r.jina.ai" in the thread, and it limits anonymous use
+to about 20 requests a minute. Set `READER` to `''` in `static/webtools.js` to use only
+sites that allow direct reads (and no search). Local, private and IP-address URLs are never
+fetched, page text is marked as untrusted in the system note, and **Stop** cancels the reply
+and its requests. Only this page may connect to https sites (`connect-src 'self' https:`);
+every other page keeps `connect-src 'self'`. Each tool step costs a model call, so a
+browsing answer is billed for every call it made.
+
 ## Run
 
 ```sh
