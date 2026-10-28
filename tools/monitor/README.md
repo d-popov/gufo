@@ -23,6 +23,18 @@ share those polls: `GET /api/state` returns a snapshot with history, and
 `GET /api/stream` sends one Server-Sent Event per poll. The pages have no build step and
 load nothing from other hosts.
 
+The pages include a chat at `/chat` (**Chat** in the top menu) for the admin and, with
+`--billing-config`, for approved portal users with a positive balance. It sends text and
+image attachments through the monitor, so no API key reaches the browser. The admin chats
+with the monitor's `--gufo-key-file` key, which must allow inference (not `access=monitor`);
+without a usable key, chat shows Gufo's error. A user chats with a server-held **Web chat** key, derived from
+the admin token and listed with their keys, so those requests are metered and billed like
+any other. Replies stream as they are generated, with the model's thinking when it has
+any, and each reply shows its speed (tok/s), time to first token, token counts and, with
+`--billing-config`, its price at the model's rates (the admin sees list prices; only
+users are charged). The chat's running total is at the top. Images attach with the button
+or by pasting (Ctrl+V). The browser keeps the last 10 conversations; image bytes are not kept.
+
 ## Run
 
 ```sh

@@ -138,7 +138,7 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
 
     counters = {"prompt": 1000, "cached": 3000, "predicted": 500, "draft": 100, "accepted": 70}
     ready_status = 200
-
+    chat_request = None
     def log_message(self, *args):
         pass
 
@@ -178,6 +178,26 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
                     "llamacpp:requests_deferred 2\nllamacpp:kv_cache_usage_ratio 0.5\n")
             return self._reply(200, text.encode(), "text/plain")
         self._reply(404, {})
+
+    def do_POST(self):
+        if self.headers.get("Authorization") != "Bearer " + GUFO_KEY:
+            return self._reply(401, {"error": {"code": "invalid_api_key"}})
+        if self.path != "/v1/chat/completions":
+            return self._reply(404, {})
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).chat_request = request = json.loads(self.rfile.read(length))
+        if request.get("stream") is True:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for event in ('{"choices":[{"delta":{"content":"he"}}]}',
+                          '{"choices":[{"delta":{"content":"llo"}}]}', "[DONE]"):
+                self.wfile.write(f"data: {event}\n\n".encode())
+                self.wfile.flush()
+            return
+        return self._reply(200, {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })
 
     def _reply(self, status, body, content_type="application/json"):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -277,6 +297,7 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertIn(b'src="/static/app.js"', data)
         self.assertIn(b'src="/static/admin.js"', data)
         self.assertNotIn(b"<script>", data)
+
         # Without --billing-config the portal API is absent, not the monitor's.
         response, data = self.request("GET", "/api/portal/me")
         self.assertEqual((response.status, json.loads(data)["error"]), (404, "not_found"))
@@ -284,9 +305,65 @@ class MonitorHttpTest(unittest.TestCase):
             response, _ = self.request(method, "/login")
             self.assertIn(response.status, (401, 404), method)
 
+    def test_chat_page_and_admin_proxy(self):
+        response, _ = self.request("GET", "/chat")
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
+        response, data = self.request("GET", "/chat", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'id="images" type="file"', data)
+
+        payload = {
+            "model": "fn",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZmFrZQ=="}},
+            ]}],
+            "stream": False,
+        }
+        body = json.dumps(payload).encode()
+        response, data = self.request(
+            "POST", "/api/chat/completions",
+            {"Content-Type": "application/json", "Content-Length": str(len(body))},
+            body,
+        )
+        self.assertEqual(response.status, 401)
+        response, data = self.request(
+            "POST", "/api/chat/completions",
+            {"X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json",
+             "Content-Length": str(len(body))},
+            body,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(data)["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(FakeGufo.chat_request, payload)
+
+    def test_chat_streams_gufo_events_through(self):
+        payload = {"model": "fn", "stream": True,
+                   "stream_options": {"include_usage": True},
+                   "messages": [{"role": "user", "content": "hi"}]}
+        body = json.dumps(payload).encode()
+        response, data = self.request(
+            "POST", "/api/chat/completions",
+            {"X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json",
+             "Content-Length": str(len(body))},
+            body,
+        )
+        self.assertEqual((response.status, response.getheader("Content-Type")),
+                         (200, "text/event-stream"))
+        self.assertEqual(data.count(b"data: "), 3)
+        self.assertTrue(data.endswith(b"data: [DONE]\n\n"))
+        self.assertEqual(FakeGufo.chat_request, payload)  # stream options reach Gufo
+        self.assertNotIn(GUFO_KEY.encode(), data)
+
+    def test_chat_models_without_billing_have_no_prices(self):
+        response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(json.loads(data),
+                         {"models": ["fn", "fn-sub"], "pricing": None, "billed": False})
+
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
-                     "icons.js", "favicon.svg", "portal.js", "portal.css", "wallet.js"):
+                     "icons.js", "chat.js", "chat.css", "favicon.svg", "portal.js",
+                     "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
             self.assertEqual(response.status, 200, name)
         for path in ("/static/../gufo_monitor.py", "/static/%2e%2e/gufo_monitor.py",

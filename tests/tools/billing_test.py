@@ -554,6 +554,53 @@ class ManagedKeyAccessTest(BillingHarness):
             backend.server_close()
 
 
+class ChatTest(BillingHarness):
+    BODY = {"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}
+
+    def chat(self, cookie, **kwargs):
+        with mock.patch.object(self.monitor.gufo, "open_post",
+                               return_value=(200, io.BytesIO(b'{"choices":[]}'))) as sent:
+            status, _, _ = self.portal_call("POST", "/api/chat/completions", self.BODY,
+                                            cookie, **kwargs)
+        return status, sent
+
+    def test_user_chat_uses_one_server_held_billable_key(self):
+        cookie, user_id, _ = self.approved_user()  # signup grant gives a positive balance
+        status, sent = self.chat(cookie)
+        self.assertEqual(status, 200)
+        token = sent.call_args.kwargs["api_key"]
+        row = self.billing.db.keys(user_id)[0]
+        self.assertEqual((row["label"], row["digest"]),
+                         (gm.CHAT_KEY_LABEL, hashlib.sha256(token.encode()).hexdigest()))
+        self.assertRegex(row["name"], rf"u{user_id}-\d+")
+        self.assertIn(row["name"], self.keys_path.read_text())  # Gufo will log it, so it bills
+        self.assertNotIn(token, json.dumps(self.me(cookie)))
+        status, sent = self.chat(cookie)
+        self.assertEqual(sent.call_args.kwargs["api_key"], token)  # reused, not re-minted
+        self.assertEqual(len(self.billing.db.keys(user_id)), 1)
+
+    def test_chat_needs_an_approved_funded_user_and_the_portal_header(self):
+        cookie = self.signup_and_login()
+        self.assertEqual(self.chat(cookie)[0], 401)  # not approved
+        cookie, _, _ = self.approved_user("second@example.com")
+        self.assertEqual(self.chat(cookie, csrf=False)[0], 403)
+        self.assertEqual(self.portal_call("GET", "/chat", cookie=cookie)[0], 200)
+        self.assertEqual(self.portal_call("GET", "/chat")[0], 303)
+
+    def test_models_carry_the_prices_a_chat_is_billed_at(self):
+        self.monitor.models = [{"id": MODEL}, {"id": "other"}]
+        cookie, _, _ = self.approved_user()
+        status, payload, _ = self.portal_call("GET", "/api/chat/models", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["billed"])
+        self.assertEqual(payload["pricing"][MODEL],
+                         {"input": 1_000_000, "cached_input": 100_000, "output": 3_000_000})
+        self.assertEqual(set(payload["pricing"]), {MODEL, "other"})
+        admin = self.admin_call("GET", "/api/chat/models")[1]
+        self.assertFalse(admin["billed"])  # the admin sees prices but is not charged
+        self.assertEqual(admin["pricing"], payload["pricing"])
+
+
 class AccountFlowTest(BillingHarness):
     def test_signup_verify_approve_key_meter_cutoff_and_restore(self):
         cookie = self.signup_and_login()

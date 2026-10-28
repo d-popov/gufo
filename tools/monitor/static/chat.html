@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>AI Inference – Chat</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/header.css">
+  <link rel="stylesheet" href="/static/chat.css">
+  <script src="/static/icons.js" defer></script>
+  <script src="/static/header.js" defer></script>
+  <script src="/static/chat.js" defer></script>
+</head>
+<body>
+  <header id="site-header" class="site-header"></header>
+  <main>
+    <nav aria-label="Chat history">
+      <button id="new-chat" type="button">New chat</button>
+      <label for="history">Recent chats</label>
+      <select id="history" aria-label="Recent chats"></select>
+      <span id="chat-total" class="chat-total"></span>
+    </nav>
+    <section class="conversation" aria-label="Conversation">
+      <div id="messages"></div>
+    </section>
+    <form id="composer">
+      <label for="model">Model</label>
+      <select id="model" required></select>
+      <div id="preview" class="preview" aria-live="polite"></div>
+      <div class="compose-row">
+        <label class="attach" for="images">Attach images</label>
+        <input id="images" type="file" accept="image/*" multiple hidden>
+        <textarea id="prompt" rows="2" placeholder="Message Gufo… (Enter to send, Shift+Enter for a new line)"></textarea>
+        <button id="send" type="submit">Send</button>
+      </div>
+      <p id="status" role="status">Attach or paste (Ctrl+V) images up to 4 MiB each; chat history is saved in this browser.</p>
+    </form>
+  </main>
+</body>
+</html>

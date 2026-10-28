@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync('tools/monitor/portal_static/portal.js', 'utf8');
+const headerSource = fs.readFileSync('tools/monitor/static/header.js', 'utf8');
 const html = fs.readFileSync('tools/monitor/portal_static/index.html', 'utf8');
 assert.match(html, /id="auth-tab-admin"[^>]*\bhidden\b/);
 const nodes = new Map();
@@ -25,6 +26,27 @@ const context = vm.createContext({ $, document, setTimeout, window: { GufoHeader
 } }, showError: (id, error) => { $(id).hidden = !error; $(id).textContent = error || ''; } });
 vm.runInContext('let me = null; let portalEnabled = true;\n' + source.slice(
   source.indexOf('const AUTH_TABS'), source.indexOf('// ---------------------------------------------------------------- admin area')), context);
+const headerNodes = new Map();
+const headerContext = vm.createContext({
+  session: { admin: true }, user: null, portalEnabled: true,
+  $: (id) => {
+    if (!headerNodes.has(id)) headerNodes.set(id, {
+      hidden: false, classList: { toggle() {} }, replaceChildren() {},
+    });
+    return headerNodes.get(id);
+  },
+  fmtUsd: () => '$0.00', icon: () => ({}),
+});
+vm.runInContext(headerSource.slice(
+  headerSource.indexOf('function render()'),
+  headerSource.indexOf('function openMenu')), headerContext);
+vm.runInContext('render()', headerContext);
+assert.equal(headerNodes.get('menu-signin').hidden, true,
+  'admin session hides portal sign-in menu item');
+assert.equal(headerNodes.get('menu-signup').hidden, true,
+  'admin session hides portal sign-up menu item');
+assert.equal(headerNodes.get('menu-admin-signout').hidden, false,
+  'admin session keeps its sign-out action');
 const run = (code) => vm.runInContext(code, context);
 run('setUpAuthTabs(); syncAuth()');
 assert.equal($('auth-tab-admin').hidden, true, 'ordinary page hides Admin');
@@ -65,5 +87,9 @@ assert.equal($('auth').hidden, false, 'no-portal menu can open Admin');
   reply('Wrong admin token.');
   await pending;
   assert.equal($('admin-login-error').hidden, true, 'late failure cannot restore dismissed error');
+  run('window.GufoHeader.session.admin = true; adminWanted = false; syncAuth()');
+  assert.equal($('auth').hidden, true, 'admin session hides the welcome/login card');
+  assert.equal($('auth-tab-signin').hidden, true, 'admin session hides public sign-in');
+  assert.equal($('auth-tab-signup').hidden, true, 'admin session hides public sign-up');
   console.log('Admin visibility, card focus, dismissal, Escape, no-portal and late-submit checks passed.');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

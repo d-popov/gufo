@@ -14,7 +14,7 @@
 window.GufoHeader = (() => {
   // The product name in the brand and the page titles.
   const SITE_NAME = 'AI Inference';
-  const PAGES = { portal: 'Portal', monitor: 'Monitor' };
+  const PAGES = { portal: 'Portal', monitor: 'Monitor', chat: 'Chat' };
 
   const $ = (id) => document.getElementById(id);
   const icon = (name) => window.GufoIcons.svg(name);
@@ -59,7 +59,8 @@ window.GufoHeader = (() => {
   }
 
   function build() {
-    const page = window.location.pathname === '/monitor' ? 'monitor' : 'portal';
+    const page = window.location.pathname === '/monitor' ? 'monitor'
+      : window.location.pathname === '/chat' ? 'chat' : 'portal';
     document.title = `${SITE_NAME} – ${PAGES[page]}`;
     const link = (name, href, iconName) => {
       const node = el('a', { class: 'site-link', href }, icon(iconName), PAGES[name]);
@@ -69,6 +70,9 @@ window.GufoHeader = (() => {
     const monitorLink = link('monitor', '/monitor', 'activity');
     monitorLink.id = 'site-link-monitor';
     monitorLink.hidden = true;
+    const chatLink = link('chat', '/chat', 'messages-square');
+    chatLink.id = 'site-link-chat';
+    chatLink.hidden = true;
     const button = el('button', {
       type: 'button', id: 'profile-button', class: 'avatar anon', 'aria-haspopup': 'menu',
       'aria-expanded': 'false', 'aria-controls': 'profile-menu', 'aria-label': 'Account menu' });
@@ -93,7 +97,8 @@ window.GufoHeader = (() => {
     $('site-header').replaceChildren(
       el('div', { class: 'site-bar' },
         el('a', { class: 'brand', href: '/' }, icon('brand'), SITE_NAME),
-        el('nav', { class: 'site-nav', 'aria-label': 'Pages' }, link('portal', '/', 'wallet'), monitorLink),
+        el('nav', { class: 'site-nav', 'aria-label': 'Pages' },
+          link('portal', '/', 'wallet'), chatLink, monitorLink),
         el('div', { class: 'profile' }, button, menu)));
   }
 
@@ -109,8 +114,8 @@ window.GufoHeader = (() => {
       $('menu-status').textContent = USER_STATUS[user.status] ?? user.status;
       $('menu-balance').textContent = `Balance ${fmtUsd(user.balance_micro)}`;
     }
-    $('menu-signin').hidden = !!user || !portalEnabled;
-    $('menu-signup').hidden = !!user || !portalEnabled;
+    $('menu-signin').hidden = !!user || session.admin || !portalEnabled;
+    $('menu-signup').hidden = !!user || session.admin || !portalEnabled;
     $('menu-signout').hidden = !user;
     $('menu-admin-signin').hidden = session.admin;
     for (const id of ['menu-admin-info', 'menu-admin-accounts', 'menu-admin-keys']) {
@@ -121,6 +126,8 @@ window.GufoHeader = (() => {
     }
     $('menu-admin-signout').hidden = !session.admin;
     $('site-link-monitor').hidden = !session.admin;
+    $('site-link-chat').hidden = !(session.admin ||
+      (user && user.status === 'approved' && user.balance_micro > 0));
   }
 
   function openMenu(open) {

@@ -132,10 +132,9 @@ async function load() {
   await loadLedger();
 }
 
-// ---------------------------------------------------------------- sign-in card
 // One form at a time: Sign in (default), Sign up or Admin, also from ?signin, ?signup,
-// ?admin and the profile menu. Signed-in users see the card only when they ask for the
-// admin sign-in. Admin is temporary: leaving the whole card dismisses it.
+// ?admin and the profile menu. Authenticated accounts and admins do not see the welcome
+// form; an account can ask for the temporary admin sign-in from its profile menu.
 
 const AUTH_TABS = ['signin', 'signup', 'admin'];
 let authTab = 'signin';
@@ -144,14 +143,14 @@ let adminAttempt = 0;
 
 function authTabs() {
   return AUTH_TABS.filter((tab) => (tab === 'admin' ? adminWanted && !window.GufoHeader.session.admin
-    : portalEnabled && !me));
+    : portalEnabled && !me && !window.GufoHeader.session.admin));
 }
 
 function syncAuth() {
   const tabs = authTabs();
   for (const tab of AUTH_TABS) $(`auth-tab-${tab}`).hidden = !tabs.includes(tab);
   $('auth-intro').hidden = !tabs.includes('signin');
-  $('auth').hidden = !tabs.length || (!!me && !adminWanted);
+  $('auth').hidden = window.GufoHeader.session.admin || !tabs.length || (!!me && !adminWanted);
   showAuthTab(tabs.includes(authTab) ? authTab : tabs[0] ?? 'signin');
 }
 

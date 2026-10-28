@@ -1,0 +1,23 @@
+main { max-width: 900px; min-height: calc(100vh - 140px); margin: 0 auto; display: grid; grid-template-rows: auto minmax(200px, 1fr) auto; gap: var(--space-4); }
+nav[aria-label="Chat history"] { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-4); }
+nav[aria-label="Chat history"] label { margin-left: auto; }
+select, textarea, .attach { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 7px 12px; }
+.attach { display: inline-flex; align-items: center; cursor: pointer; }
+.attach:hover { background: var(--panel); }
+.conversation { overflow-y: auto; border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-4); background: var(--surface); }
+.message { max-width: 85%; margin: 8px 0 16px; padding: 12px 16px; border-radius: var(--radius); white-space: pre-wrap; overflow-wrap: anywhere; }
+.message.user { margin-left: auto; background: var(--accent-soft); }
+.message.assistant { background: var(--panel); }
+.message img, .preview img { display: block; max-width: min(100%, 320px); max-height: 240px; object-fit: contain; margin-top: 8px; border-radius: var(--radius-sm); }
+#composer { border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-3); background: var(--surface); }
+.preview { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.preview figure { position: relative; margin: 0; }
+.preview button { position: absolute; top: 2px; right: 2px; min-height: 0; padding: 0 6px; }
+.compose-row { display: flex; align-items: stretch; gap: 8px; }
+textarea { flex: 1; resize: vertical; min-width: 0; }
+#status { margin: 8px 0 0; color: var(--muted); font-size: var(--text-sm); }
+@media (max-width: 600px) { .compose-row { flex-wrap: wrap; } textarea { order: 3; flex-basis: 100%; } }
+.chat-total { color: var(--muted); font-size: var(--text-sm); }
+.message .meta { margin-top: 8px; color: var(--muted); font-size: var(--text-xs); }
+details.thinking { margin-bottom: 8px; color: var(--muted); font-size: var(--text-sm); }
+details.thinking summary { cursor: pointer; }

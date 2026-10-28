@@ -26,6 +26,7 @@ import collections
 import hashlib
 import hmac
 import http.server
+import io
 import ipaddress
 import json
 import math
@@ -48,6 +49,7 @@ HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
 PORTAL_STATIC_DIR = HERE / "portal_static"
 _JS, _CSS = "text/javascript; charset=utf-8", "text/css; charset=utf-8"
+CHAT_KEY_LABEL = "Web chat"  # the portal key the web chat uses for a user's own requests
 # /static/NAME, from either page's directory; a whitelist, so no paths or traversal.
 STATIC_FILES = {
     "app.js": (STATIC_DIR, _JS),
@@ -57,6 +59,8 @@ STATIC_FILES = {
     "header.js": (STATIC_DIR, _JS),
     "header.css": (STATIC_DIR, _CSS),
     "icons.js": (STATIC_DIR, _JS),
+    "chat.js": (STATIC_DIR, _JS),
+    "chat.css": (STATIC_DIR, _CSS),
     "favicon.svg": (STATIC_DIR, "image/svg+xml"),
     "portal.js": (PORTAL_STATIC_DIR, _JS),
     "wallet.js": (PORTAL_STATIC_DIR, _JS),
@@ -374,6 +378,24 @@ class GufoClient:
             finally:
                 error.close()
             return error.code, body
+
+    def open_post(self, path: str, body: bytes, timeout: float = 300.0,
+                  api_key: str | None = None):
+        """POST JSON to Gufo and return (status, response): a file-like object the caller
+        closes, holding the error body for a refused request too. Gufo unreachable is a
+        502. api_key replaces the monitor's own, which is how a user's chat is billed."""
+        headers = {**self._headers, "Content-Type": "application/json"}
+        if api_key is not None:
+            headers["Authorization"] = "Bearer " + api_key
+        request = urllib.request.Request(self.base_url + path, data=body,
+                                         headers=headers, method="POST")
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+            return response.status, response
+        except urllib.error.HTTPError as error:
+            return error.code, error
+        except (OSError, TimeoutError):
+            return 502, io.BytesIO(b'{"error":{"message":"Gufo is unreachable"}}')
 
     def get_json(self, path: str):
         status, body = self.get(path)
@@ -1492,6 +1514,10 @@ class AdminAuth:
         expires = int(time.time() if now is None else now) + ADMIN_COOKIE_MAX_AGE
         return f"{expires}.{self._sign(expires).decode()}"
 
+    def derive(self, purpose: str) -> str:
+        """A secret only this server can compute, for server-held credentials."""
+        return hmac.new(self._token, purpose.encode(), hashlib.sha256).hexdigest()
+
     def valid_until(self, headers, now: float | None = None) -> float | None:
         """Until when the request's admin credentials hold: forever for the token, the
         expiry of a valid session cookie, None without either."""
@@ -1625,6 +1651,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _admin(self) -> bool:
         """Admin access, which every monitor route needs."""
         return self._admin_until() is not None
+
+    def _chat_user(self):
+        billing = self.server.billing
+        if billing is None:
+            return None
+        session_id = next((
+            part.strip().partition("=")[2]
+            for part in self.headers.get("Cookie", "").split(";")
+            if part.strip().partition("=")[0] == "gufo_portal"
+        ), None)
+        user_id = billing.db.session_user(session_id) if session_id else None
+        user = billing.db.user(user_id) if user_id is not None else None
+        if user is None or user["status"] != "approved" or user["balance_micro"] <= 0:
+            return None
+        return user
 
     def _secure(self) -> bool:
         return self.server.secure_cookie or self.headers.get("X-Forwarded-Proto", "") == "https"
@@ -1860,12 +1901,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(404, "not_found")
         self._keys_change(method, name)
 
+    def _chat_key(self, user) -> tuple[str, bool]:
+        """The server-held key of a portal user's web chat, and whether it is new. Its
+        token is derived from the admin token, so nothing secret is stored; Gufo logs it
+        as u<id>-<n> and the meter bills that user."""
+        billing = self.server.billing
+        digest = lambda token: hashlib.sha256(token.encode()).hexdigest()  # noqa: E731
+        token_of = lambda name: "gufo-" + self.server.admin.derive("chat:" + name)  # noqa: E731
+        for row in billing.db.keys(user["id"]):
+            if row["label"] == CHAT_KEY_LABEL:
+                if digest(token_of(row["name"])) == row["digest"]:
+                    return token_of(row["name"]), False
+                billing.db.revoke_key(user["id"], row["name"])  # admin token changed
+        name = billing.db.add_key(user["id"], CHAT_KEY_LABEL, "0" * 64,
+                                  billing.config["max_keys_per_user"])
+        with billing.db.write() as conn:
+            conn.execute("UPDATE keys SET digest=? WHERE name=?",
+                         (digest(token_of(name)), name))
+        billing.reconcile()
+        return token_of(name), True
+
+    def _chat_models(self):
+        """Served models and, with billing, their prices (micro-USD per 1M tokens) so the
+        page can show what a chat costs. `billed` is false for the admin, who is not charged."""
+        ids = [model["id"] for model in self.server.monitor.models]
+        billing = self.server.billing
+        self._json(200, json.dumps({
+            "models": ids,
+            "pricing": None if billing is None else {
+                model: dict(billing.pricing.for_model(model)) for model in ids},
+            "billed": not self._admin(),
+        }).encode())
+
+    def _relay_stream(self, upstream):
+        """Pass Gufo's server-sent events on as they arrive. Leaving closes the upstream
+        connection, which cancels the generation when the browser goes away."""
+        self.send_response(200)
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for line in iter(upstream.readline, b""):
+                self.wfile.write(line)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+
+    def _chat_completion(self):
+        """The chat page's requests, sent with a key the server holds: the browser never
+        has one. The admin's go with the monitor's own key (--gufo-key-file), which must
+        allow inference; a portal user's go with their billed Web chat key."""
+        admin = self._admin()
+        user = None if admin else self._chat_user()
+        if user is None and not admin:
+            return self._error(401, "unauthorized")
+        if user is not None and self.headers.get("X-Gufo-Portal") != "1":
+            return self._error(403, "csrf")
+        body = self._read_json(12 << 20)
+        if body is None or not isinstance(body.get("messages"), list):
+            return self._error(400, "expected a JSON object with messages, at most 12 MiB")
+        try:
+            key, fresh = (None, False) if admin else self._chat_key(user)
+            payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+        except (TypeError, ValueError):
+            return self._error(400, "invalid chat request")
+        except Exception as error:
+            billing = self.server.billing
+            if billing is not None and isinstance(error, billing.Error):  # key limit
+                return self._error(error.status, error.message)
+            raise
+        if fresh:
+            time.sleep(1.5)  # Gufo re-reads its key file about once a second
+        status, upstream = self.server.monitor.gufo.open_post(
+            "/v1/chat/completions", payload, api_key=key)
+        try:
+            if status == 200 and body.get("stream") is True:
+                return self._relay_stream(upstream)
+            self._send(status, upstream.read(4 << 20), "application/json")
+        finally:
+            upstream.close()
+
     def do_PUT(self):
         self._mutation("PUT")
 
     def do_DELETE(self):
         self._mutation("DELETE")
 
+    def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path == "/api/chat/completions":
+            return self._chat_completion()
+        self._mutation("POST")
     # -- routes: / and /api/portal/* are public; /monitor and the rest of /api/ are the
     # admin's alone, apart from signing in and out and asking whether one is signed in
 
@@ -1883,19 +2013,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._admin_session()
         until = self._admin_until()
         if until is None:
-            if path == "/monitor":
-                return self._redirect("/")  # the admin signs in from the profile menu
+            if path in ("/chat", "/api/chat/models") and self._chat_user() is not None:
+                return (self._file(STATIC_DIR / "chat.html", "text/html; charset=utf-8")
+                        if path == "/chat" else self._chat_models())
+            if path in ("/monitor", "/chat"):
+                return self._redirect("/")  # sign in through the profile menu
             if path.startswith("/api/"):
                 return self._json(401, b'{"error":"unauthorized"}')
             return self._json(404, b'{"error":"not_found"}')
         if path == "/monitor":
             return self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        if path == "/chat":
+            return self._file(STATIC_DIR / "chat.html", "text/html; charset=utf-8")
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
             return self._stream(until)
         if path == "/api/stats/long":
             return self._long_stats()
+        if path == "/api/chat/models":
+            return self._chat_models()
         if path == "/api/admin/accounts":
             return self._accounts_get()
         if path == "/api/admin/pricing":
@@ -1912,8 +2049,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._keys_get()
         self._json(404, b'{"error":"not_found"}')
 
-    def do_POST(self):
-        self._mutation("POST")
 
     def _file(self, path: Path, content_type: str, cache: str = "no-store"):
         try:
