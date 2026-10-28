@@ -146,8 +146,8 @@ window.GufoAdmin = (() => {
     $('admin-keys-section').hidden = !keysAdmin;
     $('admin-keys-manage').hidden = !keysAdmin;
     renderModelChoices();
-    renderKeys();
     await loadAccounts();
+    renderKeys();
     await loadPricing();
     await loadUsage();
     await loadDeposits();
@@ -183,28 +183,51 @@ window.GufoAdmin = (() => {
       : reload.ok ? `Server loaded ${fmt(reload.keys, 0)} keys · ${fmtTime(reload.t)}`
         : `Server kept its previous keys: ${reload.reason} · ${fmtTime(reload.t)}`;
     $('admin-keys-reload').className = reload && !reload.ok ? 'bad' : 'muted';
-    const rows = keys.map((key) => {
-      const used = usage[key.name] ?? {};
-      const actions = el('td');
-      if (keysAdmin) {
-        const edit = el('button', { type: 'button', class: 'link with-icon' }, window.GufoIcons.svg('pencil'), 'Edit');
-        edit.addEventListener('click', () => startEdit(key));
-        const revoke = el('button', { type: 'button', class: 'link danger with-icon' }, window.GufoIcons.svg('trash'), 'Revoke');
-        revoke.addEventListener('click', () => revokeKey(key.name));
-        actions.append(edit, ' ', revoke);
-      }
-      return el('tr', {},
-        el('td', {}, key.name),
-        el('td', {}, key.access === 'monitor' ? 'Monitoring' : 'Inference'),
-        el('td', {}, key.access === 'monitor' ? '—' : key.models.length ? key.models.join(', ') : 'All'),
-        el('td', { class: 'num' }, fmt(used.requests ?? 0, 0)),
-        el('td', { class: 'num' }, fmt(used.prompt_tokens ?? 0, 0)),
-        el('td', { class: 'num' }, fmt(used.cached_tokens ?? 0, 0)),
-        el('td', { class: 'num' }, fmt(used.generated_tokens ?? 0, 0)),
-        el('td', { class: used.errors ? 'num bad' : 'num' }, fmt(used.errors ?? 0, 0)),
-        el('td', {}, used.last_t ? fmtTime(used.last_t) : '—'),
-        actions);
+    const users = new Map((accounts?.accounts ?? []).map((account) => [String(account.id), account]));
+    const groups = new Map();
+    for (const key of keys) {
+      const match = /^u(\d{1,18})-(\d{1,9})$/.exec(key.name);
+      const group = match ? `user:${match[1]}` : 'server';
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push(key);
+    }
+    const ordered = [...groups].sort(([a], [b]) => {
+      if (a === 'server') return 1;
+      if (b === 'server') return -1;
+      const aId = a.slice(5);
+      const bId = b.slice(5);
+      return aId.length - bId.length || aId.localeCompare(bId);
     });
+    const rows = [];
+    for (const [group, groupKeys] of ordered) {
+      const userId = group.startsWith('user:') ? group.slice(5) : null;
+      const user = userId === null ? null : users.get(userId);
+      const heading = userId === null ? 'Owner / server keys'
+        : `User #${userId} · ${user?.email ?? 'portal user'}`;
+      rows.push(el('tr', { class: 'group' }, el('td', { colspan: '10' }, heading)));
+      for (const key of groupKeys) {
+        const used = usage[key.name] ?? {};
+        const actions = el('td');
+        if (keysAdmin) {
+          const edit = el('button', { type: 'button', class: 'link with-icon' }, window.GufoIcons.svg('pencil'), 'Edit');
+          edit.addEventListener('click', () => startEdit(key));
+          const revoke = el('button', { type: 'button', class: 'link danger with-icon' }, window.GufoIcons.svg('trash'), 'Revoke');
+          revoke.addEventListener('click', () => revokeKey(key.name));
+          actions.append(edit, ' ', revoke);
+        }
+        rows.push(el('tr', {},
+          el('td', {}, key.name),
+          el('td', {}, key.access === 'monitor' ? 'Monitoring' : 'Inference'),
+          el('td', {}, key.access === 'monitor' ? '—' : key.models.length ? key.models.join(', ') : 'All'),
+          el('td', { class: 'num' }, fmt(used.requests ?? 0, 0)),
+          el('td', { class: 'num' }, fmt(used.prompt_tokens ?? 0, 0)),
+          el('td', { class: 'num' }, fmt(used.cached_tokens ?? 0, 0)),
+          el('td', { class: 'num' }, fmt(used.generated_tokens ?? 0, 0)),
+          el('td', { class: used.errors ? 'num bad' : 'num' }, fmt(used.errors ?? 0, 0)),
+          el('td', {}, used.last_t ? fmtTime(used.last_t) : '—'),
+          actions));
+      }
+    }
     if (!rows.length) {
       rows.push(el('tr', {}, el('td', { colspan: '10', class: 'muted' }, 'No keys in the file.')));
     }
