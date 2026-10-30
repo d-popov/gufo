@@ -1139,9 +1139,16 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
               "restore into a populated draft table differs from a fresh "
               "session");
       // The restored Thai table keeps drafting through the small head.
-      // Greedy lookup may copy every chain; sampled cycles always draft.
-      Require(pair != &thai_snapshot || (use.small_head == use.drafting &&
-                                         (!sampled || use.drafting > 0)),
+      // Greedy lookup may copy every chain. A sampled run commits up to a
+      // full chain per cycle, and where it goes depends on the seed: it can
+      // reach a rare token the table does not hold, and that cycle drafts
+      // through the full head. Seeds 91-100 leave the small head in 4 of 10
+      // runs, and before the confidence gate (#882) in 1 of 10. So a sampled
+      // restore must use the small head, not every cycle of one trajectory;
+      // fresh and restored sessions are already required to agree above.
+      Require(pair != &thai_snapshot ||
+                  (sampled ? use.small_head > 0 && use.drafting > 0
+                           : use.small_head == use.drafting),
               "a restored draft table left the small head");
       RequireExact(fresh->Logits(), used->Logits(),
                    "restore into a populated draft table changed logits");
