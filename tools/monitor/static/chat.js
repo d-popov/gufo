@@ -11,7 +11,14 @@ const NEW_PROJECT = '__new';
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const $ = (id) => document.getElementById(id);
 const fmtUsd = window.GufoHeader.fmtUsd;
-const Projects = window.GufoProjects;
+// Without projects.js the chat still works, with no project text.
+const Projects = window.GufoProjects ?? {
+  MEMORY_MAX: 0, GUIDELINES_MAX: 0, context: () => null, unsummarized: () => false,
+  systemMessage: (...texts) => {
+    const parts = texts.filter((text) => typeof text === 'string' && text.trim());
+    return parts.length ? { role: 'system', content: parts.join('\n\n') } : null;
+  },
+};
 
 // The page header first, so it is there whatever fails below.
 window.GufoHeader.init();
@@ -51,12 +58,23 @@ function plainChat(chat) {
 function saveChat(chat) { store.put('chats', plainChat(chat)).catch(failedToSave); }
 function saveProject(project) { project.updated = Date.now(); store.put('projects', { ...project }).catch(failedToSave); }
 
+// What stands in for the browser database when chatstore.js did not load.
+function volatileStore() {
+  const tables = { chats: new Map(), projects: new Map() };
+  return {
+    persistent: false,
+    getAll: async (table) => [...tables[table].values()],
+    put: async (table, value) => { tables[table].set(value.id, structuredClone(value)); },
+    remove: async (table, id) => { tables[table].delete(id); },
+  };
+}
+
 async function loadStore() {
-  store = await window.GufoStore.open();
-  if (!store.persistent) $('status').textContent = 'This browser blocks storage: chats last until you close the page.';
+  store = window.GufoStore ? await window.GufoStore.open() : volatileStore();
+  if (!store.persistent && window.GufoStore) $('status').textContent = 'This browser blocks storage: chats last until you close the page.';
   [chats, projects] = await Promise.all([store.getAll('chats'), store.getAll('projects')]);
   // The first version kept 10 chats in localStorage; move them over once.
-  chats.push(...await window.GufoStore.migrate(store, localStorage, OLD_STORAGE_KEY, chats));
+  if (window.GufoStore) chats.push(...await window.GufoStore.migrate(store, localStorage, OLD_STORAGE_KEY, chats));
   chats = chats.filter((chat) => chat && typeof chat.id === 'string' && Array.isArray(chat.messages));
   if (scope && !projects.some((project) => project.id === scope)) scope = '';
 }
@@ -965,33 +983,57 @@ $('tools').addEventListener('focusout', (event) => {
   if (event.relatedTarget && !$('tools').contains(event.relatedTarget)) setToolsOpen(false);
 });
 
+// Fills the model chooser, and asks again every few seconds until a model is listed: a monitor
+// that was just started, or one that cannot reach Gufo yet, fills the chooser by itself instead
+// of leaving it empty until the page is reloaded.
+let modelRetry = null;
+let modelNote = '';  // the status text this loader wrote, so it never erases another message
+function noteModels(text) {
+  const status = $('status');
+  if (status.textContent === '' || status.textContent === modelNote) status.textContent = text;
+  modelNote = text;
+}
+
 async function loadModels() {
+  clearTimeout(modelRetry);
+  let found = 0;
   try {
     const response = await fetch('/api/chat/models');
-    if (!response.ok) throw new Error('Could not load served models.');
+    if (!response.ok) throw new Error(`Could not load served models (${response.status}).`);
     const data = await response.json();
     prices = data.pricing;
     billed = data.billed;
     pythonInstalled = Boolean(data.python);
-    renderToolsMenu();
+    found = data.models.length;
     const select = $('model');
-    for (const id of data.models) {
+    const chosen = select.value;
+    select.replaceChildren(...data.models.map((id) => {
       const option = document.createElement('option');
       option.value = id;
       option.textContent = id;
-      select.append(option);
-    }
-    if (!data.models.length) $('status').textContent = 'No served model found yet; wait for the monitor to discover it.';
+      return option;
+    }));
+    if (data.models.includes(chosen)) select.value = chosen;
+    noteModels(found ? '' : 'No served model found yet; trying again…');
+    renderToolsMenu();
     renderTotal();
     renderMessages();
-  } catch (error) { $('status').textContent = error.message; }
+  } catch (error) { noteModels(`${error.message} Trying again…`); }
+  if (!found) modelRetry = setTimeout(loadModels, 5000);
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('model').value) loadModels(); });
 
 (async () => {
+  loadModels();  // first and on its own: nothing below may keep the model list from loading
+  if (!window.GufoProjects || !window.GufoStore) {
+    $('project').hidden = true;
+    $('status').textContent = 'Projects did not load (restart the monitor so it serves the new scripts).';
+  }
   try { await loadStore(); } catch { $('status').textContent = 'Could not read the saved chats from this browser.'; }
-  renderProjectList();
-  activeId = scoped()[0]?.id ?? null;
-  if (activeId) showChat(activeId); else newChat();
-  renderToolsMenu();
-  loadModels();
+  try {
+    renderProjectList();
+    activeId = scoped()[0]?.id ?? null;
+    if (activeId) showChat(activeId); else newChat();
+    renderToolsMenu();
+  } catch (error) { $('status').textContent = `The chat could not start: ${error.message}`; }
 })();

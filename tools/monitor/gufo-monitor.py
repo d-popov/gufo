@@ -589,7 +589,8 @@ class Monitor:
         slots: list[dict] = []
         slots_t = t
         if status["state"] == "ready":
-            if t - self.info_t >= self.info_every_s or self.status["state"] != "ready":
+            # With no model known the list is asked for again every poll, not every info_every_s.
+            if t - self.info_t >= self.info_every_s or self.status["state"] != "ready" or not self.models:
                 self._poll_info()
                 self.info_t = t
             slots = self._poll_slots()
@@ -637,6 +638,11 @@ class Monitor:
         try:
             listing = self.gufo.get_json("/v1/models")
         except OSError:
+            return
+        if listing is None:
+            # A refusal (a rejected key, a connection limit, a reload) says nothing about what is
+            # served. Keep the last list: replacing it with nothing empties the chat's model
+            # chooser until the next refresh.
             return
         models = []
         if isinstance(listing, dict) and isinstance(listing.get("data"), list):

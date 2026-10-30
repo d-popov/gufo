@@ -139,6 +139,7 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
 
     counters = {"prompt": 1000, "cached": 3000, "predicted": 500, "draft": 100, "accepted": 70}
     ready_status = 200
+    models_status = 200
     chat_request = None
     def log_message(self, *args):
         pass
@@ -152,6 +153,8 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
                 return self._reply(503, {"error": {"code": "loading"}})
             return self._reply(200, {"status": "ready", "model": "fn"})
         if path == "/v1/models":
+            if self.models_status != 200:
+                return self._reply(self.models_status, {"error": {"code": "overloaded"}})
             return self._reply(200, {"data": [{"id": "fn", "context_length": 262144},
                                               {"id": "fn-sub", "context_length": 65536}]})
         if path == "/props":
@@ -522,6 +525,22 @@ class AdminChatKeyTest(unittest.TestCase):
 
 
 class GufoStatusTest(unittest.TestCase):
+    def test_refused_model_list_keeps_the_last_one(self):
+        gufo = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeGufo))
+        try:
+            monitor = gm.Monitor(gm.GufoClient(f"http://127.0.0.1:{gufo.server_address[1]}", GUFO_KEY),
+                                 NoTelemetry())
+            monitor.poll_once(1.0)
+            self.assertEqual([m["id"] for m in monitor.models], ["fn", "fn-sub"])
+            for refusal in (503, 401, 429):
+                FakeGufo.models_status = refusal
+                monitor._poll_info()
+                self.assertEqual([m["id"] for m in monitor.models], ["fn", "fn-sub"], refusal)
+        finally:
+            FakeGufo.models_status = 200
+            gufo.shutdown()
+            gufo.server_close()
+
     def test_wrong_key_unreachable_and_loading(self):
         gufo = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeGufo))
         url = f"http://127.0.0.1:{gufo.server_address[1]}"
