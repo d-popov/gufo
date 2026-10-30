@@ -33,6 +33,26 @@
     });
   }
 
+  // Moves chats an older version kept in `storage` under `key` into the store, skipping ids it
+  // already has, and returns them. The old copy is deleted only once every chat is committed to
+  // a store that survives the page: with the browser database unavailable, or any write refused,
+  // it stays where it is for the next visit.
+  async function migrate(store, storage, key, existing = []) {
+    try {
+      const old = JSON.parse(storage.getItem(key) || '[]');
+      if (!Array.isArray(old)) return [];
+      const known = new Set(existing.map((chat) => chat.id));
+      const moved = [];
+      for (const chat of old) {
+        if (!chat || typeof chat.id !== 'string' || !Array.isArray(chat.messages) || known.has(chat.id)) continue;
+        await store.put('chats', chat);
+        moved.push(chat);
+      }
+      if (store.persistent) storage.removeItem(key);
+      return moved;
+    } catch { return []; }  // unreadable or refused: the old copy stays
+  }
+
   async function open() {
     let db = null;
     try { db = await openDatabase(); } catch { db = null; }
@@ -53,5 +73,5 @@
     };
   }
 
-  window.GufoStore = { open };
+  window.GufoStore = { open, migrate };
 })();

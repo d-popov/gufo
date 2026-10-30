@@ -56,18 +56,7 @@ async function loadStore() {
   if (!store.persistent) $('status').textContent = 'This browser blocks storage: chats last until you close the page.';
   [chats, projects] = await Promise.all([store.getAll('chats'), store.getAll('projects')]);
   // The first version kept 10 chats in localStorage; move them over once.
-  try {
-    const old = JSON.parse(localStorage.getItem(OLD_STORAGE_KEY) || '[]');
-    if (Array.isArray(old) && old.length) {
-      const known = new Set(chats.map((chat) => chat.id));
-      for (const chat of old) {
-        if (!chat || typeof chat.id !== 'string' || !Array.isArray(chat.messages) || known.has(chat.id)) continue;
-        chats.push(chat);
-        await store.put('chats', chat);
-      }
-    }
-    localStorage.removeItem(OLD_STORAGE_KEY);
-  } catch { /* unreadable or storage refused: the old copy stays where it is */ }
+  chats.push(...await window.GufoStore.migrate(store, localStorage, OLD_STORAGE_KEY, chats));
   chats = chats.filter((chat) => chat && typeof chat.id === 'string' && Array.isArray(chat.messages));
   if (scope && !projects.some((project) => project.id === scope)) scope = '';
 }
