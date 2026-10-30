@@ -244,7 +244,7 @@ Choose 1024/8 for prefill speed equal to the default with about 4.6 times its
 decode speed beside a prefill, or 2048/16 for about 14% faster prefill and the
 same decode speed at the cost of longer pauses. 1024/4 and 2048/8 favor prefill,
 for code agents that mostly read. One run each, Flash-Next MTP only; the
-defaults stay 512/1 for models not measured. `tools/bench/prefill-decode-sweep.py` repeats the measurement for any `--prefill-chunk` × `--decode-rounds` grid: it starts one private server per setting from a command you give it, so stop other GPU users first.
+defaults stay 512/1 for models not measured. `tools/bench/prefill-decode-sweep.py` repeats the measurement for any `--prefill-chunk` × `--decode-rounds` grid: it starts one private server per setting from a command you give it, so stop other GPU users first. With session classes pass `--model` for a class with at least two slots (the sweep refuses a one-slot class, where the arrival would queue behind the decoding stream) and read the result for that shape.
 
 Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
 hash and exact encoded-byte comparison under the preprocessing version and

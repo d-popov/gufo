@@ -10,6 +10,12 @@ private server per setting, so nothing else may use the GPU.
 The server is launched from `--serve-cmd`, a shell command with `{port}`, `{chunk}` and
 `{rounds}` placeholders, so the caller supplies the container and the exact production flags.
 Each server is stopped with `--stop-cmd` when given, else by ending its process group.
+
+Both requests go to one session class, which must have at least two slots: with one slot the
+arrival would queue behind the decoding stream and nothing interleaves. Servers with session
+classes need `--model` (for Flash-Next production: `--model qwen3.8-flash-next-sub`, the 3-slot
+class where concurrent agents run); a server with one model needs nothing. The class, its slots
+and its context are recorded with every setting, because the best setting depends on that shape.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_GRID = "512x1,1024x4,1024x8,1024x16,2048x8,2048x16,4096x16"
@@ -141,6 +148,29 @@ def wait_ready(port: int, process: subprocess.Popen, timeout: float) -> None:
     raise RuntimeError("server was not ready in time")
 
 
+def get_json(port: int, path: str):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=30) as reply:
+        return json.load(reply)
+
+
+def select_class(port: int, wanted: str | None, min_slots: int) -> dict:
+    """The model (session class) both requests use, and the shape being tuned."""
+    served = [m["id"] for m in get_json(port, "/v1/models").get("data", []) if isinstance(m.get("id"), str)]
+    if wanted is None and len(served) > 1:
+        raise RuntimeError(f"the server has several session classes {served}: choose one with --model")
+    if wanted is not None and wanted not in served:
+        raise RuntimeError(f"--model {wanted!r} is not served; the server lists {served}")
+    model = wanted or (served[0] if served else None)
+    query = f"?model={urllib.parse.quote(model, safe='')}" if model and len(served) > 1 else ""
+    props = get_json(port, "/props" + query)
+    slots = props.get("total_slots")
+    context = (props.get("default_generation_settings") or {}).get("n_ctx")
+    if not isinstance(slots, int) or slots < min_slots:
+        raise RuntimeError(f"class {model!r} has {slots} slot(s); the arrival would queue behind the "
+                           f"decoding stream. Use a class with at least {min_slots}, or --min-slots 1 to measure queueing")
+    return {"model": model, "slots": slots, "context": context}
+
+
 def calibrate(port: int, model: str | None, target_tokens: int) -> int:
     """Words per prompt that reach about `target_tokens`, from one small request."""
     probe = Stream(port, filler(1, 3000), 1, model).start().join()
@@ -197,10 +227,13 @@ def run_setting(args, chunk: int, rounds: int, log_dir: Path) -> dict:
         wait_ready(port, process, args.ready_timeout)
         entry = {"prefill_chunk": chunk, "decode_rounds": rounds,
                  "ready_s": time.monotonic() - started, "command": command}
-        words = calibrate(port, args.model, args.prompt_tokens)
+        shape = select_class(port, args.model, args.min_slots)
+        entry["shape"] = {**shape, "streams": "1 decoding + 1 cold arrival, same class",
+                          "prompt_tokens": args.prompt_tokens}
+        words = calibrate(port, shape["model"], args.prompt_tokens)
         # One untimed pass warms kernels and allocators, so the first setting is not penalized.
-        measure(port, args.model, max(words // 8, 100), 900, 200)
-        samples = [measure(port, args.model, words, 1000 * (i + 1), args.decode_tokens)
+        measure(port, shape["model"], max(words // 8, 100), 900, 200)
+        samples = [measure(port, shape["model"], words, 1000 * (i + 1), args.decode_tokens)
                    for i in range(args.repetitions)]
         for key in samples[0]:
             values = [s[key] for s in samples]
@@ -241,7 +274,10 @@ def main(argv=None) -> int:
                              "--decode-rounds {rounds}")
     parser.add_argument("--stop-cmd", help="shell command that stops the server, with {port}")
     parser.add_argument("--grid", default=DEFAULT_GRID, help=f"CHUNKxROUNDS list (default {DEFAULT_GRID})")
-    parser.add_argument("--model", help="model name in the request, when the server needs one")
+    parser.add_argument("--model", help="session class both requests use (required when the server has "
+                                        "several, as production does: qwen3.8-flash-next-sub)")
+    parser.add_argument("--min-slots", type=int, default=2,
+                        help="refuse a class with fewer slots, where the arrival queues (default 2)")
     parser.add_argument("--port", type=int, default=18234)
     parser.add_argument("--prompt-tokens", type=int, default=37600, help="cold prompt length")
     parser.add_argument("--decode-tokens", type=int, default=6000,
@@ -269,7 +305,10 @@ def main(argv=None) -> int:
         args.out.write_text(json.dumps({"date": time.strftime("%Y-%m-%d %H:%M:%S"), "entries": entries}, indent=1))
     good = [e for e in entries if "error" not in e]
     if good:
-        print("\n" + table(good))
+        shape = good[0]["shape"]
+        print(f"\nShape: class {shape['model']} ({shape['slots']} slots, context {shape['context']}); "
+              f"{shape['streams']}; cold prompt about {shape['prompt_tokens']} tokens.\n")
+        print(table(good))
     return 0 if len(good) == len(entries) else 1
 
 
