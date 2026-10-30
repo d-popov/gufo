@@ -647,51 +647,159 @@ const MAX_ROUNDS = 6;  // model calls per message with tools on; the last one ge
 // POSTs the chat and reads Gufo's server-sent events: onDelta gets each delta ({content,
 // reasoning_content, tool_calls}); the usage and timings chunks and the assembled tool calls
 // come back at the end.
+//
+// The monitor writes the reply in a run that goes on without this connection. A phone that puts
+// the page in the background, or loses its network for a while, therefore comes back and reads
+// the rest: the stream is reattached at the number of events already taken. Only Stop (the
+// caller's signal) ends a run early. A stream that stays silent for STALL_MS while the page is
+// visible, or that was left in the background for AWAY_MS, is replaced the same way.
+const RESUME_PAUSES_MS = [500, 1000, 2000, 4000, 8000];
+const RESUME_TRIES = 30;
+const STALL_MS = 45000;
+const AWAY_MS = 3000;
+
+let link = null;     // the abort handle of the connection being read
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (link && hiddenAt && Date.now() - hiddenAt >= AWAY_MS) link.abort();  // read it again, from where we were
+  hiddenAt = 0;
+});
+
+function whenVisible() {
+  if (!document.hidden) return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => {
+      if (document.hidden) return;
+      document.removeEventListener('visibilitychange', check);
+      resolve();
+    };
+    document.addEventListener('visibilitychange', check);
+  });
+}
+
+function cancelRun(id) {
+  fetch(`/api/chat/runs/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST', headers: { 'X-Gufo-Portal': '1' }, keepalive: true,
+  }).catch(() => {});
+}
+
+function stopped() { return new DOMException('The reply was stopped.', 'AbortError'); }
+function fatal(message) { return Object.assign(new Error(message), { fatal: true }); }
+
 async function streamCompletion({ model, messages, effort, tools, signal, onDelta }) {
-  const response = await fetch('/api/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Gufo-Portal': '1' }, signal,
+  const result = { usage: null, timings: null, toolCalls: [] };
+  let runId = null;
+  let handled = 0;      // events of the reply taken so far
+  let finished = false;
+
+  const take = (event) => {
+    const lines = event.split('\n').filter((line) => line.startsWith('data:'));
+    if (!lines.length) return;  // a keepalive comment
+    handled += 1;
+    for (const line of lines) {
+      const data = line.slice(5).trim();
+      if (!data) continue;
+      if (data === '[DONE]') { finished = true; continue; }
+      let chunk;
+      try { chunk = JSON.parse(data); } catch { throw fatal('The server sent a reply that could not be read.'); }
+      if (chunk.error) throw fatal(chunk.error.message || 'The server reported an error.');
+      const delta = chunk.choices?.[0]?.delta;
+      if (delta) {
+        for (const part of delta.tool_calls ?? []) {
+          const call = (result.toolCalls[part.index ?? 0] ??= { id: '', name: '', arguments: '' });
+          if (part.id) call.id = part.id;
+          if (part.function?.name) call.name = part.function.name;
+          call.arguments += part.function?.arguments ?? '';
+        }
+        onDelta(delta);
+      }
+      if (chunk.usage) result.usage = chunk.usage;
+      if (chunk.timings) result.timings = chunk.timings;
+    }
+  };
+
+  // One connection to the reply: the first POST, or a reattachment. `connection` aborts it
+  // when the page returns from the background or the stream goes quiet, and when Stop is pressed.
+  const connect = (url, init) => {
+    const connection = new AbortController();
+    link = connection;
+    if (signal?.aborted) connection.abort();
+    else signal?.addEventListener('abort', () => connection.abort(), { once: true });
+    return { connection, response: fetch(url, { ...init, signal: connection.signal }) };
+  };
+
+  const failure = async (response) => {
+    let detail;
+    try { const body = await response.json(); detail = body.error?.message || body.error || body.message; } catch { /* not JSON */ }
+    return fatal(detail || `Request failed (${response.status})`);
+  };
+
+  const read = async (connection, response) => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let lastByte = Date.now();
+    const watchdog = setInterval(() => {
+      if (!document.hidden && Date.now() - lastByte > STALL_MS) connection.abort();
+    }, 5000);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        lastByte = Date.now();
+        buffer += decoder.decode(value, { stream: true });
+        let end;
+        while ((end = buffer.indexOf('\n\n')) >= 0) {
+          const event = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          take(event);
+        }
+      }
+    } finally { clearInterval(watchdog); }
+  };
+
+  const reattach = async () => {
+    for (let attempt = 0; attempt < RESUME_TRIES; attempt++) {
+      await whenVisible();
+      await new Promise((resolve) => setTimeout(resolve, RESUME_PAUSES_MS[Math.min(attempt, RESUME_PAUSES_MS.length - 1)]));
+      if (signal?.aborted) throw stopped();
+      const { connection, response } = connect(`/api/chat/runs/${encodeURIComponent(runId)}?from=${handled}`, {});
+      try {
+        const reply = await response;
+        if (reply.ok) return { connection, reply };
+        if (reply.status === 401 || reply.status === 404) throw fatal('The connection was lost and the reply could not be continued.');
+      } catch (error) {
+        if (error.fatal) throw error;
+        if (signal?.aborted) throw stopped();
+      }
+    }
+    throw fatal('The connection was lost and could not be restored.');
+  };
+
+  let { connection, response: pending } = connect('/api/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Gufo-Portal': '1' },
     body: JSON.stringify({
       model, messages, stream: true, stream_options: { include_usage: true },
       ...(effort ? { reasoning_effort: effort } : {}),
       ...(tools ? { tools } : {}),
-    })
+    }),
   });
-  if (!response.ok) {
-    let detail;
-    try { const body = await response.json(); detail = body.error?.message || body.error || body.message; } catch { /* not JSON */ }
-    throw new Error(detail || `Request failed (${response.status})`);
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const result = { usage: null, timings: null, toolCalls: [] };
-  let buffer = '';
+  let response = await pending;
+  if (!response.ok) throw await failure(response);
+  runId = response.headers.get('X-Gufo-Run');
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let end;
-    while ((end = buffer.indexOf('\n\n')) >= 0) {
-      const event = buffer.slice(0, end);
-      buffer = buffer.slice(end + 2);
-      for (const line of event.split('\n')) {
-        if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (!data || data === '[DONE]') continue;
-        const chunk = JSON.parse(data);
-        if (chunk.error) throw new Error(chunk.error.message || 'The server reported an error.');
-        const delta = chunk.choices?.[0]?.delta;
-        if (delta) {
-          for (const part of delta.tool_calls ?? []) {
-            const call = (result.toolCalls[part.index ?? 0] ??= { id: '', name: '', arguments: '' });
-            if (part.id) call.id = part.id;
-            if (part.function?.name) call.name = part.function.name;
-            call.arguments += part.function?.arguments ?? '';
-          }
-          onDelta(delta);
-        }
-        if (chunk.usage) result.usage = chunk.usage;
-        if (chunk.timings) result.timings = chunk.timings;
+    try {
+      await read(connection, response);
+      if (finished) break;
+      throw new TypeError('The reply stream ended early.');
+    } catch (error) {
+      if (signal?.aborted) {
+        if (runId) cancelRun(runId);
+        throw stopped();
       }
+      if (error.fatal || !runId) throw error;
+      ({ connection, reply: response } = await reattach());
     }
   }
   result.toolCalls = result.toolCalls.filter(Boolean);

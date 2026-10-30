@@ -38,7 +38,11 @@ conversation. **Thinking** sets the model's reasoning effort (Default leaves it 
 server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images attach with
 the button or by pasting (Ctrl+V). The browser keeps every conversation in its own database
 (IndexedDB), with no limit but the browser's quota and nothing stored on the monitor; the
-chat list shows the 200 most recent of the open project. **Delete** removes the open chat,
+chat list shows the 200 most recent of the open project. A reply keeps being written when the page goes to the background or loses its network (a phone
+switching apps): the monitor generates it in a run that does not depend on the browser's connection,
+and the page reads the rest when it is back, from the event where it stopped. **Stop** ends the run
+and the generation; a run nobody has read for three minutes is stopped too, and a finished one stays
+readable for ten (kept in the monitor's memory only, for the user who started it). **Delete** removes the open chat,
 after a second click to confirm. Image bytes are not kept. Moving to another browser or
 device does not bring the chats along: use a project's Export for its notes.
 

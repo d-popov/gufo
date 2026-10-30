@@ -139,6 +139,7 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
 
     counters = {"prompt": 1000, "cached": 3000, "predicted": 500, "draft": 100, "accepted": 70}
     ready_status = 200
+    slow = {}  # per slow request: pieces sent, and whether the monitor hung up
     models_status = 200
     chat_request = None
     def log_message(self, *args):
@@ -190,6 +191,23 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
             return self._reply(404, {})
         length = int(self.headers.get("Content-Length", "0"))
         type(self).chat_request = request = json.loads(self.rfile.read(length))
+        if request.get("slow"):
+            # A long reply, one piece every 0.1 s, noticing when the monitor hangs up.
+            state = type(self).slow[request["slow"]] = {"sent": 0, "hung_up": False}
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                for index in range(40):
+                    self.wfile.write(f'data: {{"n":{index}}}\n\n'.encode())
+                    self.wfile.flush()
+                    state["sent"] = index + 1
+                    time.sleep(0.1)
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:
+                state["hung_up"] = True
+            return
         if request.get("stream") is True:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -359,6 +377,86 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(data)["choices"][0]["message"]["content"], "ok")
         self.assertEqual(FakeGufo.chat_request, payload)
+
+    def _start_slow_run(self):
+        """POST a slow streamed reply and return (connection, response, run id); self.state is
+        what Gufo's side saw."""
+        token = os.urandom(4).hex()
+        self.token = token
+        body = json.dumps({"model": "fn", "stream": True, "slow": token,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.request("POST", "/api/chat/completions", body=body, headers={
+            "X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json",
+            "Content-Length": str(len(body))})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        return connection, response, response.getheader("X-Gufo-Run")
+
+    @staticmethod
+    def _hang_up(connection, response):
+        """Really end the connection: the response holds its own handle on the socket."""
+        with contextlib.suppress(OSError, AttributeError):
+            response.fp.raw._sock.shutdown(socket.SHUT_RDWR)  # the response took the socket over
+        response.close()
+        connection.close()
+
+    @property
+    def state(self):
+        return FakeGufo.slow[self.token]
+
+    @staticmethod
+    def _numbers(data):
+        return [json.loads(line[5:])["n"] for line in data.split(b"\n") if line.startswith(b"data: {")]
+
+    def test_chat_reply_survives_a_dropped_connection(self):
+        # The browser reads three events, then goes to the background and the connection dies.
+        connection, response, run_id = self._start_slow_run()
+        self.assertTrue(run_id)
+        seen = b""
+        while self._numbers(seen)[-1:] != [2]:
+            seen += response.fp.readline()
+        self._hang_up(connection, response)
+        # It comes back and asks for what it has not read; the reply was written meanwhile.
+        response, rest = self.request("GET", f"/api/chat/runs/{run_id}?from=3", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(response.status, 200)
+        self.assertTrue(rest.endswith(b"data: [DONE]\n\n"))
+        self.assertEqual(self._numbers(seen) + self._numbers(rest), list(range(40)))
+        self.assertFalse(self.state["hung_up"], "Gufo was never cut off")
+        # A finished reply can be read again, from anywhere in it.
+        _, again = self.request("GET", f"/api/chat/runs/{run_id}?from=38", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(self._numbers(again), [38, 39])
+
+    def test_chat_run_is_the_owners_and_can_be_cancelled(self):
+        connection, response, run_id = self._start_slow_run()
+        response.fp.readline()
+        path = f"/api/chat/runs/{run_id}"
+        other = self.request("GET", path)[0]
+        self.assertEqual(other.status, 401, "no sign-in, no reply")
+        self.assertEqual(self.request("GET", "/api/chat/runs/nope", {"X-Admin-Token": ADMIN_TOKEN})[0].status, 404)
+        self.assertEqual(self.request("POST", path + "/cancel")[0].status, 401)
+        self.assertEqual(self.request("POST", path + "/cancel", {"X-Admin-Token": ADMIN_TOKEN})[0].status, 204)
+        self._hang_up(connection, response)
+        deadline = time.monotonic() + 3
+        while not self.state["hung_up"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.state["hung_up"], "cancelling hangs up on Gufo, which stops generating")
+        self.assertLess(self.state["sent"], 20)
+
+    def test_chat_run_nobody_reads_is_cancelled(self):
+        connection, response, run_id = self._start_slow_run()
+        response.fp.readline()
+        self._hang_up(connection, response)
+        with mock.patch.object(gm, "RUN_ORPHAN_S", 0.2):
+            time.sleep(0.8)  # the monitor notices the hang-up on its next write, within 0.1 s
+            self.server.runs.sweep()
+        deadline = time.monotonic() + 3
+        while not self.state["hung_up"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.state["hung_up"])
+        # What was written before it was cancelled can still be read, and it ends in an error-free stop.
+        _, data = self.request("GET", f"/api/chat/runs/{run_id}", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(self._numbers(data)[:1], [0])
 
     def test_chat_streams_gufo_events_through(self):
         payload = {"model": "fn", "stream": True,
