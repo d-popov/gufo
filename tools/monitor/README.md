@@ -83,7 +83,7 @@ every other page keeps `connect-src 'self'`.
 **Pictures and video.** With **Pictures and video** ticked, the model can ask `find_media` for
 freely licensed photos or short clips on [Wikimedia Commons](https://commons.wikimedia.org),
 asked from your browser like the other web tools. They appear in the thread as a grid of
-thumbnails, each linked to its Commons page with its license and author; videos play in place.
+thumbnails, each linked to its Commons page with its license and author; videos play in place, from Commons' VP9 WebM rendition nearest 480p (about 1 MB per second, instead of an original that can be 100 MB). Commons has no H.264 rendition, so a browser without WebM/VP9 support (iOS before 17.4) cannot play them inline: the caption link opens the file on Commons.
 The model names what to look for and gets titles, credits and page links back; it never supplies
 an address, and the page draws only files on `upload.wikimedia.org` and `thumb.wikimedia.org`,
 which are the only image and media hosts the chat page's CSP allows. Nothing is hosted or

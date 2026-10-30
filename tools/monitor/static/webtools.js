@@ -263,7 +263,8 @@ window.GufoWebTools = (() => {
     const url = `${COMMONS}?${new URLSearchParams({
       action: 'query', format: 'json', origin: '*', generator: 'search', gsrnamespace: '6',
       gsrsearch: `${query} filetype:${kind === 'video' ? 'video' : 'bitmap'}`, gsrlimit: String(count * 2),
-      prop: 'imageinfo', iiprop: 'url|mime|extmetadata', iiurlwidth: '480',
+      prop: kind === 'video' ? 'imageinfo|videoinfo' : 'imageinfo', iiprop: 'url|mime|extmetadata', iiurlwidth: '480',
+      viprop: 'derivatives',
       iiextmetadatafilter: 'LicenseShortName|Artist',
     })}`;
     const body = await withTimeout(signal, async (inner) => {
@@ -278,7 +279,15 @@ window.GufoWebTools = (() => {
       const mime = String(info?.mime ?? '');
       // Video must be something a browser plays; a vector or a scan is not a photo.
       if (kind === 'video' ? !/^video\/(webm|mp4)$/.test(mime) : !/^image\/(jpeg|png|webp)$/.test(mime)) continue;
-      const original = https(info?.url, ['upload.wikimedia.org']);
+      let original = https(info?.url, ['upload.wikimedia.org']);
+      if (kind === 'video') {
+        // The original can be a hundred megabytes. Commons keeps smaller VP9 renditions; play the
+        // one nearest 480p, and the original only when there is none.
+        const rendition = (page.videoinfo?.[0]?.derivatives ?? [])
+          .filter((item) => /^video\/webm/.test(item?.type) && item.height >= 240)
+          .sort((a, b) => Math.abs(a.height - 480) - Math.abs(b.height - 480))[0];
+        original = https(rendition?.src, ['upload.wikimedia.org']) ?? original;
+      }
       if (original) original.search = '';
       const item = safeMedia({
         kind, title: String(page.title ?? '').replace(NAME, '').replace(EXTENSION, '').replace(/_/g, ' '),

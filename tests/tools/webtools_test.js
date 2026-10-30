@@ -167,7 +167,13 @@ function reply(body, { status = 200, type = 'application/json', url = '' } = {})
       1: page(1, 'File:First_horse.JPG', 'image/jpeg'),
       2: page(2, 'File:Drawing.svg', 'image/svg+xml'),
       4: page(4, 'File:Tracker.jpg', 'image/jpeg', { thumburl: 'https://evil.example/pixel.jpg?d=secret' }),
-      5: page(5, 'File:Clip.webm', 'video/webm'),
+      5: { ...page(5, 'File:Clip.webm', 'video/webm'), videoinfo: [{ derivatives: [
+        { type: 'video/webm; codecs="vp9, opus"', height: 240, src: 'https://upload.wikimedia.org/t/5.240p.vp9.webm' },
+        { type: 'video/quicktime; codecs="mp4v"', height: 360, src: 'https://upload.wikimedia.org/t/5.360p.mpeg4.mov' },
+        { type: 'video/webm; codecs="vp9, opus"', height: 480, src: 'https://upload.wikimedia.org/t/5.480p.vp9.webm' },
+        { type: 'video/webm; codecs="vp9, opus"', height: 1080, src: 'https://upload.wikimedia.org/t/5.1080p.vp9.webm' },
+        { type: 'video/webm; codecs="vp9, opus"', height: 480, src: 'https://evil.example/6.webm' },
+      ] }] },
     };
     const answer = () => reply(JSON.stringify({ query: { pages } }));
     const { tools, calls } = load(answer);
@@ -187,9 +193,14 @@ function reply(body, { status = 200, type = 'application/json', url = '' } = {})
     assert.match(found.text, /1\. First horse \(CC BY-SA 4\.0, Jane Doe\) https:\/\/commons\.wikimedia\.org\/wiki\/File:First_horse\.JPG/);
     assert.doesNotMatch(found.text, /evil\.example|Tracker/);
 
-    const clips = await load(answer).tools.run('find_media', { query: 'horse', kind: 'video' });
+    const clipLoad = load(answer);
+    const clips = await clipLoad.tools.run('find_media', { query: 'horse', kind: 'video' });
     assert.equal(clips.media.map((item) => `${item.kind}:${item.title}`).join('|'), 'video:Clip');
-    assert.equal(clips.media[0].src, 'https://upload.wikimedia.org/wikipedia/commons/a/a2/5.bin', 'the file, without tracking parameters');
+    assert.equal(clips.media[0].src, 'https://upload.wikimedia.org/t/5.480p.vp9.webm', 'the WebM rendition nearest 480p, not the original or a MOV');
+    assert.equal(new URL(clipLoad.calls[0].url).searchParams.get('prop'), 'imageinfo|videoinfo');
+    const bare = { ...pages, 5: page(5, 'File:Clip.webm', 'video/webm') };
+    const plain = await load(() => reply(JSON.stringify({ query: { pages: bare } }))).tools.run('find_media', { query: 'horse', kind: 'video' });
+    assert.equal(plain.media[0].src, 'https://upload.wikimedia.org/wikipedia/commons/a/a2/5.bin', 'the original, without tracking parameters, when there is no rendition');
 
     const none = await load(() => reply('{"batchcomplete":""}')).tools.run('find_media', { query: 'zzzz' });
     assert.equal(none.ok, true);
