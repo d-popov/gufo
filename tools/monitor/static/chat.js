@@ -1,19 +1,26 @@
 'use strict';
 
-const STORAGE_KEY = 'gufo-chat-histories-v1';
+const OLD_STORAGE_KEY = 'gufo-chat-histories-v1';  // the last 10 chats of the first version, moved to the store
+const SCOPE_KEY = 'gufo-chat-project';
 const EFFORT_KEY = 'gufo-chat-effort';
 const BROWSER_KEY = 'gufo-chat-browser';
 const TOOLS_KEY = 'gufo-chat-tools';
-const MAX_HISTORIES = 10;
+const LIST_MAX = 200;           // chats listed at once
+const MEMORY_IDLE_MS = 60_000;  // after a reply, how long before the project memory is updated
+const NEW_PROJECT = '__new';
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const $ = (id) => document.getElementById(id);
 const fmtUsd = window.GufoHeader.fmtUsd;
+const Projects = window.GufoProjects;
 
 // The page header first, so it is there whatever fails below.
 window.GufoHeader.init();
 window.GufoHeader.refresh().catch(() => {});
-let histories = loadHistories();
-let activeId = histories[0]?.id ?? null;
+let store = null;     // the browser database, once opened (see chatstore.js)
+let chats = [];       // every conversation, in every project
+let projects = [];
+let scope = localStorage.getItem(SCOPE_KEY) || '';  // the project shown, or '' for chats outside any
+let activeId = null;
 let pendingImages = [];
 let prices = null;  // {model: {input, cached_input, output}} micro-USD per 1M tokens, or null
 let billed = false;  // false for the admin: prices are shown, nothing is charged
@@ -26,36 +33,56 @@ let pythonInstalled = false;            // set by loadModels: is the Python runt
 
 // ---------------------------------------------------------------- history (this browser only)
 
-function loadHistories() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    return Array.isArray(saved) ? saved.filter((item) => item && typeof item.id === 'string' && Array.isArray(item.messages)).slice(0, MAX_HISTORIES) : [];
-  } catch { return []; }
+function failedToSave() {
+  $('status').textContent = 'The browser would not store this change (storage full or blocked).';
 }
 
 // Image bytes and the live "thinking" text stay out of storage; the stats stay in.
-function saveHistories() {
-  const saved = histories.slice(0, MAX_HISTORIES).map((history) => ({
-    ...history,
-    messages: history.messages.map(({ role, content, hadImages, images, stats, error, steps }) => ({
+function plainChat(chat) {
+  return {
+    ...chat,
+    messages: chat.messages.map(({ role, content, hadImages, images, stats, error, steps }) => ({
       role, content, hadImages: Boolean(hadImages || images?.length), stats, error,
       steps: steps?.map(({ figures, ...rest }) => (figures ? { ...rest, figureCount: figures.length } : rest)),
-    }))
-  }));
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(saved)); }
-  catch { $('status').textContent = 'Browser storage is full; this conversation will not be saved.'; }
+    })),
+  };
 }
 
-function active() { return histories.find((item) => item.id === activeId); }
+function saveChat(chat) { store.put('chats', plainChat(chat)).catch(failedToSave); }
+function saveProject(project) { project.updated = Date.now(); store.put('projects', { ...project }).catch(failedToSave); }
 
-function updateHistory() {
-  const current = active();
+async function loadStore() {
+  store = await window.GufoStore.open();
+  if (!store.persistent) $('status').textContent = 'This browser blocks storage: chats last until you close the page.';
+  [chats, projects] = await Promise.all([store.getAll('chats'), store.getAll('projects')]);
+  // The first version kept 10 chats in localStorage; move them over once.
+  try {
+    const old = JSON.parse(localStorage.getItem(OLD_STORAGE_KEY) || '[]');
+    if (Array.isArray(old) && old.length) {
+      const known = new Set(chats.map((chat) => chat.id));
+      for (const chat of old) {
+        if (!chat || typeof chat.id !== 'string' || !Array.isArray(chat.messages) || known.has(chat.id)) continue;
+        chats.push(chat);
+        await store.put('chats', chat);
+      }
+    }
+    localStorage.removeItem(OLD_STORAGE_KEY);
+  } catch { /* unreadable or storage refused: the old copy stays where it is */ }
+  chats = chats.filter((chat) => chat && typeof chat.id === 'string' && Array.isArray(chat.messages));
+  if (scope && !projects.some((project) => project.id === scope)) scope = '';
+}
+
+function active() { return chats.find((item) => item.id === activeId); }
+function currentProject() { return projects.find((project) => project.id === scope) ?? null; }
+function projectOf(chat) { return projects.find((project) => project.id === chat.projectId) ?? null; }
+function scoped() {
+  return chats.filter((chat) => (chat.projectId || '') === scope).sort((a, b) => b.updated - a.updated);
+}
+
+function updateHistory(current = active()) {
   if (!current) return;
   current.updated = Date.now();
-  histories.sort((a, b) => b.updated - a.updated);
-  histories = histories.slice(0, MAX_HISTORIES);
-  activeId = current.id;
-  saveHistories();
+  saveChat(current);
   renderHistoryList();
   renderTotal();
 }
@@ -63,27 +90,60 @@ function updateHistory() {
 function renderHistoryList() {
   const select = $('history');
   select.replaceChildren();
-  histories.forEach((item) => {
+  const list = scoped();
+  list.slice(0, LIST_MAX).forEach((item) => {
     const option = document.createElement('option');
     option.value = item.id;
-    option.textContent = item.title || 'New chat';
+    const day = new Date(item.updated).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    option.textContent = `${item.title || 'New chat'} · ${day}`;
     select.append(option);
   });
+  if (list.length > LIST_MAX) select.title = `The ${LIST_MAX} most recent of ${list.length} chats`;
+  else select.removeAttribute('title');
   if (activeId) select.value = activeId;
 }
 
-function newChat() {
-  disarmDelete();
-  const item = { id: crypto.randomUUID(), title: 'New chat', updated: Date.now(), messages: [] };
-  histories.unshift(item);
-  histories = histories.slice(0, MAX_HISTORIES);
-  activeId = item.id;
+// A chat that was opened and never written in is not worth keeping.
+function dropIfEmpty(chat) {
+  if (!chat || chat.messages.length) return;
+  chats = chats.filter((item) => item !== chat);
+  store.remove('chats', chat.id).catch(failedToSave);
+}
+
+// Called when the open chat is about to be left: its project learns what it said.
+function leaveChat() {
+  const chat = active();
+  clearTimeout(memoryTimer);
+  if (!chat) return;
+  dropIfEmpty(chat);
+  if (!busy) maybeUpdateMemory(chat);
+}
+
+function showChat(id) {
+  activeId = id;
   pendingImages = [];
   renderPreview();
   renderHistoryList();
   renderMessages();
   renderTotal();
-  saveHistories();
+}
+
+function newChat() {
+  disarmDelete();
+  const current = active();
+  // One empty chat is enough.
+  if (current && !current.messages.length && (current.projectId || '') === scope) { showChat(current.id); return; }
+  leaveChat();
+  const item = { id: crypto.randomUUID(), title: 'New chat', updated: Date.now(), messages: [], projectId: scope || null };
+  chats.unshift(item);
+  showChat(item.id);
+  saveChat(item);
+}
+
+function openChat(id) {
+  if (id === activeId) return;
+  leaveChat();
+  showChat(id);
 }
 
 // Deleting takes two clicks: the first arms the button for three seconds, the second deletes.
@@ -97,17 +157,225 @@ function disarmDelete() {
   button.classList.remove('danger');
 }
 
-// Removes the open chat and opens the most recent one left, or a fresh one if none is.
+// Removes the open chat and opens the most recent one left in the project, or a fresh one.
 function deleteChat() {
-  histories = histories.filter((item) => item.id !== activeId);
-  activeId = histories[0]?.id ?? null;
+  const gone = active();
+  clearTimeout(memoryTimer);
+  chats = chats.filter((item) => item !== gone);
+  if (gone) store.remove('chats', gone.id).catch(failedToSave);
+  activeId = scoped()[0]?.id ?? null;
   if (!activeId) { newChat(); return; }
-  pendingImages = [];
-  renderPreview();
-  renderHistoryList();
-  renderMessages();
-  renderTotal();
-  saveHistories();
+  showChat(activeId);
+}
+
+// ---------------------------------------------------------------- projects
+
+function renderProjectList() {
+  const select = $('project');
+  select.replaceChildren();
+  const add = (value, text) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    select.append(option);
+  };
+  add('', 'No project');
+  for (const project of [...projects].sort((a, b) => a.name.localeCompare(b.name))) add(project.id, project.name);
+  add(NEW_PROJECT, '+ New project…');
+  select.value = scope;
+  $('edit-project').hidden = !scope;
+  $('empty-text').textContent = scope
+    ? 'This project’s guidelines and memory go with every message. Chats are kept in this browser.'
+    : 'Ask anything. Attach or paste (Ctrl+V) images up to 4 MiB each.\nEnter sends, Shift+Enter adds a line. Chats are kept in this browser.';
+}
+
+function setScope(id) {
+  leaveChat();
+  scope = id;
+  localStorage.setItem(SCOPE_KEY, scope);
+  setProjectOpen(false);
+  renderProjectList();
+  activeId = scoped()[0]?.id ?? null;
+  if (!activeId) { newChat(); return; }
+  showChat(activeId);
+}
+
+function createProject() {
+  leaveChat();
+  const project = {
+    id: crypto.randomUUID(), name: 'New project', guidelines: '', memory: '', autoMemory: true,
+    memoryUpdated: null, updated: Date.now(),
+  };
+  projects.push(project);
+  saveProject(project);
+  setScope(project.id);
+  setProjectOpen(true);
+  $('project-name').select();
+}
+
+function setProjectOpen(open) {
+  const project = currentProject();
+  const show = open && project !== null;
+  $('project-panel').hidden = !show;
+  $('edit-project').setAttribute('aria-expanded', String(show));
+  if (!show) return;
+  $('project-name').value = project.name;
+  $('project-guidelines').value = project.guidelines;
+  $('project-memory').value = project.memory;
+  $('auto-memory').checked = project.autoMemory !== false;
+  $('memory-status').textContent = project.memoryUpdated
+    ? `Memory updated ${new Date(project.memoryUpdated).toLocaleString()}` : '';
+  $('project-guidelines').focus();
+}
+
+// Edits to the project's text are saved a moment after the last key.
+let projectSaveTimer = null;
+function projectEdited() {
+  const project = currentProject();
+  if (!project) return;
+  project.name = $('project-name').value.trim() || 'Untitled project';
+  project.guidelines = $('project-guidelines').value;
+  project.memory = $('project-memory').value;
+  project.autoMemory = $('auto-memory').checked;
+  clearTimeout(projectSaveTimer);
+  projectSaveTimer = setTimeout(() => { saveProject(project); renderProjectList(); }, 400);
+}
+
+let memoryTimer = null;
+let memoryJob = null;  // the memory update in progress, if any
+
+// After a reply, the memory is updated once the user has been quiet for a while.
+function scheduleMemory(chat) {
+  clearTimeout(memoryTimer);
+  if (projectOf(chat)?.autoMemory === false) return;
+  memoryTimer = setTimeout(() => { if (!busy && chat === active()) maybeUpdateMemory(chat); }, MEMORY_IDLE_MS);
+}
+
+function maybeUpdateMemory(chat) {
+  const owner = projectOf(chat);
+  if (owner && owner.autoMemory !== false && Projects.unsummarized(chat)) updateMemory(chat).catch(() => {});
+}
+
+function setMemoryStatus(text) {
+  if (!$('project-panel').hidden) $('memory-status').textContent = text;
+}
+
+// Asks the model to fold the chat into the project's memory, one update at a time.
+function updateMemory(chat) {
+  if (memoryJob) return Promise.resolve(false);
+  const job = runMemoryUpdate(chat).finally(() => { if (memoryJob === job) memoryJob = null; });
+  memoryJob = job;
+  return job;
+}
+
+// A hand edit made while the model wrote wins over what it wrote.
+async function runMemoryUpdate(chat) {
+  const owner = projectOf(chat);
+  const model = $('model').value;
+  if (!owner || !model) return false;
+  const before = owner.memory;
+  const seen = chat.messages.length;
+  setMemoryStatus('Updating memory…');
+  try {
+    let text = '';
+    await streamCompletion({
+      model, messages: Projects.memoryRequest(owner, chat), effort: 'none',
+      onDelta: (delta) => { text += delta.content || ''; },
+    });
+    const next = Projects.clean(text, Projects.MEMORY_MAX);
+    if (!next) throw new Error('the model sent no memory');
+    if (owner.memory !== before) { setMemoryStatus('You edited the memory meanwhile, so it was not replaced.'); return false; }
+    owner.memory = next;
+    owner.memoryUpdated = Date.now();
+    chat.memoryCount = seen;
+    saveProject(owner);
+    if (chats.includes(chat)) saveChat(chat);
+    if (!$('project-panel').hidden && owner.id === scope) $('project-memory').value = next;
+    setMemoryStatus(`Memory updated ${new Date(owner.memoryUpdated).toLocaleString()}`);
+    return true;
+  } catch (error) {
+    setMemoryStatus(`Memory not updated: ${error.message}`);
+    return false;
+  }
+}
+
+async function draftGuidelines() {
+  const project = currentProject();
+  const brief = $('project-brief').value.trim();
+  const model = $('model').value;
+  if (!project || busy || !model) return;
+  if (!brief) { setMemoryStatus('Say what the project is or what rules you want, then Draft.'); return; }
+  const box = $('project-guidelines');
+  const before = box.value;
+  $('draft-guidelines').disabled = true;
+  setMemoryStatus('Drafting guidelines…');
+  try {
+    let text = '';
+    await streamCompletion({
+      model, messages: Projects.guidelinesRequest({ ...project, guidelines: before }, brief), effort: 'none',
+      onDelta: (delta) => { text += delta.content || ''; },
+    });
+    const next = Projects.clean(text, Projects.GUIDELINES_MAX);
+    if (!next) throw new Error('the model sent nothing');
+    if (box.value !== before) { setMemoryStatus('You edited the guidelines meanwhile, so the draft was dropped.'); return; }
+    box.value = next;
+    projectEdited();
+    setMemoryStatus('Guidelines drafted: read them, edit what you like.');
+  } catch (error) {
+    setMemoryStatus(`Draft failed: ${error.message}`);
+  } finally { $('draft-guidelines').disabled = false; }
+}
+
+function exportProject() {
+  const project = currentProject();
+  if (!project) return;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([Projects.toMarkdown(project)], { type: 'text/markdown' }));
+  link.download = `${project.name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'}.md`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+async function importProject(file) {
+  const project = currentProject();
+  if (!project || !file) return;
+  const found = Projects.fromMarkdown(await file.text());
+  if (!found) { setMemoryStatus('No “# Guidelines” or “# Memory” heading in that file.'); return; }
+  if ('guidelines' in found) $('project-guidelines').value = found.guidelines.slice(0, Projects.GUIDELINES_MAX);
+  if ('memory' in found) $('project-memory').value = found.memory.slice(0, Projects.MEMORY_MAX);
+  projectEdited();
+  setMemoryStatus(`Imported ${Object.keys(found).join(' and ')}.`);
+}
+
+// Deleting a project takes two clicks, like deleting a chat. Its chats are kept, outside any project.
+let projectDisarmTimer = null;
+function disarmProjectDelete() {
+  clearTimeout(projectDisarmTimer);
+  projectDisarmTimer = null;
+  $('delete-project').textContent = 'Delete project';
+  $('delete-project').classList.remove('danger');
+}
+
+function deleteProject() {
+  const project = currentProject();
+  if (!project) return;
+  clearTimeout(projectSaveTimer);
+  clearTimeout(memoryTimer);
+  for (const chat of chats.filter((item) => item.projectId === project.id)) {
+    chat.projectId = null;
+    saveChat(chat);
+  }
+  projects = projects.filter((item) => item !== project);
+  store.remove('projects', project.id).catch(failedToSave);
+  scope = '';
+  localStorage.setItem(SCOPE_KEY, '');
+  setProjectOpen(false);
+  renderProjectList();
+  const open = active();
+  if (open) dropIfEmpty(open);
+  activeId = scoped()[0]?.id ?? null;
+  if (!activeId) { newChat(); return; }
+  showChat(activeId);
 }
 
 // ---------------------------------------------------------------- price and speed
@@ -394,21 +662,34 @@ function setBusy(on) {
   $('send').textContent = on ? 'Stop' : 'Send';
   $('send').classList.toggle('secondary', on);
   $('delete-chat').disabled = on;  // not while a reply is being written into it
+  for (const id of ['update-memory', 'draft-guidelines']) $(id).disabled = on;  // the model is busy with the reply
   if (on) disarmDelete();
 }
 
 async function send() {
+  // A memory update that is still running would be missed by this chat's first message.
+  if (memoryJob) {
+    $('status').textContent = 'Updating the project memory first…';
+    await memoryJob.catch(() => {});
+    $('status').textContent = '';
+  }
   const text = $('prompt').value.trim();
   const model = $('model').value;
   if (busy || (!text && pendingImages.length === 0)) return;
   if (!model) { $('status').textContent = 'No served model yet; try again in a moment.'; return; }
   if (!active()) newChat();
   const chat = active();
+  clearTimeout(memoryTimer);
   const allowed = selectedTools();
+  const owner = projectOf(chat);
+  // A chat keeps the memory it started with, so the model's own memory updates do not change
+  // the start of its prompt and force it to be read again.
+  chat.memory ??= owner?.memory ?? '';
   chat.messages.push({ role: 'user', content: text, images: pendingImages, hadImages: pendingImages.length > 0 });
   // Earlier tool steps stay in the thread but not in what is sent: the answers carry them.
   const note = allowed.size ? toolkit.note(allowed, new Date().toISOString().slice(0, 10)) : null;
-  const outgoing = [...(note ? [note] : []), ...toApiMessages(chat.messages)];
+  const system = Projects.systemMessage(owner ? Projects.context(owner, chat.memory) : null, note?.content);
+  const outgoing = [...(system ? [system] : []), ...toApiMessages(chat.messages)];
   const reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [] };
   chat.messages.push(reply);
   if (chat.title === 'New chat') chat.title = text.slice(0, 48) || 'Image chat';
@@ -418,7 +699,7 @@ async function send() {
   renderPreview();
   renderMessages();
   const block = $('messages').lastElementChild;
-  updateHistory();
+  updateHistory(chat);
   controller = new AbortController();
   setBusy(true);
   $('status').textContent = '';
@@ -542,8 +823,9 @@ async function send() {
     delete reply.pending;
     reply.reasoning = reply.reasoning || undefined;
     if (!reply.steps.length) delete reply.steps;
-    updateHistory();
+    updateHistory(chat);
     renderMessages();
+    scheduleMemory(chat);
   }
 }
 
@@ -561,11 +843,38 @@ $('delete-chat').addEventListener('click', () => {
 });
 $('history').addEventListener('change', () => {
   disarmDelete();
-  activeId = $('history').value;
-  pendingImages = [];
-  renderPreview();
-  renderMessages();
-  renderTotal();
+  openChat($('history').value);
+});
+$('project').addEventListener('change', () => {
+  disarmDelete();
+  if ($('project').value === NEW_PROJECT) createProject(); else setScope($('project').value);
+});
+$('edit-project').addEventListener('click', () => setProjectOpen($('project-panel').hidden));
+for (const id of ['project-name', 'project-guidelines', 'project-memory', 'auto-memory']) {
+  $(id).addEventListener('input', projectEdited);
+}
+$('draft-guidelines').addEventListener('click', draftGuidelines);
+$('update-memory').addEventListener('click', () => {
+  const chat = active();
+  if (!chat || busy) return;
+  if (!chat.messages.length || !Projects.unsummarized(chat)) { setMemoryStatus('Nothing new in this chat to add.'); return; }
+  updateMemory(chat).catch(() => {});
+});
+$('export-project').addEventListener('click', exportProject);
+$('import-project').addEventListener('change', async () => {
+  const [file] = $('import-project').files;
+  $('import-project').value = '';
+  await importProject(file);
+});
+$('delete-project').addEventListener('click', () => {
+  if (projectDisarmTimer === null) {
+    $('delete-project').textContent = 'Delete project? Chats are kept';
+    $('delete-project').classList.add('danger');
+    projectDisarmTimer = setTimeout(disarmProjectDelete, 3000);
+    return;
+  }
+  disarmProjectDelete();
+  deleteProject();
 });
 // Enter sends, Shift+Enter adds a line; Enter while an input method is composing does neither.
 $('prompt').addEventListener('keydown', (event) => {
@@ -688,9 +997,11 @@ async function loadModels() {
   } catch (error) { $('status').textContent = error.message; }
 }
 
-if (!activeId) newChat();
-renderHistoryList();
-renderMessages();
-renderTotal();
-renderToolsMenu();
-loadModels();
+(async () => {
+  try { await loadStore(); } catch { $('status').textContent = 'Could not read the saved chats from this browser.'; }
+  renderProjectList();
+  activeId = scoped()[0]?.id ?? null;
+  if (activeId) showChat(activeId); else newChat();
+  renderToolsMenu();
+  loadModels();
+})();

@@ -13,21 +13,54 @@
   <script src="/static/pybox.js" defer></script>
   <script src="/static/tools.js" defer></script>
   <script src="/static/header.js" defer></script>
+  <script src="/static/projects.js" defer></script>
+  <script src="/static/chatstore.js" defer></script>
   <script src="/static/chat.js" defer></script>
 </head>
 <body>
   <header id="site-header" class="site-header"></header>
   <main class="chat">
     <div class="toolbar">
+      <select id="project" aria-label="Project"></select>
+      <button id="edit-project" type="button" class="secondary" aria-expanded="false" aria-controls="project-panel"
+              title="Edit this project's guidelines and memory" hidden>Project</button>
       <button id="new-chat" type="button" class="secondary">New chat</button>
-      <select id="history" aria-label="Recent chats"></select>
+      <select id="history" aria-label="Chats in this project"></select>
       <button id="delete-chat" type="button" class="secondary" title="Delete this chat from this browser">Delete</button>
       <div id="chat-total" class="chat-total" title="Total for this chat"></div>
     </div>
+    <section id="project-panel" class="project-panel" aria-label="Project settings" hidden>
+      <label class="field">Name
+        <input id="project-name" type="text" maxlength="60" autocomplete="off">
+      </label>
+      <label class="field">Guidelines
+        <span class="hint">Rules the model follows in every chat of this project, like a CLAUDE.md. Yours to write and edit.</span>
+        <textarea id="project-guidelines" rows="6" maxlength="12000" spellcheck="false"></textarea>
+      </label>
+      <div class="row">
+        <input id="project-brief" type="text" autocomplete="off" aria-label="What to draft guidelines from"
+               placeholder="Describe the project or the rules you want, then draft…">
+        <button id="draft-guidelines" type="button" class="secondary">Draft guidelines</button>
+      </div>
+      <label class="field">Memory
+        <span class="hint">What the model remembers from this project's chats. It updates itself; edit it whenever you like.</span>
+        <textarea id="project-memory" rows="6" maxlength="6000" spellcheck="false"></textarea>
+      </label>
+      <div class="row">
+        <button id="update-memory" type="button" class="secondary">Update memory from this chat</button>
+        <label class="check"><input id="auto-memory" type="checkbox"> Update when I leave a chat</label>
+        <span id="memory-status" role="status"></span>
+      </div>
+      <div class="row">
+        <button id="export-project" type="button" class="secondary" title="Download guidelines and memory as one Markdown file">Export .md</button>
+        <label class="button secondary attach" for="import-project" title="Load a Markdown file with “# Guidelines” and “# Memory” headings">Import .md</label>
+        <input id="import-project" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" hidden>
+        <button id="delete-project" type="button" class="secondary">Delete project</button>
+      </div>
+    </section>
     <section class="conversation" aria-label="Conversation">
       <div id="messages"></div>
-      <p id="empty" class="empty">Ask anything. Attach or paste (Ctrl+V) images up to 4 MiB each.<br>
-        Enter sends, Shift+Enter adds a line. The last 10 chats are kept in this browser.</p>
+      <p id="empty" class="empty"><span id="empty-text"></span></p>
     </section>
     <form id="composer">
       <div id="preview" class="preview" aria-live="polite"></div>

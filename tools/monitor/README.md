@@ -36,8 +36,31 @@ any, and each reply shows its speed (tok/s), time to first token, token counts a
 users are charged). The chat's running total (cost and tokens) stays in view above the
 conversation. **Thinking** sets the model's reasoning effort (Default leaves it to the
 server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images attach with
-the button or by pasting (Ctrl+V). The browser keeps the last 10 conversations (**Delete**
-removes the open one, after a second click to confirm); image bytes are not kept.
+the button or by pasting (Ctrl+V). The browser keeps every conversation in its own database
+(IndexedDB), with no limit but the browser's quota and nothing stored on the monitor; the
+chat list shows the 200 most recent of the open project. **Delete** removes the open chat,
+after a second click to confirm. Image bytes are not kept. Moving to another browser or
+device does not bring the chats along: use a project's Export for its notes.
+
+**Projects.** The first box in the toolbar picks a project: a folder of chats that share two
+plain Markdown notes, both editable in the **Project** panel.
+
+- **Guidelines**: rules for the model in every chat of the project, like a `CLAUDE.md`.
+  You write them; **Draft guidelines** writes a first version from a sentence about the
+  project and refines what is there. Edits apply to the next message, even in an open chat.
+- **Memory**: what the model remembers from the project's chats. It updates itself when you
+  leave a chat with new answers (or open another project), after a minute without activity
+  once a reply is done, and on **Update memory from this chat**; the model is asked to merge
+  the new conversation into the notes (at most 400 words), at the cost of one short request
+  each time, billed like any other. Untick *Update when I leave a chat* to keep it manual.
+  A chat keeps the memory it started with, so an update never changes the start of its
+  prompt and forces it to be read again; new chats get the updated one. If you edit the
+  memory while an update runs, your edit is kept.
+
+Both go to the model as one system message ahead of the conversation. **Export .md** downloads
+the two notes as one file with `# Guidelines` and `# Memory` headings; **Import .md** reads
+such a file back (a file with one heading replaces only that note). Deleting a project keeps
+its chats, which move to *No project*.
 
 The **Tools** menu above the message box chooses what the model may use (nothing by default;
 the choice is remembered). The chat sends the model only the ticked tools, with a short system

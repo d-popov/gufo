@@ -318,9 +318,9 @@ class MonitorHttpTest(unittest.TestCase):
         for path in ("/monitor", "/", "/static/chat.js"):
             other, _ = self.request("GET", path, {"X-Admin-Token": ADMIN_TOKEN})
             self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
-        scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "chat")
+        scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chat")
                    if f'src="/static/{name}.js"'.encode() in data]
-        self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "chat"])
+        self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chat"])
         self.assertEqual([data.index(f'src="/static/{n}.js"'.encode()) for n in scripts],
                          sorted(data.index(f'src="/static/{n}.js"'.encode()) for n in scripts),
                          "tools.js and chat.js need the scripts they build on loaded first")
@@ -377,6 +377,7 @@ class MonitorHttpTest(unittest.TestCase):
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
                      "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
+                     "projects.js", "chatstore.js",
                      "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)

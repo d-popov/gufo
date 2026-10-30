@@ -68,6 +68,8 @@ STATIC_FILES = {
     "pybox.js": (STATIC_DIR, _JS),
     "pyworker.js": (STATIC_DIR, _JS),
     "tools.js": (STATIC_DIR, _JS),
+    "projects.js": (STATIC_DIR, _JS),
+    "chatstore.js": (STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),
 }
 # Settings read from the environment or --env-file.
