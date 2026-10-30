@@ -839,6 +839,7 @@ $('project').addEventListener('change', () => {
   if ($('project').value === NEW_PROJECT) createProject(); else setScope($('project').value);
 });
 $('edit-project').addEventListener('click', () => setProjectOpen($('project-panel').hidden));
+$('close-project').addEventListener('click', () => setProjectOpen(false));
 for (const id of ['project-name', 'project-guidelines', 'project-memory', 'auto-memory']) {
   $(id).addEventListener('input', projectEdited);
 }

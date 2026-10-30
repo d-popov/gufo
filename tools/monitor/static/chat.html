@@ -56,6 +56,7 @@
         <label class="button secondary attach" for="import-project" title="Load a Markdown file with “# Guidelines” and “# Memory” headings">Import .md</label>
         <input id="import-project" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" hidden>
         <button id="delete-project" type="button" class="secondary">Delete project</button>
+        <button id="close-project" type="button">Done</button>
       </div>
     </section>
     <section class="conversation" aria-label="Conversation">
@@ -69,7 +70,7 @@
         <label class="button secondary attach" for="images">Attach images</label>
         <input id="images" type="file" accept="image/*" multiple hidden>
         <select id="model" required aria-label="Model"></select>
-        <label class="effort">Thinking
+        <label class="effort" title="How much the model thinks first">Thinking
           <select id="effort">
             <option value="">Default</option>
             <option value="none">Off</option>
