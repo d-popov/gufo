@@ -16,6 +16,12 @@ window.GufoWebTools = (() => {
   const DEFAULT_CHARS = 8000;
   const SEARCH_CHARS = 6000;
   const MAX_CHARS = 30000;
+  // Pictures and video come from Wikimedia Commons: freely licensed, readable from a browser
+  // (CORS), and served from two hosts only, which is all the chat page's CSP lets an <img> or
+  // <video> load. The model never supplies a media address; it only names what to look for.
+  const COMMONS = 'https://commons.wikimedia.org/w/api.php';
+  const MEDIA_HOSTS = ['upload.wikimedia.org', 'thumb.wikimedia.org'];
+  const MEDIA_MAX = 8;
 
   const TOOLS = [
     {
@@ -42,6 +48,23 @@ window.GufoWebTools = (() => {
             max_chars: { type: 'integer', description: `Text to return, default ${DEFAULT_CHARS}, at most ${MAX_CHARS}.` },
           },
           required: ['url'],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'find_media',
+        description: 'Find freely licensed photos or short videos on Wikimedia Commons and show them to the user in the chat. '
+          + 'You get their titles, licenses and page URLs but cannot see them. Use it when the user asks to see pictures or videos.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'What to look for, in a few words.' },
+            kind: { type: 'string', enum: ['image', 'video'], description: 'image (default) or video.' },
+            count: { type: 'integer', description: `How many, default 6, at most ${MEDIA_MAX}.` },
+          },
+          required: ['query'],
         },
       },
     },
@@ -201,8 +224,86 @@ window.GufoWebTools = (() => {
     return { text: clip(unwrapSearchLinks(found.text), SEARCH_CHARS), via: found.via };
   }
 
+  function https(value, hosts) {
+    try {
+      const url = new URL(String(value));
+      return url.protocol === 'https:' && !url.username && !url.password && hosts.includes(url.hostname) ? url : null;
+    } catch { return null; }
+  }
+
+  const plain = (value, max) => String(value ?? '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+  // One media item as the chat may show it, or null. Used when a tool finds it and again when a
+  // saved chat is drawn, so only addresses on the media hosts ever reach an <img> or <video>.
+  function safeMedia(item) {
+    const kind = item?.kind === 'video' ? 'video' : item?.kind === 'image' ? 'image' : null;
+    const thumb = https(item?.thumb, MEDIA_HOSTS);
+    const page = https(item?.page, ['commons.wikimedia.org']);
+    if (!kind || !thumb || !page) return null;
+    let src = thumb;
+    if (kind === 'video') {
+      src = https(item.src, ['upload.wikimedia.org']);
+      if (!src) return null;
+    }
+    return {
+      kind, title: plain(item.title, 120), src: src.href, thumb: thumb.href, page: page.href,
+      license: plain(item.license, 60), author: plain(item.author, 80),
+    };
+  }
+
+  const NAME = /^File:/i;
+  const EXTENSION = /\.[a-z0-9]{2,5}$/i;
+
+  async function findMedia(args, signal) {
+    const query = String(args?.query ?? '').trim();
+    if (!query) throw new ToolError('the query is empty');
+    const kind = args?.kind === 'video' ? 'video' : 'image';
+    const wanted = Number(args?.count);
+    const count = Number.isFinite(wanted) && wanted >= 1 ? Math.min(Math.floor(wanted), MEDIA_MAX) : 6;
+    const url = `${COMMONS}?${new URLSearchParams({
+      action: 'query', format: 'json', origin: '*', generator: 'search', gsrnamespace: '6',
+      gsrsearch: `${query} filetype:${kind === 'video' ? 'video' : 'bitmap'}`, gsrlimit: String(count * 2),
+      prop: 'imageinfo', iiprop: 'url|mime|extmetadata', iiurlwidth: '480',
+      iiextmetadatafilter: 'LicenseShortName|Artist',
+    })}`;
+    const body = await withTimeout(signal, async (inner) => {
+      const response = await get(url, inner, 'application/json');
+      if (!response.ok) throw new ToolError(`Wikimedia Commons answered HTTP ${response.status}`);
+      try { return JSON.parse(await readBody(response)); } catch { throw new ToolError('Wikimedia Commons sent no usable answer'); }
+    });
+    const pages = Object.values(body?.query?.pages ?? {}).sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const media = [];
+    for (const page of pages) {
+      const info = page?.imageinfo?.[0];
+      const mime = String(info?.mime ?? '');
+      // Video must be something a browser plays; a vector or a scan is not a photo.
+      if (kind === 'video' ? !/^video\/(webm|mp4)$/.test(mime) : !/^image\/(jpeg|png|webp)$/.test(mime)) continue;
+      const original = https(info?.url, ['upload.wikimedia.org']);
+      if (original) original.search = '';
+      const item = safeMedia({
+        kind, title: String(page.title ?? '').replace(NAME, '').replace(EXTENSION, '').replace(/_/g, ' '),
+        src: original?.href, thumb: info?.thumburl, page: info?.descriptionurl,
+        license: info?.extmetadata?.LicenseShortName?.value, author: info?.extmetadata?.Artist?.value,
+      });
+      if (item) media.push(item);
+      if (media.length >= count) break;
+    }
+    if (!media.length) return { text: `No ${kind === 'video' ? 'videos' : 'pictures'} found for “${query}” on Wikimedia Commons.`, via: 'direct', media };
+    const lines = media.map((item, index) => {
+      const credit = [item.license, item.author].filter(Boolean).join(', ');
+      return `${index + 1}. ${item.title}${credit ? ` (${credit})` : ''} ${item.page}`;
+    });
+    return {
+      text: `Shown to the user now, from Wikimedia Commons (they are freely licensed; credit the author when you mention one):\n${lines.join('\n')}`,
+      via: 'direct', media,
+    };
+  }
+
   // What the tool step says in the thread, before and after it has run.
   function label(name, args, done) {
+    if (name === 'find_media') {
+      return `${done ? 'Found' : 'Finding'} ${args?.kind === 'video' ? 'videos' : 'pictures'} of “${String(args?.query ?? '').slice(0, 80)}”`;
+    }
     if (name === 'web_search') return `${done ? 'Searched' : 'Searching'} “${String(args?.query ?? '').slice(0, 80)}”`;
     let where = String(args?.url ?? '');
     try { const url = new URL(where); where = (url.host + url.pathname).replace(/\/$/, ''); } catch { /* shown as given */ }
@@ -213,14 +314,15 @@ window.GufoWebTools = (() => {
   // only the caller's abort is rethrown.
   async function run(name, args, signal) {
     try {
-      if (name !== 'web_search' && name !== 'fetch_url') throw new ToolError(`unknown tool ${name}`);
-      const result = await (name === 'web_search' ? webSearch : fetchUrl)(args, signal);
-      return { ok: true, text: result.text, via: result.via };
+      const tool = { web_search: webSearch, fetch_url: fetchUrl, find_media: findMedia }[name];
+      if (!tool) throw new ToolError(`unknown tool ${name}`);
+      const result = await tool(args, signal);
+      return { ok: true, text: result.text, via: result.via, ...(result.media?.length ? { media: result.media } : {}) };
     } catch (error) {
       if (signal?.aborted) throw error;
       return { ok: false, text: `Error: ${error instanceof ToolError ? error.message : 'the request failed'}`, via: null };
     }
   }
 
-  return { TOOLS, run, label, privateName, unwrapSearchLinks };
+  return { TOOLS, run, label, privateName, unwrapSearchLinks, safeMedia };
 })();

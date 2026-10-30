@@ -438,6 +438,50 @@ function renderTotal() {
 
 // ---------------------------------------------------------------- messages
 
+// Pictures and videos a tool found, each linked to its page. Only addresses on the media hosts
+// are drawn, whatever a saved chat holds.
+function mediaBox(items) {
+  const box = document.createElement('div');
+  box.className = 'media';
+  for (const raw of items) {
+    const item = window.GufoWebTools?.safeMedia(raw);
+    if (!item) continue;
+    const figure = document.createElement('figure');
+    if (item.kind === 'video') {
+      const video = document.createElement('video');
+      video.controls = true;
+      video.preload = 'none';
+      video.playsInline = true;
+      video.poster = item.thumb;
+      video.src = item.src;
+      figure.className = 'wide';
+      figure.append(video);
+    } else {
+      const link = document.createElement('a');
+      link.href = item.page;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      const img = document.createElement('img');
+      img.src = item.thumb;
+      img.alt = item.title;
+      img.loading = 'lazy';
+      img.referrerPolicy = 'no-referrer';
+      link.append(img);
+      figure.append(link);
+    }
+    const caption = document.createElement('figcaption');
+    const title = document.createElement('a');
+    title.href = item.page;
+    title.target = '_blank';
+    title.rel = 'noopener noreferrer';
+    title.textContent = item.title || 'Wikimedia Commons';
+    caption.append(title, document.createTextNode([item.license, item.author].filter(Boolean).map((part) => ` · ${part}`).join('')));
+    figure.append(caption);
+    box.append(figure);
+  }
+  return box;
+}
+
 // The figures a tool drew, shown in full with a way to keep each one.
 function figureBox(figures) {
   const box = document.createElement('div');
@@ -499,6 +543,7 @@ function fillMessage(block, message) {
     result.textContent = step.excerpt || '';
     details.append(result);
     block.append(details);
+    if (step.media?.length) block.append(mediaBox(step.media));
     if (step.figures?.length) {
       block.append(figureBox(step.figures));
     } else if (step.figureCount) {
@@ -796,6 +841,7 @@ async function send() {
         step.via = result.via;
         step.excerpt = result.text.slice(0, 1500);
         if (result.figures?.length) step.figures = result.figures;
+        if (result.media?.length) step.media = result.media;
         schedule();
         return result;
       }));

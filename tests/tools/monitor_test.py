@@ -318,9 +318,16 @@ class MonitorHttpTest(unittest.TestCase):
         # Only the chat page may read https sites (its browser tools); no other page may.
         self.assertIn("connect-src 'self' https:;", response.getheader("Content-Security-Policy"))
         self.assertIn("script-src 'self';", response.getheader("Content-Security-Policy"))
+        # Pictures and video the find_media tool shows load from Wikimedia's two media hosts and
+        # nowhere else; every other page keeps images to itself.
+        policy = response.getheader("Content-Security-Policy")
+        self.assertIn("img-src 'self' data: https://upload.wikimedia.org https://thumb.wikimedia.org;", policy)
+        self.assertIn("media-src 'self' https://upload.wikimedia.org;", policy)
         for path in ("/monitor", "/", "/static/chat.js"):
             other, _ = self.request("GET", path, {"X-Admin-Token": ADMIN_TOKEN})
             self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
+            self.assertIn("img-src 'self' data:;", other.getheader("Content-Security-Policy"), path)
+            self.assertNotIn("media-src", other.getheader("Content-Security-Policy"), path)
         scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chat")
                    if f'src="/static/{name}.js"'.encode() in data]
         self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chat"])

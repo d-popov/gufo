@@ -16,7 +16,7 @@ function load(handler) {
   };
   const window = {};
   vm.runInNewContext(source, {
-    window, fetch, URL, AbortController, setTimeout, clearTimeout, TextDecoder, Uint8Array,
+    window, fetch, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, TextDecoder, Uint8Array,
   });
   return { tools: window.GufoWebTools, calls };
 }
@@ -146,7 +146,71 @@ function reply(body, { status = 200, type = 'application/json', url = '' } = {})
     const { tools } = load(() => reply('x'));
     assert.equal(tools.label('web_search', { query: 'cats' }, false), 'Searching “cats”');
     assert.equal(tools.label('fetch_url', { url: 'https://example.com/a/b/' }, true), 'Read example.com/a/b');
-    assert.equal(tools.TOOLS.map((tool) => tool.function.name).join(), 'web_search,fetch_url');
+    assert.equal(tools.TOOLS.map((tool) => tool.function.name).join(), 'web_search,fetch_url,find_media');
+    assert.equal(tools.label('find_media', { query: 'horses' }, false), 'Finding pictures of “horses”');
+    assert.equal(tools.label('find_media', { query: 'horses', kind: 'video' }, true), 'Found videos of “horses”');
+  }
+  // find_media asks Wikimedia Commons only, and shows nothing but Commons files: the model names
+  // what to look for and never supplies an address.
+  {
+    const page = (index, title, mime, extra = {}) => ({
+      index, title, imageinfo: [{
+        mime, url: `https://upload.wikimedia.org/wikipedia/commons/a/a2/${index}.bin?utm_source=x`,
+        thumburl: `https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a2/${index}/480px-${index}.jpg`,
+        descriptionurl: `https://commons.wikimedia.org/wiki/${title.replace(' ', '_')}`,
+        extmetadata: { LicenseShortName: { value: 'CC BY-SA 4.0' }, Artist: { value: '<a href="//x">Jane</a> Doe' } },
+        ...extra,
+      }],
+    });
+    const pages = {
+      3: page(3, 'File:Third horse.jpg', 'image/jpeg'),
+      1: page(1, 'File:First_horse.JPG', 'image/jpeg'),
+      2: page(2, 'File:Drawing.svg', 'image/svg+xml'),
+      4: page(4, 'File:Tracker.jpg', 'image/jpeg', { thumburl: 'https://evil.example/pixel.jpg?d=secret' }),
+      5: page(5, 'File:Clip.webm', 'video/webm'),
+    };
+    const answer = () => reply(JSON.stringify({ query: { pages } }));
+    const { tools, calls } = load(answer);
+    const found = await tools.run('find_media', { query: 'horse', count: 99 });
+    assert.equal(found.ok, true);
+    assert.equal(calls.length, 1);
+    const request = new URL(calls[0].url);
+    assert.equal(request.origin + request.pathname, 'https://commons.wikimedia.org/w/api.php');
+    assert.equal(request.searchParams.get('gsrsearch'), 'horse filetype:bitmap');
+    assert.equal(request.searchParams.get('gsrlimit'), '16', 'count is capped at 8, asked twice over to survive filtering');
+    assert.equal(calls[0].options.credentials, 'omit');
+    assert.equal(calls[0].options.referrerPolicy, 'no-referrer');
+    // Result order, no vector drawings, no tracker host, no videos among pictures.
+    assert.equal(found.media.map((item) => item.title).join('|'), 'First horse|Third horse');
+    assert.equal(found.media[0].author, 'Jane Doe');
+    assert.equal(found.media[0].src, found.media[0].thumb, 'a picture is shown by its thumbnail');
+    assert.match(found.text, /1\. First horse \(CC BY-SA 4\.0, Jane Doe\) https:\/\/commons\.wikimedia\.org\/wiki\/File:First_horse\.JPG/);
+    assert.doesNotMatch(found.text, /evil\.example|Tracker/);
+
+    const clips = await load(answer).tools.run('find_media', { query: 'horse', kind: 'video' });
+    assert.equal(clips.media.map((item) => `${item.kind}:${item.title}`).join('|'), 'video:Clip');
+    assert.equal(clips.media[0].src, 'https://upload.wikimedia.org/wikipedia/commons/a/a2/5.bin', 'the file, without tracking parameters');
+
+    const none = await load(() => reply('{"batchcomplete":""}')).tools.run('find_media', { query: 'zzzz' });
+    assert.equal(none.ok, true);
+    assert.equal(none.media, undefined);
+    assert.match(none.text, /No pictures found/);
+    assert.equal((await load(() => reply('x', { status: 429 })).tools.run('find_media', { query: 'a' })).ok, false);
+    assert.equal((await tools.run('find_media', { query: '  ' })).ok, false);
+
+    // Whatever a saved chat holds, only Commons media on the two media hosts is drawn.
+    const safe = tools.safeMedia;
+    const good = {
+      kind: 'image', title: 't', thumb: 'https://thumb.wikimedia.org/a.jpg', src: 'https://thumb.wikimedia.org/a.jpg',
+      page: 'https://commons.wikimedia.org/wiki/File:A.jpg',
+    };
+    assert.ok(safe(good));
+    for (const bad of [
+      { ...good, thumb: 'https://evil.example/a.jpg' }, { ...good, thumb: 'http://thumb.wikimedia.org/a.jpg' },
+      { ...good, thumb: 'https://thumb.wikimedia.org.evil.example/a.jpg' }, { ...good, page: 'https://evil.example/wiki' },
+      { ...good, thumb: 'https://u:p@thumb.wikimedia.org/a.jpg' }, { ...good, kind: 'audio' },
+      { ...good, kind: 'video', src: 'https://evil.example/v.webm' }, null, 'x',
+    ]) assert.equal(safe(bad), null, JSON.stringify(bad));
   }
   console.log('Browser tools: blocked targets, direct and reader paths, errors, limits, search links and Stop passed.');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

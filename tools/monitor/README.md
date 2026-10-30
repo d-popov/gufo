@@ -80,6 +80,17 @@ private and IP-address URLs are never fetched, and page text is marked as untrus
 system note. Only the chat page may connect to https sites (`connect-src 'self' https:`);
 every other page keeps `connect-src 'self'`.
 
+**Pictures and video.** With **Pictures and video** ticked, the model can ask `find_media` for
+freely licensed photos or short clips on [Wikimedia Commons](https://commons.wikimedia.org),
+asked from your browser like the other web tools. They appear in the thread as a grid of
+thumbnails, each linked to its Commons page with its license and author; videos play in place.
+The model names what to look for and gets titles, credits and page links back; it never supplies
+an address, and the page draws only files on `upload.wikimedia.org` and `thumb.wikimedia.org`,
+which are the only image and media hosts the chat page's CSP allows. Nothing is hosted or
+copied by the monitor. Pictures are loaded straight from Wikimedia by your browser and are
+re-fetched when a saved chat is reopened. Commons holds photos and clips, not every
+web image; search results from the open web are not shown as pictures.
+
 **Python** runs the model's code in your browser, in a sandbox, and shows the charts it
 draws (matplotlib) under the step, each with a **Save PNG** link. numpy, pandas and
 matplotlib are there; variables stay between calls until the box is reset by a timeout (30 s)

@@ -152,3 +152,12 @@ input[type="text"]:focus-visible { outline: 2px solid var(--focus); outline-offs
   .project-panel .row input[type="text"] { flex-basis: 100%; }
   .project-panel .row:last-child { position: sticky; bottom: calc(-1 * var(--space-3)); margin: 0 -8px calc(-1 * var(--space-3)); padding: 8px; border-top: 1px solid var(--line); background: var(--surface); }
 }
+
+/* Pictures and videos a tool found: a grid of thumbnails, each linked to its page. */
+.message .media { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-2); margin: 0 0 var(--space-2); }
+.message .media figure { margin: 0; min-width: 0; }
+.message .media figure.wide { grid-column: 1 / -1; }
+.message .media img, .message .media video { display: block; width: 100%; height: 150px; margin: 0; object-fit: cover; background: var(--panel); border-radius: var(--radius-sm); }
+.message .media video { height: auto; max-height: 360px; object-fit: contain; background: #000; }
+.message .media figcaption { margin-top: 2px; color: var(--muted); font-size: var(--text-xs); line-height: 1.3; overflow-wrap: anywhere; }
+.message .media figcaption a { color: var(--accent); }

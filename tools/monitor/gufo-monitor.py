@@ -96,11 +96,16 @@ SECURITY_HEADERS = (
     ("Cross-Origin-Opener-Policy", "same-origin"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
 )
+# The find_media tool shows pictures and video from Wikimedia Commons: its thumbnails and files
+# come from these hosts, and no other image or media host may load on the chat page.
+UPLOAD_HOST = "https://upload.wikimedia.org"
+MEDIA_HOSTS = f"{UPLOAD_HOST} https://thumb.wikimedia.org"
 # The chat page alone may also read https sites: its browser tools (static/webtools.js) make
 # the model's web requests from the user's browser, with no credentials. Every other page
 # keeps `connect-src 'self'`.
 CHAT_SECURITY_HEADERS = tuple(
-    (name, value.replace("connect-src 'self';", "connect-src 'self' https:;"))
+    (name, value.replace("connect-src 'self';", "connect-src 'self' https:;")
+     .replace("img-src 'self' data:;", f"img-src 'self' data: {MEDIA_HOSTS}; media-src 'self' {UPLOAD_HOST};"))
     if name == "Content-Security-Policy" else (name, value)
     for name, value in SECURITY_HEADERS)
 
