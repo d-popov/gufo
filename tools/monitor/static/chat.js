@@ -5,6 +5,7 @@ const SCOPE_KEY = 'gufo-chat-project';
 const EFFORT_KEY = 'gufo-chat-effort';
 const BROWSER_KEY = 'gufo-chat-browser';
 const TOOLS_KEY = 'gufo-chat-tools';
+const MODEL_KEY = 'gufo-chat-model';
 const LIST_MAX = 200;           // chats listed at once
 const MEMORY_IDLE_MS = 60_000;  // after a reply, how long before the project memory is updated
 const NEW_PROJECT = '__new';
@@ -948,6 +949,7 @@ function autosize() {
 }
 $('prompt').addEventListener('input', autosize);
 $('effort').value = localStorage.getItem(EFFORT_KEY) || '';
+$('model').addEventListener('change', () => localStorage.setItem(MODEL_KEY, $('model').value));
 $('effort').addEventListener('change', () => localStorage.setItem(EFFORT_KEY, $('effort').value));
 
 // ---------------------------------------------------------------- tools menu
@@ -1059,7 +1061,10 @@ async function loadModels() {
       option.textContent = id;
       return option;
     }));
-    if (data.models.includes(chosen)) select.value = chosen;
+    // What the user picked, here or on an earlier visit; else the monitor's default; else the first.
+    const remembered = localStorage.getItem(MODEL_KEY);
+    const pick = [chosen, remembered, data.default].find((id) => id && data.models.includes(id));
+    if (pick) select.value = pick;
     noteModels(found ? '' : 'No served model found yet; trying again…');
     renderToolsMenu();
     renderTotal();

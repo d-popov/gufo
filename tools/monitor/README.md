@@ -125,6 +125,7 @@ Scripts send the admin token as `X-Admin-Token: <token>` or
 | `--gufo URL` | `http://127.0.0.1:8080` | Gufo base URL |
 | `--gufo-key-file FILE` | none | file holding the server's `--api-key`; read and used only by the monitor |
 | `--chat-key-file FILE` | the monitor's key | file holding an inference key for the admin's chat; keeps `--gufo-key-file` read-only |
+| `--chat-model NAME` | the first served model | the model the chat page selects until a user picks another; the page then remembers that choice in the browser |
 | `--bind`, `--port` | `127.0.0.1`, `8099` | listen address of the monitor and the portal |
 | `--log-source` | `none` | `podman:CONTAINER`, `file:PATH` or `none` |
 | `--log-since` | `1h` | podman log backlog read at start |

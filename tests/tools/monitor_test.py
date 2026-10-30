@@ -382,7 +382,17 @@ class MonitorHttpTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as empty, mock.patch.object(gm, "PYODIDE_DIR", Path(empty)):
             response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(json.loads(data), {"models": ["fn", "fn-sub"], "pricing": None,
-                                            "billed": False, "python": False})
+                                            "billed": False, "python": False, "default": None})
+
+    def test_chat_default_model_is_offered_only_when_served(self):
+        try:
+            for configured, expected in (("fn-sub", "fn-sub"), ("gone", None)):
+                self.server.chat_model = configured
+                with mock.patch.object(gm, "PYODIDE_DIR", Path("/nonexistent")):
+                    _, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
+                self.assertEqual(json.loads(data)["default"], expected, configured)
+        finally:
+            self.server.chat_model = None
 
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",

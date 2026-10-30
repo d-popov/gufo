@@ -1619,7 +1619,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, monitor: Monitor, admin: AdminAuth, secure_cookie: bool,
-                 keys: KeyStore | None = None, billing=None, chat_key: str | None = None):
+                 keys: KeyStore | None = None, billing=None, chat_key: str | None = None,
+                 chat_model: str | None = None):
         super().__init__(address, Handler)
         self.monitor = monitor
         self.admin = admin
@@ -1627,6 +1628,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.keys = keys  # None: no --keys-file, the key routes answer 404
         # The inference key of the admin's chat (--chat-key-file); None uses the monitor's own.
         self.chat_key = chat_key
+        # The model the chat page selects until the user picks another (--chat-model).
+        self.chat_model = chat_model
         # Sign-in attempts (admin, portal login and signup), budgeted per kind and client.
         self.limiter = RateLimiter()
         # None without --billing-config: the account and portal routes answer 404.
@@ -1977,6 +1980,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 model: dict(billing.pricing.for_model(model)) for model in ids},
             "billed": not self._admin(),
             "python": python_installed(),
+            "default": self.server.chat_model if self.server.chat_model in ids else None,
         }).encode())
 
     def _relay_stream(self, upstream):
@@ -2183,6 +2187,9 @@ def parse_args(argv=None):
                         help="file holding an inference key for the admin's chat; the "
                              "monitor's own --gufo-key-file key is often read-only "
                              "(access=monitor), which Gufo refuses for chat")
+    parser.add_argument("--chat-model", metavar="NAME",
+                        help="the served model the chat page selects until a user picks another "
+                             "(default: the first one listed)")
     parser.add_argument("--bind", default="127.0.0.1",
                         help="listen address, for the monitor and the portal")
     parser.add_argument("--port", type=int, default=8099)
@@ -2296,7 +2303,7 @@ def main(argv=None) -> int:
             return 2
         monitor.billing = service
     server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
-                    chat_key)
+                    chat_key, args.chat_model)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":
