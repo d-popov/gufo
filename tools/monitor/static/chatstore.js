@@ -4,13 +4,13 @@
 // more than localStorage and is never sent to the monitor. If the browser refuses it (some private
 // windows), the same calls work in memory and `persistent` is false, so the page can say so.
 (() => {
-  const NAME = 'gufo-chat';
+  const DEFAULT_NAME = 'gufo-chat';
   const TABLES = ['chats', 'projects'];
 
-  function openDatabase() {
+  function openDatabase(name) {
     return new Promise((resolve, reject) => {
       if (!window.indexedDB) { reject(new Error('no IndexedDB')); return; }
-      const request = indexedDB.open(NAME, 1);
+      const request = indexedDB.open(name, 1);
       request.onupgradeneeded = () => {
         for (const table of TABLES) request.result.createObjectStore(table, { keyPath: 'id' });
       };
@@ -53,9 +53,9 @@
     } catch { return []; }  // unreadable or refused: the old copy stays
   }
 
-  async function open() {
+  async function open(name = DEFAULT_NAME) {
     let db = null;
-    try { db = await openDatabase(); } catch { db = null; }
+    try { db = await openDatabase(name); } catch { db = null; }
     const memory = new Map(TABLES.map((table) => [table, new Map()]));
     return {
       persistent: db !== null,

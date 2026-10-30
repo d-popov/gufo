@@ -36,15 +36,23 @@ any, and each reply shows its speed (tok/s), time to first token, token counts a
 users are charged). The chat's running total (cost and tokens) stays in view above the
 conversation. **Thinking** sets the model's reasoning effort (Default leaves it to the
 server; Off, Low, Medium, High and Max are sent as `reasoning_effort`). Images attach with
-the button or by pasting (Ctrl+V). The browser keeps every conversation in its own database
-(IndexedDB), with no limit but the browser's quota and nothing stored on the monitor; the
-chat list shows the 200 most recent of the open project. A reply keeps being written when the page goes to the background or loses its network (a phone
+the button or by pasting (Ctrl+V). Chats and projects belong to the signed-in account (the admin, or a portal
+user), so the same account sees the same ones on every device. Each browser works from its own
+database (IndexedDB), one per account, and the page never waits for the network: a change is sent
+to the monitor about a second and a half later, and the monitor's changes are read on opening the
+page, on returning to it, when the network comes back and every 45 s. Two devices editing one
+chat or project: the later edit (by the device's clock) wins. A deleted one is remembered for 90
+days so a device that was away learns of it. The monitor keeps them in `--chat-store`
+(`~/.config/gufo-monitor/chats.sqlite`, mode 0600), up to 256 MiB and 20,000 items per account, a
+chat up to 4 MiB and a project up to 256 KiB; **the admin can read that file, so the
+conversations are not private from whoever runs the monitor**. Image bytes are never stored or sent.
+The chat list shows the 200 most recent of the open project. If the monitor is older or sync is
+off, chats stay in the browser alone; an unknown account gets an in-memory copy and no database. A reply keeps being written when the page goes to the background or loses its network (a phone
 switching apps): the monitor generates it in a run that does not depend on the browser's connection,
 and the page reads the rest when it is back, from the event where it stopped. **Stop** ends the run
 and the generation; a run nobody has read for three minutes is stopped too, and a finished one stays
 readable for ten (kept in the monitor's memory only, for the user who started it). **Delete** removes the open chat,
-after a second click to confirm. Image bytes are not kept. Moving to another browser or
-device does not bring the chats along: use a project's Export for its notes.
+after a second click to confirm. Image bytes are not kept. A project's Export still downloads its notes as a file.
 
 **Projects.** The first box in the toolbar picks a project: a folder of chats that share two
 plain Markdown notes, both editable in the **Project** panel.
@@ -130,6 +138,7 @@ Scripts send the admin token as `X-Admin-Token: <token>` or
 | `--gufo-key-file FILE` | none | file holding the server's `--api-key`; read and used only by the monitor |
 | `--chat-key-file FILE` | the monitor's key | file holding an inference key for the admin's chat; keeps `--gufo-key-file` read-only |
 | `--chat-model NAME` | the first served model | the model the chat page selects until a user picks another; the page then remembers that choice in the browser |
+| `--chat-store FILE` | `~/.config/gufo-monitor/chats.sqlite` | where every account's chats and projects are kept, so they follow the account between devices |
 | `--bind`, `--port` | `127.0.0.1`, `8099` | listen address of the monitor and the portal |
 | `--log-source` | `none` | `podman:CONTAINER`, `file:PATH` or `none` |
 | `--log-since` | `1h` | podman log backlog read at start |

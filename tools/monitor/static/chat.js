@@ -29,6 +29,10 @@ let chats = [];       // every conversation, in every project
 let projects = [];
 let scope = localStorage.getItem(SCOPE_KEY) || '';  // the project shown, or '' for chats outside any
 let activeId = null;
+let sync = null;       // keeps these chats and projects in step with the monitor's copy (chatsync.js)
+let replyingId = null; // the chat a reply is being written into
+let ownerKnown = null; // who this browser is signed in as, from the monitor: {owner, sync}
+const ownerReady = new Promise((resolve) => { ownerKnown = resolve; });
 let pendingImages = [];
 let prices = null;  // {model: {input, cached_input, output}} micro-USD per 1M tokens, or null
 let billed = false;  // false for the admin: prices are shown, nothing is charged
@@ -39,7 +43,7 @@ const toolkit = (() => { try { return window.GufoTools.create(); } catch { retur
 let allowedTools = loadAllowedTools();  // what the user ticked in the Tools menu, kept between visits
 let pythonInstalled = false;            // set by loadModels: is the Python runtime on the monitor?
 
-// ---------------------------------------------------------------- history (this browser only)
+// ---------------------------------------------------------------- history (this browser, kept in step with the monitor)
 
 function failedToSave() {
   $('status').textContent = 'The browser would not store this change (storage full or blocked).';
@@ -56,8 +60,16 @@ function plainChat(chat) {
   };
 }
 
-function saveChat(chat) { store.put('chats', plainChat(chat)).catch(failedToSave); }
-function saveProject(project) { project.updated = Date.now(); store.put('projects', { ...project }).catch(failedToSave); }
+function saveChat(chat) {
+  chat.modified = Date.now();  // what decides between two devices' edits; `updated` only orders the list
+  store.put('chats', plainChat(chat)).catch(failedToSave);
+  sync?.touch('chat', chat.id);
+}
+function saveProject(project) {
+  project.updated = Date.now();
+  store.put('projects', { ...project }).catch(failedToSave);
+  sync?.touch('project', project.id);
+}
 
 // What stands in for the browser database when chatstore.js did not load.
 function volatileStore() {
@@ -70,14 +82,99 @@ function volatileStore() {
   };
 }
 
-async function loadStore() {
-  store = window.GufoStore ? await window.GufoStore.open() : volatileStore();
+// One database per signed-in account, so two people on one browser never see each other's chats.
+// The admin's keeps the name the first version used.
+function databaseFor(owner) { return owner === 'admin' ? 'gufo-chat' : `gufo-chat-${String(owner).replace(/[^\w-]/g, '_')}`; }
+
+async function loadStore(owner) {
+  store = window.GufoStore ? await window.GufoStore.open(databaseFor(owner)) : volatileStore();
   if (!store.persistent && window.GufoStore) $('status').textContent = 'This browser blocks storage: chats last until you close the page.';
   [chats, projects] = await Promise.all([store.getAll('chats'), store.getAll('projects')]);
   // The first version kept 10 chats in localStorage; move them over once.
-  if (window.GufoStore) chats.push(...await window.GufoStore.migrate(store, localStorage, OLD_STORAGE_KEY, chats));
+  if (window.GufoStore && owner === 'admin') chats.push(...await window.GufoStore.migrate(store, localStorage, OLD_STORAGE_KEY, chats));
   chats = chats.filter((chat) => chat && typeof chat.id === 'string' && Array.isArray(chat.messages));
   if (scope && !projects.some((project) => project.id === scope)) scope = '';
+}
+
+// ---- sync with the monitor
+
+function applyRemote(kind, id, data) {
+  if (kind === 'chat') {
+    if (!data || typeof data.id !== 'string' || !Array.isArray(data.messages)) return;
+    const at = chats.findIndex((item) => item.id === id);
+    if (at >= 0) chats[at] = data; else chats.push(data);
+    store.put('chats', data).catch(failedToSave);
+  } else {
+    if (!data || typeof data.id !== 'string') return;
+    const at = projects.findIndex((item) => item.id === id);
+    if (at >= 0) projects[at] = data; else projects.push(data);
+    store.put('projects', data).catch(failedToSave);
+  }
+}
+
+function dropRemote(kind, id) {
+  if (kind === 'chat') { chats = chats.filter((item) => item.id !== id); store.remove('chats', id).catch(failedToSave); }
+  else { projects = projects.filter((item) => item.id !== id); store.remove('projects', id).catch(failedToSave); }
+}
+
+// The monitor had newer chats or projects: show them, without disturbing what is being typed or written.
+function showSynced(changes) {
+  if (scope && !projects.some((project) => project.id === scope)) {
+    scope = '';
+    localStorage.setItem(SCOPE_KEY, '');
+    setProjectOpen(false);
+  }
+  renderProjectList();
+  if (!active()) {
+    activeId = scoped()[0]?.id ?? null;
+    if (activeId) showChat(activeId); else newChat();
+  } else {
+    renderHistoryList();
+    if (changes.chats.includes(activeId) && !busy) { renderMessages(); renderTotal(); }
+  }
+  const project = currentProject();
+  if (project && changes.projects.includes(project.id) && !$('project-panel').hidden) {
+    for (const [id, value] of [['project-name', project.name], ['project-guidelines', project.guidelines], ['project-memory', project.memory]]) {
+      if (document.activeElement !== $(id)) $(id).value = value;
+    }
+  }
+}
+
+function startSync(owner) {
+  sync = window.GufoSync.create({
+    owner, storage: localStorage,
+    request: async (method, path, body) => {
+      const response = await fetch(path, {
+        method, headers: { 'X-Gufo-Portal': '1', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let json = null;
+      try { json = await response.json(); } catch { /* no body */ }
+      return { status: response.status, json };
+    },
+    list: () => [...chats.map((item) => ({ kind: 'chat', id: item.id })), ...projects.map((item) => ({ kind: 'project', id: item.id }))],
+    read: (kind, id) => {
+      if (kind === 'chat') {
+        const item = chats.find((chat) => chat.id === id);
+        return !item || item.messages.length === 0 ? null : { updated: item.modified ?? item.updated, data: plainChat(item) };
+      }
+      const item = projects.find((project) => project.id === id);
+      return item ? { updated: item.updated, data: { ...item } } : null;
+    },
+    stamp: (kind, id) => {
+      const item = (kind === 'chat' ? chats : projects).find((entry) => entry.id === id);
+      return item ? (item.modified ?? item.updated ?? 0) : null;
+    },
+    apply: applyRemote, drop: dropRemote,
+    busy: (kind, id) => kind === 'chat' && id === replyingId,
+    onChange: showSynced,
+    onError: (message) => { $('status').textContent = message; },
+  });
+  const run = () => { sync.sync().catch(() => {}); };
+  run();
+  setInterval(() => { if (!document.hidden) run(); }, 45000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) run(); });
+  window.addEventListener('online', run);
 }
 
 function active() { return chats.find((item) => item.id === activeId); }
@@ -170,7 +267,10 @@ function deleteChat() {
   const gone = active();
   clearTimeout(memoryTimer);
   chats = chats.filter((item) => item !== gone);
-  if (gone) store.remove('chats', gone.id).catch(failedToSave);
+  if (gone) {
+    store.remove('chats', gone.id).catch(failedToSave);
+    if (gone.messages.length) sync?.forget('chat', gone.id);
+  }
   activeId = scoped()[0]?.id ?? null;
   if (!activeId) { newChat(); return; }
   showChat(activeId);
@@ -375,6 +475,7 @@ function deleteProject() {
   }
   projects = projects.filter((item) => item !== project);
   store.remove('projects', project.id).catch(failedToSave);
+  sync?.forget('project', project.id);
   scope = '';
   localStorage.setItem(SCOPE_KEY, '');
   setProjectOpen(false);
@@ -862,6 +963,7 @@ async function send() {
   const block = $('messages').lastElementChild;
   updateHistory(chat);
   controller = new AbortController();
+  replyingId = chat.id;
   setBusy(true);
   $('status').textContent = '';
 
@@ -980,6 +1082,7 @@ async function send() {
       };
     }
     controller = null;
+    replyingId = null;
     setBusy(false);
     $('status').textContent = '';
     delete reply.pending;
@@ -1160,6 +1263,7 @@ async function loadModels() {
     prices = data.pricing;
     billed = data.billed;
     pythonInstalled = Boolean(data.python);
+    ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');
     const chosen = select.value;
@@ -1188,11 +1292,22 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden && !$
     $('project').hidden = true;
     $('status').textContent = 'Projects did not load (restart the monitor so it serves the new scripts).';
   }
-  try { await loadStore(); } catch { $('status').textContent = 'Could not read the saved chats from this browser.'; }
+  // Whose chats these are comes from the monitor; without an answer the chats last for this visit only.
+  const who = await Promise.race([ownerReady, new Promise((resolve) => setTimeout(() => resolve(null), 20000))]);
+  try {
+    if (who?.owner) await loadStore(who.owner);
+    else {
+      // Never guess whose chats these are: an unknown account gets a private in-memory copy, not a shared database.
+      store = volatileStore();
+      $('status').textContent = who ? 'The monitor is out of date (restart it): chats last until you close the page.'
+        : 'The monitor did not answer: chats last until you close the page.';
+    }
+  } catch { $('status').textContent = 'Could not read the saved chats from this browser.'; }
   try {
     renderProjectList();
     activeId = scoped()[0]?.id ?? null;
     if (activeId) showChat(activeId); else newChat();
     renderToolsMenu();
   } catch (error) { $('status').textContent = `The chat could not start: ${error.message}`; }
+  if (who?.sync && window.GufoSync) startSync(who.owner);
 })();

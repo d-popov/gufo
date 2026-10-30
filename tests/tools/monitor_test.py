@@ -346,9 +346,9 @@ class MonitorHttpTest(unittest.TestCase):
             self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
             self.assertIn("img-src 'self' data:;", other.getheader("Content-Security-Policy"), path)
             self.assertNotIn("media-src", other.getheader("Content-Security-Policy"), path)
-        scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chat")
+        scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chatsync", "chat")
                    if f'src="/static/{name}.js"'.encode() in data]
-        self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chat"])
+        self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chatsync", "chat"])
         self.assertEqual([data.index(f'src="/static/{n}.js"'.encode()) for n in scripts],
                          sorted(data.index(f'src="/static/{n}.js"'.encode()) for n in scripts),
                          "tools.js and chat.js need the scripts they build on loaded first")
@@ -480,7 +480,8 @@ class MonitorHttpTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as empty, mock.patch.object(gm, "PYODIDE_DIR", Path(empty)):
             response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(json.loads(data), {"models": ["fn", "fn-sub"], "pricing": None,
-                                            "billed": False, "python": False, "default": None})
+                                            "billed": False, "python": False, "default": None,
+                                            "owner": "admin", "sync": False})
 
     def test_chat_default_model_is_offered_only_when_served(self):
         try:
@@ -495,7 +496,7 @@ class MonitorHttpTest(unittest.TestCase):
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
                      "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
-                     "projects.js", "chatstore.js",
+                     "projects.js", "chatstore.js", "chatsync.js",
                      "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
@@ -637,6 +638,159 @@ class AdminChatKeyTest(unittest.TestCase):
     def test_chat_key_file_option(self):
         self.assertEqual(gm.parse_args(["--chat-key-file", "/tmp/k"]).chat_key_file, Path("/tmp/k"))
         self.assertIsNone(gm.parse_args([]).chat_key_file)
+
+
+class ChatStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.store = gm.ChatStore(":memory:")
+        self.addCleanup(self.store.close)
+
+    def test_changes_come_back_in_revision_order_and_only_once_seen(self):
+        a = self.store.put("u1", "chat", "a", 100, {"title": "A"})
+        b = self.store.put("u1", "project", "p", 110, {"name": "P"})
+        self.assertTrue(a["applied"] and b["applied"])
+        page = self.store.since("u1", 0)
+        self.assertEqual([(i["kind"], i["id"]) for i in page["items"]], [("chat", "a"), ("project", "p")])
+        self.assertFalse(page["more"])
+        self.assertEqual(self.store.since("u1", page["through"])["items"], [])
+        self.store.put("u1", "chat", "a", 120, {"title": "A2"})
+        again = self.store.since("u1", page["through"])
+        self.assertEqual([(i["id"], i["data"]["title"]) for i in again["items"]], [("a", "A2")])
+
+    def test_users_never_see_each_others_items(self):
+        self.store.put("u1", "chat", "a", 100, {"title": "mine"})
+        self.store.put("u2", "chat", "a", 100, {"title": "yours"})
+        self.assertEqual([i["data"]["title"] for i in self.store.since("u1", 0)["items"]], ["mine"])
+        self.assertEqual([i["data"]["title"] for i in self.store.since("u2", 0)["items"]], ["yours"])
+
+    def test_the_later_edit_wins_and_the_loser_is_told_what_was_kept(self):
+        self.store.put("u", "chat", "a", 200, {"title": "newer"})
+        stale = self.store.put("u", "chat", "a", 150, {"title": "older"})
+        self.assertFalse(stale["applied"])
+        self.assertEqual(stale["item"]["data"]["title"], "newer")
+        self.assertTrue(self.store.put("u", "chat", "a", 200, {"title": "newer"})["applied"], "a retry is accepted")
+
+    def test_a_delete_keeps_a_tombstone_and_only_a_later_edit_brings_the_item_back(self):
+        self.store.put("u", "chat", "a", 100, {"title": "x" * 50})
+        gone = self.store.delete("u", "chat", "a", 200)
+        self.assertTrue(gone["applied"] and gone["item"]["deleted"])
+        item = self.store.since("u", 0)["items"][0]
+        self.assertEqual((item["deleted"], item["data"]), (True, None))
+        self.assertFalse(self.store.put("u", "chat", "a", 150, {"title": "late write"})["applied"])
+        self.assertTrue(self.store.put("u", "chat", "a", 300, {"title": "back"})["applied"])
+        self.assertFalse(self.store.delete("u", "chat", "a", 250)["applied"], "edited after this delete")
+
+    def test_tombstones_are_forgotten_after_their_time_but_items_are_not(self):
+        self.store.put("u", "chat", "keep", 1, {"title": "old but live"})
+        self.store.put("u", "chat", "gone", 1, {"title": "x"})
+        self.store.delete("u", "chat", "gone", 1000)
+        self.store.purge(now_ms=1000 + gm.CHAT_TOMBSTONE_S * 1000 + 1)
+        self.assertEqual([i["id"] for i in self.store.since("u", 0)["items"]], ["keep"])
+
+    def test_size_count_and_id_limits(self):
+        with self.assertRaises(gm.ChatStoreError) as big:
+            self.store.put("u", "project", "p", 1, {"memory": "x" * gm.CHAT_ITEM_MAX["project"]})
+        self.assertEqual(big.exception.status, 413)
+        for bad in ("", "a/b", "x" * 65, "sp ace"):
+            with self.assertRaises(gm.ChatStoreError, msg=bad):
+                self.store.put("u", "chat", bad, 1, {})
+        with self.assertRaises(gm.ChatStoreError):
+            self.store.put("u", "folder", "a", 1, {})
+        with mock.patch.object(gm, "CHAT_OWNER_BYTES", 300):
+            self.store.put("u", "chat", "a", 1, {"t": "x" * 150})
+            with self.assertRaises(gm.ChatStoreError) as full:
+                self.store.put("u", "chat", "b", 1, {"t": "x" * 200})
+            self.assertEqual(full.exception.status, 413)
+            self.store.put("u", "chat", "a", 2, {"t": "y" * 200})  # replacing counts the old size out
+            self.store.delete("u", "chat", "a", 3)
+            self.store.put("u", "chat", "b", 4, {"t": "x" * 200})  # deleting frees the space
+        with mock.patch.object(gm, "CHAT_OWNER_ITEMS", 2):
+            self.store.put("v", "chat", "1", 1, {})
+            self.store.put("v", "chat", "2", 1, {})
+            with self.assertRaises(gm.ChatStoreError):
+                self.store.put("v", "chat", "3", 1, {})
+
+    def test_a_big_history_arrives_in_pages_that_chain(self):
+        with mock.patch.object(gm, "CHAT_SYNC_PAGE_BYTES", 2500):
+            for index in range(8):
+                self.store.put("u", "chat", f"c{index}", index, {"body": "z" * 900})
+            seen, since, pages = [], 0, 0
+            while True:
+                page = self.store.since("u", since)
+                seen += [item["id"] for item in page["items"]]
+                since, pages = page["through"], pages + 1
+                if not page["more"]:
+                    break
+        self.assertEqual(seen, [f"c{i}" for i in range(8)])
+        self.assertGreater(pages, 1)
+
+
+class ChatSyncHttpTest(unittest.TestCase):
+    def setUp(self):
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        store = gm.ChatStore(":memory:")
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False,
+                                      chat_store=store))
+        self.addCleanup(lambda: (self.server.shutdown(), self.server.server_close(), store.close()))
+        self.port = self.server.server_address[1]
+
+    def call(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        data = None if body is None else json.dumps(body).encode()
+        merged = {"X-Admin-Token": ADMIN_TOKEN, **(headers or {})}
+        if data is not None:
+            merged.update({"Content-Type": "application/json", "Content-Length": str(len(data))})
+        connection.request(method, path, data, merged)
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
+        return response.status, (json.loads(payload) if payload else None)
+
+    def test_the_admin_stores_reads_and_deletes(self):
+        status, stored = self.call("PUT", "/api/chat/items/chat/abc", {"updated": 5, "data": {"title": "hi"}})
+        self.assertEqual((status, stored["applied"]), (200, True))
+        status, page = self.call("GET", "/api/chat/sync?since=0")
+        self.assertEqual((status, page["owner"], [i["id"] for i in page["items"]]), (200, "admin", ["abc"]))
+        status, stale = self.call("PUT", "/api/chat/items/chat/abc", {"updated": 4, "data": {"title": "old"}})
+        self.assertEqual((status, stale["applied"], stale["item"]["data"]["title"]), (200, False, "hi"))
+        self.assertEqual(self.call("DELETE", "/api/chat/items/chat/abc?at=9")[1]["applied"], True)
+        _, page = self.call("GET", "/api/chat/sync?since=0")
+        self.assertEqual([(i["id"], i["deleted"]) for i in page["items"]], [("abc", True)])
+
+    def test_bad_requests_and_no_sign_in(self):
+        self.assertEqual(self.call("GET", "/api/chat/sync", headers={"X-Admin-Token": "wrong"})[0], 401)
+        self.assertEqual(self.call("PUT", "/api/chat/items/chat/a", {"updated": 1, "data": {}},
+                                   headers={"X-Admin-Token": "wrong"})[0], 401)
+        for body in ({}, {"updated": "1", "data": {}}, {"updated": True, "data": {}}, {"updated": 1, "data": []}):
+            self.assertEqual(self.call("PUT", "/api/chat/items/chat/a", body)[0], 400, body)
+        self.assertEqual(self.call("PUT", "/api/chat/items/chat/a%2Fb", {"updated": 1, "data": {}})[0], 400)
+        self.assertEqual(self.call("PUT", "/api/chat/items/note/a", {"updated": 1, "data": {}})[0], 400)
+        self.assertEqual(self.call("GET", "/api/chat/sync?since=x")[0], 400)
+
+    def test_portal_users_are_separate_and_need_the_csrf_header_to_write(self):
+        users = {"1": {"id": 1}, "2": {"id": 2}}
+
+        def chat_user(handler):
+            return users.get(handler.headers.get("X-Test-User"))
+
+        with mock.patch.object(gm.Handler, "_chat_user", chat_user):
+            as_user = lambda n, extra=None: {"X-Admin-Token": "", "X-Test-User": n, **(extra or {})}  # noqa: E731
+            put = lambda n, headers: self.call("PUT", "/api/chat/items/chat/a", {"updated": 1, "data": {"title": n}}, headers)  # noqa: E731
+            self.assertEqual(put("1", as_user("1"))[0], 403, "a user's write needs X-Gufo-Portal")
+            self.assertEqual(put("1", as_user("1", {"X-Gufo-Portal": "1"}))[0], 200)
+            self.assertEqual(put("2", as_user("2", {"X-Gufo-Portal": "1"}))[0], 200)
+            titles = {n: self.call("GET", "/api/chat/sync", headers=as_user(n))[1]["items"][0]["data"]["title"]
+                      for n in ("1", "2")}
+            self.assertEqual(titles, {"1": "1", "2": "2"})
+            admin = self.call("GET", "/api/chat/sync")[1]
+            self.assertEqual((admin["owner"], admin["items"]), ("admin", []))
+
+    def test_without_a_store_sync_is_off_and_the_page_is_told(self):
+        self.server.chat_store = None
+        self.assertEqual(self.call("GET", "/api/chat/sync")[0], 404)
+        with mock.patch.object(gm, "PYODIDE_DIR", Path("/nonexistent")):
+            _, models = self.call("GET", "/api/chat/models")
+        self.assertEqual((models["sync"], models["owner"]), (False, "admin"))
 
 
 class GufoStatusTest(unittest.TestCase):
