@@ -228,23 +228,37 @@ cost.
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 `--decode-rounds N` runs every active decoder N rounds after each prefill chunk
-instead of one. On Flash-Next MTP, one decoding stream beside a cold 37.6K-token
-prefill gave (solo prefill 22.8 s = 1649 tok/s, solo decode about 170
-characters/s):
+instead of one. On Flash-Next MTP (`qwen3.8-flash-next-sub`, 3 slots), one
+decoding stream beside a cold 37.6K-token prefill gave, measured on 2026-10-30
+with `tools/bench/prefill-decode-sweep.py` (solo prefill 23.2 s = 1620 tok/s,
+solo decode about 165 characters/s):
 
 | `--prefill-chunk` | `--decode-rounds` | Prefill | Prefill tok/s | Decode during prefill | Longest decode gap |
 | --- | --- | --- | --- | --- | --- |
-| 512 (default) | 1 (default) | 41.4 s | 909 | 10.9 characters/s | 0.75 s |
-| 1024 | 4 | 34.0 s | 1108 | 27.5 characters/s | 0.82 s |
-| 1024 | 8 | 40.5 s | 930 | 50.6 characters/s | 0.83 s |
-| 2048 | 8 | 30.4 s | 1238 | 29.1 characters/s | 1.70 s |
-| 2048 | 16 | 36.3 s | 1039 | 52.4 characters/s | 1.65 s |
+| 512 (default) | 1 (default) | 34.7 s | 1086 | 11.3 characters/s | 0.51 s |
+| 1024 | 4 | 32.8 s | 1148 | 26.2 characters/s | 0.81 s |
+| 1024 | 8 | 39.7 s | 947 | 51.2 characters/s | 0.82 s |
+| 1024 | 16 | 53.8 s | 700 | 84.1 characters/s | 0.82 s |
+| 2048 | 8 | 30.2 s | 1246 | 28.2 characters/s | 1.41 s |
+| 2048 | 16 | 36.8 s | 1022 | 54.5 characters/s | 1.41 s |
+| 4096 | 16 | 28.6 s | 1315 | 27.1 characters/s | 2.66 s |
 
-Choose 1024/8 for prefill speed equal to the default with about 4.6 times its
-decode speed beside a prefill, or 2048/16 for about 14% faster prefill and the
-same decode speed at the cost of longer pauses. 1024/4 and 2048/8 favor prefill,
-for code agents that mostly read. One run each, Flash-Next MTP only; the
-defaults stay 512/1 for models not measured. `tools/bench/prefill-decode-sweep.py` repeats the measurement for any `--prefill-chunk` × `--decode-rounds` grid: it starts one private server per setting from a command you give it, so stop other GPU users first. With session classes pass `--model` for a class with at least two slots (the sweep refuses a one-slot class, where the arrival would queue behind the decoding stream) and read the result for that shape.
+One run per row. An earlier by-hand run of the same shape agreed within 4% for
+1024/4, 1024/8, 2048/8 and 2048/16, so those rows reproduce; the default 512/1
+prefill was 41.4 s then and is 34.7 s now. No setting wins on every column:
+more decode rounds buy decode speed beside a prefill at the cost of prefill time,
+and a larger chunk buys prefill time at the cost of longer pauses. 1024/8 (the
+production setting) gives about 4.5 times the default's decode speed beside a
+prefill for a prefill 14% slower than the default; 2048/16 gives slightly more
+of both (7% faster prefill and 6% more decode than 1024/8) with a longest pause
+of 1.41 s instead of 0.82 s; 2048/8 and 4096/16 favor prefill, for code agents
+that mostly read. Defaults stay 512/1 for models not measured.
+`tools/bench/prefill-decode-sweep.py` repeats the measurement for any
+`--prefill-chunk` × `--decode-rounds` grid: it starts one private server per
+setting from a command you give it, so stop other GPU users first. With session
+classes pass `--model` for a class with at least two slots (the sweep refuses a
+one-slot class, where the arrival would queue behind the decoding stream) and
+read the result for that shape.
 
 Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
 hash and exact encoded-byte comparison under the preprocessing version and
