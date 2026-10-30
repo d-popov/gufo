@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/cli/serve/component_cache_metrics.hpp"
+#include "src/cli/serve/logprobs.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -119,6 +120,9 @@ struct ChatRequest {
   bool cache_prompt{true};
   /// Served model that runs this request; empty selects the first one.
   std::string model;
+  /// False keeps this request's checkpoints out of the disk cache; it may
+  /// still read existing disk checkpoints and use the RAM cache.
+  bool cache_persist{true};
   /// Optional streaming prompt progress; never changes prompt or cache
   /// identity.
   bool return_progress{false};
@@ -131,11 +135,11 @@ struct ChatRequest {
 ///
 /// Implementations retain ownership of tokenization, templates, complete
 /// continuation state, and execution resources. The transport observes only
-/// generated text pieces and aggregate request metrics.
+/// generated text pieces, optional token probabilities and aggregate metrics.
 class TextGenerationBackend {
 public:
   using CancellationCheck = std::function<bool()>;
-  using TokenCallback = std::function<bool(std::string_view)>;
+  using TokenCallback = std::function<bool(const TokenPiece&)>;
 
   /// llama-server `prompt_progress`; `processed` includes cached tokens.
   struct PromptProgress {
@@ -221,6 +225,7 @@ public:
     /// Absent for text-only prompts.
     std::optional<ImageMetrics> images;
     std::string text;
+    std::vector<DecodedLogprobs> logprobs;
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};
     std::size_t cached_prompt_tokens{0};
@@ -376,8 +381,8 @@ public:
                           const TokenCallback& on_token = {},
                           std::string_view client_id = "anonymous",
                           const std::vector<std::string>& stop_sequences = {},
-                          bool cache_prompt = true,
-                          std::string_view model = {}) = 0;
+                          bool cache_prompt = true, std::string_view model = {},
+                          bool cache_persist = true) = 0;
 
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
                       const sampling::SamplingConfig& sampling,
@@ -419,7 +424,7 @@ public:
       bool ignore_eos = false, std::string_view client_id = "anonymous",
       const std::vector<std::string>& stop_sequences = {},
       bool return_progress = false, bool cache_prompt = true,
-      std::string_view model = {});
+      std::string_view model = {}, bool cache_persist = true);
 
   std::shared_ptr<GenerationRequest> start_chat(
       const ChatRequest& request, std::size_t max_tokens, float temperature,
@@ -465,7 +470,8 @@ TextGenerationBackend::start_complete(
     const sampling::SamplingConfig& sampling,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool return_progress, bool cache_prompt, std::string_view model) {
+    bool return_progress, bool cache_prompt, std::string_view model,
+    bool cache_persist) {
   (void)stream_output;
   (void)return_progress;
   if (ignore_eos)
@@ -478,7 +484,8 @@ TextGenerationBackend::start_complete(
                               CancellationCheck cancellation,
                               std::string client_id,
                               std::vector<std::string> stop_sequences,
-                              bool cache_prompt, std::string model)
+                              bool cache_prompt, std::string model,
+                              bool cache_persist)
         : backend_(backend),
           prompt_(std::move(prompt)),
           max_tokens_(max_tokens),
@@ -487,7 +494,8 @@ TextGenerationBackend::start_complete(
           client_id_(std::move(client_id)),
           stop_sequences_(std::move(stop_sequences)),
           cache_prompt_(cache_prompt),
-          model_(std::move(model)) {}
+          model_(std::move(model)),
+          cache_persist_(cache_persist) {}
 
     Result Wait(const TokenCallback& on_token, const ProgressCallback&,
                 const StartCallback&) override {
@@ -499,7 +507,8 @@ TextGenerationBackend::start_complete(
             return cancelled_.load(std::memory_order_acquire) ||
                    (cancellation_ && cancellation_());
           },
-          on_token, client_id_, stop_sequences_, cache_prompt_, model_);
+          on_token, client_id_, stop_sequences_, cache_prompt_, model_,
+          cache_persist_);
     }
     void Cancel() noexcept override {
       cancelled_.store(true, std::memory_order_release);
@@ -515,12 +524,14 @@ TextGenerationBackend::start_complete(
     std::vector<std::string> stop_sequences_;
     bool cache_prompt_;
     std::string model_;
+    bool cache_persist_;
     std::atomic<bool> waited_{false};
     std::atomic<bool> cancelled_{false};
   };
   return std::make_shared<DeferredGenerationRequest>(
       *this, std::string(prompt), max_tokens, sampling, is_cancelled,
-      std::string(client_id), stop_sequences, cache_prompt, std::string(model));
+      std::string(client_id), stop_sequences, cache_prompt, std::string(model),
+      cache_persist);
 }
 
 inline std::shared_ptr<TextGenerationBackend::GenerationRequest>

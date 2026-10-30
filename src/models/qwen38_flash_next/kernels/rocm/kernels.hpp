@@ -180,6 +180,9 @@ bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
 /// Converts `count` floats to BF16 (or F16) for a 16-bit hipBLAS GEMM.
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        hipStream_t stream);
+/// Expands `count` Q8_0 weights (whole 32-element blocks) to F32.
+void ExpandQ8_0(const void* q8, float* out, std::size_t count,
+                hipStream_t stream);
 
 /// W8A8 route for wide batches over Q8_0 weights: activations quantized per
 /// 32-wide block into the tiled fragment layout (`Q8TiledBytes(batch, k)`
@@ -470,7 +473,9 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
 /// writes a visibility bitmap (`mask_words` uint32 per query, bit b = block
 /// b visible). Every block is visible when the count fits the budget.
 /// Queries retain F32 precision; pooled cache keys are F16. Scores
-/// still accumulate in FP32. `scores` holds n_tokens * max_blocks floats.
+/// still accumulate in FP32. `scores` holds n_tokens * max_blocks floats;
+/// blocks past max_blocks are neither scored nor selected, whatever the
+/// device position (`mask_words` * 32 must cover max_blocks).
 /// `live_blocks`, when nonzero, bounds the complete blocks of the last
 /// query (eager launches only: a captured graph must cover max_blocks).
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
@@ -488,6 +493,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// mask at ratio 4, each row's selected blocks are first compacted once into
 /// `lists`; `list_capacity` is the selection budget (blocks per row). The
 /// output is bitwise identical to the mask walk. Null lists use the mask walk.
+/// Complete blocks past a row's `mask_words` * 32 bits are not selected,
+/// whatever the device position; keys up to the position must exist.
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
@@ -509,8 +516,9 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// false, launching nothing, when the geometry is not the model's 24 x 256
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
-/// Returns false when the visible extent exceeds 262,144 tokens; the caller
-/// falls back to Attention.
+/// Returns false when the visible extent exceeds
+/// WmmaCausalAttentionContextLimit or the mask stride; the caller falls back
+/// to Attention.
 bool WmmaCausalAttention(const float* q, const float* gate,
                          const __half* k_cache, const __half* v_cache,
                          const std::uint32_t* mask, std::uint32_t mask_words,
@@ -571,6 +579,9 @@ struct ArgmaxCandidate {
 /// n_tokens * kArgmaxParts candidates.
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
+/// row[1] = float bits of softmax(logits)[row[0]] over `vocab` entries.
+void ArgmaxConfidence(const float* logits, std::int32_t* row,
+                      std::uint32_t vocab, hipStream_t stream);
 
 /// Gather selected IDs and their original logits from independent rows.
 /// The caller checks finite values only for the verification prefix it visits.
@@ -617,10 +628,13 @@ void GatherDraftLogits(float* logits, const std::int32_t* table,
                        std::uint32_t prefix, std::uint32_t n,
                        hipStream_t stream);
 
-/// Draft head rows back to token IDs: ids[i] >= prefix (a table row) becomes
-/// table[ids[i] - prefix]; prefix rows are already token IDs.
+/// Draft head rows back to token IDs: ids[i] >= prefix (a row of the
+/// table_rows-row table) becomes table[ids[i] - prefix]; prefix rows are
+/// already token IDs. A row past the table becomes UINT32_MAX, as an empty
+/// slot (-1) does.
 void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
-                   const std::int32_t* table, hipStream_t stream);
+                   const std::int32_t* table, std::uint32_t table_rows,
+                   hipStream_t stream);
 
 /// Number of IDs in each of the two selection buffers.
 std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);

@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
 #include <stdexcept>
 
 #include "qfn_mmq.h"
@@ -317,7 +319,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                 l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
                 session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
                 c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-                c.rms_eps, stream_, session.vision_input_.rope()))
+                c.rms_eps, stream_, session.vision_input_.rope(), false, yarn_))
           return Fail(error, "batched MTP cache projection failed");
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
@@ -330,7 +332,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                             &session.control_->mtp_position, n, pool,
                             c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
                             c.rope_theta, c.rms_eps, capacity, stream_,
-                            session.vision_input_.rope());
+                            session.vision_input_.rope(), yarn_);
         }
       }
       return true;
@@ -489,8 +491,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
-      if (item.output.token != nullptr)
-        *item.output.token = *mtp_token_host_;
+      if (item.output.token != nullptr) {
+        *item.output.token = mtp_token_host_[0];
+        if (item.output.confidence != nullptr)
+          *item.output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
+      }
       if (item.output.candidates != nullptr)
         *item.output.candidates = *mtp_candidates_host_;
     }
@@ -604,12 +609,15 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           slot[i] < subset_rows ? items[i].session->mtp_.draft_ids : nullptr;
       const auto count = std::min<std::size_t>(rows, kMtpCandidates);
       if (items[i].output.candidates == nullptr) {
+        // The token and its confidence (float bits) land in ids[0..1].
         Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+        ArgmaxConfidence(logits_of(i), s_.mtp_token, rows, stream_);
         if (table != nullptr)
           RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
-                        static_cast<std::uint32_t>(prefix), table, stream_);
+                        static_cast<std::uint32_t>(prefix), table,
+                        kMtpDraftExtraRows, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
-                                  s_.mtp_token, sizeof(std::int32_t),
+                                  s_.mtp_token, 2 * sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
                    error))
           return false;
@@ -619,7 +627,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                        s_.mtp_scores, rows, stream_);
       if (table != nullptr)
         RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count),
-                      static_cast<std::uint32_t>(prefix), table, stream_);
+                      static_cast<std::uint32_t>(prefix), table,
+                      kMtpDraftExtraRows, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),
@@ -646,8 +655,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].session->Cancelled())
       continue;
-    if (items[i].output.token != nullptr)
+    if (items[i].output.token != nullptr) {
       *items[i].output.token = batch_candidates_host_[i].ids[0];
+      if (items[i].output.confidence != nullptr)
+        std::memcpy(items[i].output.confidence,
+                    batch_candidates_host_[i].ids.data() + 1, sizeof(float));
+    }
     if (items[i].output.candidates != nullptr)
       *items[i].output.candidates = batch_candidates_host_[i];
   }

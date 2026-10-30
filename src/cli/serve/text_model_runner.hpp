@@ -223,6 +223,7 @@ struct TextDecodeSelection {
   bool stop{false};
   TextRunnerToken token{0};
   std::string piece;
+  std::optional<sampling::TokenLogprobs> logprobs;
 };
 
 struct TextDecodeStep {
@@ -235,6 +236,7 @@ struct TextDecodeStep {
   std::size_t lookup_tokens{0};
   std::size_t lookup_accepted_tokens{0};
   bool stop{false};
+  std::optional<sampling::TokenLogprobs> terminal_logprobs;
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.
   TextExecutionPlan execution_plan{};
@@ -701,7 +703,8 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true, std::size_t session_class = 0);
+      bool stop_at_eos = true, std::size_t session_class = 0,
+      bool persist = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse in this

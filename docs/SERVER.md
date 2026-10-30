@@ -332,6 +332,17 @@ and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities
 must match the retained prefix.
 
+`cache_persist: false` on the same endpoints keeps the request's own
+checkpoints off [`--cache-disk`](KV-CACHE.md#the-disk-tier): they stay in RAM
+and leave with RAM eviction or a restart. The request can still restore disk
+checkpoints that other requests wrote, and a later request without the flag
+that sends the same prefix can write its own. `null` keeps the default, `true`.
+Each response echoes the value it applied as a top-level `cache_persist`
+boolean, `true` by default, so a client can confirm that the server honoured
+the flag. Streams carry it on the finishing chunk and the usage chunk (Chat and
+text completions) or on the final `response` object (Responses), never on a
+content delta.
+
 Qwen image identity is checked only for images consumed before each checkpoint.
 Appending an image reuses the preceding text/image state in RAM or on disk;
 changing, removing or moving an earlier image invalidates checkpoints after it.
@@ -706,13 +717,13 @@ atomic publication.
 
 ## Embeddings
 
-EmbeddingGemma 2 (`google/embeddinggemma-2`) serves text, image and audio embeddings from its own model process.  It is a 768-dimension, BF16, 8192-token-context encoder:
+EmbeddingGemma 2 (`google/embeddinggemma-2`) serves text, image, video and audio embeddings from its own model process.  It is a 768-dimension, BF16, 8192-token-context encoder:
 
 ```sh
 ./result/bin/gufo serve --port 8080 embedding --model /persist/models/embeddinggemma-2
 ```
 
-`--model` must name an EmbeddingGemma 2 checkpoint directory, and `--served-model-name` overrides the default model ID `embeddinggemma-2`.  The process refuses to start on any other directory and in a build without the HIP backend.  There is no `--sessions` or `--context` option, because requests share one encoder.  Requests that wait for the device share batches of up to 8,192 tokens, except that a request with an image or audio runs in a batch of its own.  When the device is free, the oldest waiting request runs one batch for itself and the requests behind it.  The batch takes whole requests in arrival order until the next one does not fit or has an image or audio.  A lone request runs at once.  A request that fits in one batch never spans two.  A request larger than one batch is split, and after each of its batches it goes behind the requests that arrived meanwhile, so a short request waits for at most one batch of a long one.  Route this process through llama-swap when one public URL should offer embeddings alongside text, speech, or images.
+`--model` must name an EmbeddingGemma 2 checkpoint directory, and `--served-model-name` overrides the default model ID `embeddinggemma-2`.  The process refuses to start on any other directory and in a build without the HIP backend.  There is no `--sessions` or `--context` option, because requests share one encoder.  Requests that wait for the device share batches of up to 8,192 tokens, except that a request with an image, video or audio runs in a batch of its own.  When the device is free, the oldest waiting request runs one batch for itself and the requests behind it.  The batch takes whole requests in arrival order until the next one does not fit or has an image, video or audio.  A lone request runs at once.  A request that fits in one batch never spans two.  A request larger than one batch is split, and after each of its batches it goes behind the requests that arrived meanwhile, so a short request waits for at most one batch of a long one.  Route this process through llama-swap when one public URL should offer embeddings alongside text, speech, or images.
 
 `POST /v1/embeddings` follows the OpenAI request shape:
 
@@ -746,12 +757,14 @@ The response holds one embedding per input in request order:
 - `dimensions` is optional and must be 128, 256, 512, or 768, which is the default.  Any other value returns 400 `invalid_dimensions`.  A smaller value keeps the leading components of the normalized vector, which is Matryoshka truncation, and renormalizes them to unit length.
 - `user` is accepted and ignored when it is a string, and a non-string `user` returns 400 `invalid_parameter_type`.
 - `prompt_name` is optional; see task prefixes below.
+- `video_options` optionally selects video FPS, frame cap, overflow strategy and timestamps; see [video inputs](models/embeddinggemma-2/README.md#video).
+- `mm_processor_kwargs` is optional, as in vLLM.  Its only key, `max_soft_tokens`, selects the image budget of the checkpoint's `Gemma4ImageProcessor` for every image of the request: 70, 140, 280 (the default), 560, or 1120 soft tokens.  Absent, null or empty `mm_processor_kwargs` keeps the default. Any other key or value returns 400 `invalid_mm_processor_kwargs`, and a non-object returns 400 `invalid_parameter_type`. Video frames retain their separate 140-token budget. The 32-image request cap is a server resource limit across all inputs, independent of the selected budget; see [image limits and memory](models/embeddinggemma-2/README.md#images).
 - `truncate` is optional and `false` by default; see the token limit below.  A non-boolean `truncate` returns 400 `invalid_parameter_type`.  The server rejects other members with 400 `unsupported_field`.
 - Every vector is mean-pooled and L2-normalized, so the dot product of two vectors is their cosine similarity.
-- Each input may hold at most 8192 tokens, counting the `<bos>` and `<eos>` markers the tokenizer adds.  By default the server refuses longer inputs instead of truncating them, with 400 `context_length_exceeded`, and the message names the input index.  With `"truncate": true` it keeps the first 8190 tokens of each longer input between the markers instead; only `--max-request-bytes` then limits a text input's length.  An input with images or audio is truncated only when all of its media tokens fit in the kept tokens; otherwise it is still refused.  `usage.prompt_tokens` and `usage.total_tokens` count every token embedded for every input, markers included.
-- Errors use the standard error object.  Other 400 codes are `too_many_audio`, `invalid_audio_input`, `too_many_images`, `invalid_image_input`, `parse_error`, `invalid_request_body`, `missing_input`, `empty_input`, `too_many_inputs`, `invalid_encoding_format`, and `invalid_parameter_type`.  A client disconnect returns 499 `cancelled`, and a request whose client disconnects before its next batch does not use the device again.  A failed encode returns 500 `embedding_failed` to every request with inputs in the failed batch.  A service that is not ready returns 503 `embedding_service_unavailable`.  A GPU failure that the device probe confirms returns 503 `device_lost` and shuts the server down as described under [Lifecycle and limits](#lifecycle-and-limits).  The usual authentication, `--max-request-bytes`, and request logging apply.
+- Each input may hold at most 8192 tokens, counting the `<bos>` and `<eos>` markers the tokenizer adds.  By default the server refuses longer inputs instead of truncating them, with 400 `context_length_exceeded`, and the message names the input index.  With `"truncate": true` it keeps the first 8190 tokens of each longer input between the markers instead; only `--max-request-bytes` then limits a text input's length.  An input with images, video or audio is truncated only when all of its media tokens fit in the kept tokens; otherwise it is still refused.  `usage.prompt_tokens` and `usage.total_tokens` count every token embedded for every input, markers included.
+- Errors use the standard error object.  Other 400 codes are `too_many_videos`, `invalid_video_input`, `invalid_video_options`, `too_many_audio`, `invalid_audio_input`, `too_many_images`, `invalid_image_input`, `parse_error`, `invalid_request_body`, `missing_input`, `empty_input`, `too_many_inputs`, `invalid_encoding_format`, `invalid_mm_processor_kwargs`, and `invalid_parameter_type`.  A client disconnect returns 499 `cancelled`, and a request whose client disconnects before its next batch does not use the device again.  A failed encode returns 500 `embedding_failed` to every request with inputs in the failed batch.  A service that is not ready returns 503 `embedding_service_unavailable`.  A GPU failure that the device probe confirms returns 503 `device_lost` and shuts the server down as described under [Lifecycle and limits](#lifecycle-and-limits).  The usual authentication, `--max-request-bytes`, and request logging apply.
 
-Typed items follow llama.cpp's form: `{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},{"type":"text","text":"\n"}]}`. Each item produces one vector in the same space as text. Text parts retain their order and whitespace. PNG, JPEG and WebP use the existing image reader, including public-HTTPS checks and the shared 20 MiB / 15-second budget. Embeddings accept at most 32 images per request, 32 megapixels per image, and 32,768 pixels on either side. Image soft tokens and their markers count toward context and usage. A request with images runs in its own device batch, in arrival order, and its soft tokens count toward the 8,192-token batch. The first image request loads the vision weights in that batch. See [image embeddings](models/embeddinggemma-2/README.md#images) for exact preprocessing and index migration. Audio uses typed `input_audio` parts with raw base64, audio data URLs or public HTTPS URLs; WAV, FLAC, MP3 and Ogg are supported. Up to 32 clips of 30 seconds each share the image read budget. Actual subsampled audio tokens and their boundary markers count toward context and usage. See [audio embeddings](models/embeddinggemma-2/README.md#audio) for decoding, preprocessing, bounds and examples. Video content parts are unsupported.
+Typed items follow llama.cpp's form: `{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},{"type":"text","text":"\n"}]}`. Each item produces one vector in the same space as text. Text parts retain their order and whitespace. PNG, JPEG and WebP use the existing image reader, including public-HTTPS checks and the shared 20 MiB / 15-second budget. Embeddings accept at most 32 images per request, 32 megapixels per image, and 32,768 pixels on either side. Image soft tokens and their markers count toward context and usage. A request with images runs in its own device batch, in arrival order, and its soft tokens count toward the 8,192-token batch. The first image request loads the vision weights in that batch. See [image embeddings](models/embeddinggemma-2/README.md#images) for exact preprocessing and index migration. Audio uses typed `input_audio` parts with raw base64, audio data URLs or public HTTPS URLs; WAV, FLAC, MP3 and Ogg are supported. Up to 32 clips of 30 seconds each share the image read budget. Actual subsampled audio tokens and their boundary markers count toward context and usage. See [audio embeddings](models/embeddinggemma-2/README.md#audio) for decoding, preprocessing, bounds and examples. Video uses typed `input_video` parts with raw base64, video data URLs or public HTTPS URLs, producing one jointly encoded vector per input. MP4/MOV and WebM/Matroska share the same media read budget. Defaults sample 1 FPS, uniformly capped at 32 frames with 140 soft tokens per frame. See [video embeddings](models/embeddinggemma-2/README.md#video) for `video_options`, timestamp framing, audio-track treatment and decoding limits.
 
 **llama.cpp's `POST /embeddings`.** Clients written for llama-server's non-OpenAI route, such as Frigate 0.18's semantic search, can use `POST /embeddings` (or its older alias `POST /embedding`) on the same process.  It shares the model, tokenization, image reader, pooling, limits and errors of `/v1/embeddings`, and differs in three ways:
 
@@ -762,7 +775,7 @@ Typed items follow llama.cpp's form: `{"content":[{"type":"image_url","image_url
   [{"index": 0, "embedding": [[0.0123, -0.0456, "..."]]}]
   ```
 
-- `embd_normalize` is accepted only as `2`, the Euclidean default that every EmbeddingGemma 2 vector already has; other values return 400 `unsupported_embd_normalize`.  As in llama.cpp, `encoding_format` is validated but the vectors are always floats.  `dimensions`, `prompt_name`, `truncate` and `user` behave as on `/v1/embeddings`.  Token arrays and per-token (`--pooling none`) output stay unsupported, and other members return 400 `unsupported_field`.
+- `embd_normalize` is accepted only as `2`, the Euclidean default that every EmbeddingGemma 2 vector already has; other values return 400 `unsupported_embd_normalize`.  As in llama.cpp, `encoding_format` is validated but the vectors are always floats.  `dimensions`, `mm_processor_kwargs`, `prompt_name`, `truncate` and `user` behave as on `/v1/embeddings`.  Token arrays and per-token (`--pooling none`) output stay unsupported, and other members return 400 `unsupported_field`.
 
 **Task prefixes.** EmbeddingGemma 2 was trained with short task prefixes, and by default the server does not add them, so clients must.  Queries use `task: search result | query: {text}`, and documents use `title: none | text: {text}`, or `title: {title} | text: {text}` when a title is known.  Omitting the prefixes still works but lowers retrieval quality.  Embed a query and its documents with matching conventions.  A client that cannot change its input can send `"prompt_name"` with a name from the checkpoint's `config_sentence_transformers.json` `prompts` (for example `query` or `document`), and `--default-prompt-name NAME` applies one to requests that name none.  As the model card advises, the default skips inputs without text, so images and audio alone embed unprefixed; a requested `prompt_name` prefixes every input, as in sentence-transformers.  An empty `prompt_name` applies none, even with a default.  An unknown name returns 400 `invalid_prompt_name`, and an unknown `--default-prompt-name` fails startup.  `usage` counts the prompt's tokens.
 
@@ -774,11 +787,41 @@ Chat messages retain roles, reasoning, tool calls and image content until the
 model's tokenizer and template turn them into model input. The scheduler owns
 request limits, cancellation, cache accounting and completion state.
 
+## OpenAI input token counts
+
+`POST /v1/chat/completions/input_tokens` and
+`POST /v1/responses/input_tokens` accept the same request body and model
+selection as their respective generation endpoints and return:
+
+```json
+{"object":"response.input_tokens","input_tokens":123}
+```
+
+Responses follows OpenAI's input-token-count response shape; Chat Completions
+uses the equivalent llama-server extension. Counts include the model's chat
+template, system/instructions, tools and tool history, reasoning settings,
+structured-output instructions and supported image tokens. They describe the
+complete prompt, independent of any cached prefix, and agree with Chat
+`usage.prompt_tokens` or Responses `usage.input_tokens` for the same request.
+
+Counting does not schedule inference, prefill or generation, and does not
+update the continuation cache or generation metrics. It can count prompts
+larger than the execution context so clients can decide how much to trim.
+Image inputs still undergo the usual image loading and validation and may
+populate the CPU image-preprocessing cache. Generation options are validated as
+usual, but `stream: true` is accepted and still returns
+one JSON count response. Output-token limits are not added to `input_tokens`.
+Malformed requests return 400, a model that is not served returns 404, and a
+backend without prompt-count support returns 501. As with generation, Responses
+clients must supply the complete conversation; server-side history is not
+resolved by these endpoints.
+
 ## Responses API Subset
 
 `POST /v1/responses` accepts `model`, `input` as text or message arrays,
 `instructions`, `max_output_tokens`, `stream`, `reasoning.effort`,
-`text.format`, `tools`, `tool_choice`, `parallel_tool_calls`, and the shared
+`text.format`, `tools`, `tool_choice`, `parallel_tool_calls`, `include`,
+`top_logprobs`, and the shared
 sampling controls. Message content supports
 `input_text` and `input_image` with an `image_url` (HTTPS or a data URL).
 Image uploads accept PNG, JPEG and WebP. Base64 data URLs also accept
@@ -798,8 +841,10 @@ functions are rejected. Mid-conversation `system` and `developer` message
 items are accepted as in Chat Completions. Standard Responses request fields
 with
 no native effect are accepted and ignored so conforming clients interoperate
-(for example Codex): `include`, `reasoning.summary`, `text.verbosity`,
+(for example Codex): `reasoning.summary`, `text.verbosity`,
 `client_metadata` and `prompt_cache_key`.
+`include: ["message.output_text.logprobs"]` enables generated-token scores;
+other string entries in `include` are accepted without native effect.
 `store` and `background` must be false when present; server-side conversations
 and `previous_response_id` remain unsupported.
 
@@ -1037,8 +1082,77 @@ labelled executed model state. Stops must be nonempty, at most 4 KiB each and
 Nullable Chat Completions defaults retain server settings, including sampling
 and token limits. `logprobs: false`, empty `logit_bias`,
 `response_format: {"type":"text"}` and `modalities: ["text"]` are accepted.
-Actual log probabilities, token biases and audio output remain unsupported
-and return explicit errors.
+Token biases and audio output remain unsupported and return explicit errors.
+
+### Generated-token log probabilities
+
+Chat Completions accepts `logprobs: true` and an optional `top_logprobs`
+integer from 0 to 20 (default 0). Each choice returns `logprobs.content`,
+with `token`, `logprob`, UTF-8 `bytes`, and `top_logprobs` for each generated
+token. Streaming choices carry the same metadata beside `delta`.
+
+Raw Completions accepts an integer `logprobs` from 0 to 20. Its choices
+return parallel `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`
+arrays. Offsets count Unicode characters and continue across streaming chunks.
+Zero requests only the selected token. Omitted/null settings disable collection;
+Chat also accepts `false`. Positive Chat `top_logprobs` requires `logprobs: true`.
+
+Responses accepts `include: ["message.output_text.logprobs"]` with optional
+`top_logprobs` from 0 to 20 (omitted/null defaults to 0). It returns scores on
+each `output_text` content part and on streaming `response.output_text.delta`
+and `response.output_text.done` events. Content parts include UTF-8 `bytes`;
+text events carry `token`, `logprob`, and `top_logprobs`. Without the include
+entry, collection stays disabled even when `top_logprobs` is set.
+
+Responses scores only tokens contributing to visible output text. Reasoning,
+tool arguments, hidden framing, and terminal stop tokens receive no text
+scores. A token spanning visible text and hidden framing is reported once,
+with its original token spelling, on the first text span it contributes to.
+Tokens sharing a split UTF-8 character are retained together when that
+character is emitted. Buffered results and completed streaming content parts
+carry the same scores.
+
+```json
+{"model":"gufo","input":"Hello","include":["message.output_text.logprobs"],"top_logprobs":3}
+```
+
+The formats and candidate ordering follow [vLLM v0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0).
+Values use the target
+model's raw full-vocabulary log-softmax, before temperature, penalties,
+constraints, or sampling filters. Speculative tokens use their target verifier
+rows, including residual corrections. Values below -9999 are serialized as
+-9999. Chat and Completions metadata includes sampled stop/control tokens even
+when their text is hidden, so concatenating metadata tokens need not reproduce
+visible content.
+Existing usage accounting is unchanged.
+
+Collection adds vocabulary transfers and CPU reduction only when requested.
+Metadata counts toward streaming buffer limits but not `--max-output-bytes`,
+which bounds generated text; `max_tokens` bounds its size. Prompt logprobs,
+full-vocabulary output and token-ID extensions are not supported. For example:
+
+```json
+{"model":"gufo","messages":[{"role":"user","content":"Hello"}],"logprobs":true,"top_logprobs":3}
+```
+
+A buffered Chat choice contains metadata like this (with `top_logprobs: 0`):
+
+```json
+{"index":0,"message":{"role":"assistant","content":"Hi"},"logprobs":{"content":[{"token":"Hi","logprob":-0.5,"bytes":[72,105],"top_logprobs":[]}]},"finish_reason":"length"}
+```
+
+For streaming Completions:
+
+```json
+{"model":"gufo","prompt":"Hello","logprobs":3,"stream":true}
+```
+
+Each SSE payload's choice carries the arrays alongside its text, for example
+with `logprobs: 0`:
+
+```json
+{"index":0,"text":"Hi","logprobs":{"tokens":["Hi"],"token_logprobs":[-0.5],"top_logprobs":[{"Hi":-0.5}],"text_offset":[0]},"finish_reason":null}
+```
 
 llama.cpp sampler fields that gufo does not implement (`mirostat`,
 `mirostat_tau`, `mirostat_eta`, `typical_p`, `tfs_z`, `dynatemp_range`,
@@ -1148,9 +1262,9 @@ Return an OpenAI-style error object:
 ```json
 {
   "error": {
-    "message": "Unsupported field: logprobs",
+    "message": "Unsupported field: logit_bias",
     "type": "invalid_request_error",
-    "param": "logprobs",
+    "param": "logit_bias",
     "code": "unsupported_parameter"
   }
 }

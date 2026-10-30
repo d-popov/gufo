@@ -109,12 +109,13 @@ public:
       const CancellationCheck& cancellation, bool stream, bool ignore_eos,
       std::string_view client_id,
       const std::vector<std::string>& stop_sequences, bool return_progress,
-      bool cache_prompt, std::string_view model) override {
+      bool cache_prompt, std::string_view model, bool cache_persist) override {
     last_ignore_eos = ignore_eos;
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_complete(
             prompt, max_tokens, sampling, cancellation, stream, false,
-            client_id, stop_sequences, return_progress, cache_prompt, model),
+            client_id, stop_sequences, return_progress, cache_prompt, model,
+            cache_persist),
         progress, admit.load());
   }
   std::shared_ptr<GenerationRequest> start_chat(
@@ -141,11 +142,18 @@ public:
   }
   std::optional<std::size_t> count_chat_tokens(
       const gufo::server::ChatRequest& request) const override {
+    counted_chat = request;
     counted_messages = request.messages.size();
     counted_tools = request.tools.size();
+    if (count_failure == 1)
+      throw std::invalid_argument("invalid counting prompt");
+    if (count_failure == 2)
+      throw std::length_error("counting prompt too large");
     return chat_token_count;
   }
   std::optional<std::size_t> chat_token_count;
+  int count_failure{0};
+  mutable gufo::server::ChatRequest counted_chat;
   mutable std::size_t counted_messages{0};
   mutable std::size_t counted_tools{0};
   std::optional<std::string> render_chat_prompt(
@@ -163,10 +171,11 @@ public:
                   const CancellationCheck& cancel, const TokenCallback& token,
                   std::string_view client_id = "anonymous",
                   const std::vector<std::string>& stop_sequences = {},
-                  bool cache_prompt = true,
-                  std::string_view model = {}) override {
+                  bool cache_prompt = true, std::string_view model = {},
+                  bool cache_persist = true) override {
     ++calls;
     last_cache_prompt = cache_prompt;
+    last_cache_persist = cache_persist;
     // Like the scheduler, each served model limits prompts to its context.
     for (const auto& model_class : served)
       if (model_class.id == model &&
@@ -228,9 +237,18 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
+    if (sampling.logprobs) {
+      gufo::server::DecodedLogprobs probabilities;
+      probabilities.entries.push_back({3, result.text, -3.0});
+      if (*sampling.logprobs > 0)
+        probabilities.entries.push_back({1, "alternative", -0.5});
+      result.logprobs.push_back(std::move(probabilities));
+    }
     if (token && failure != 8) {
       std::this_thread::sleep_for(token_delay);
-      (void)token(result.text);
+      (void)token(gufo::server::TokenPiece(
+          result.text,
+          result.logprobs.empty() ? nullptr : &result.logprobs.front()));
     }
     if (failure == 6)
       throw std::runtime_error("context exceeded");
@@ -257,6 +275,7 @@ public:
   std::atomic<int> calls{0};
   std::atomic<bool> last_ignore_eos{false};
   std::atomic<bool> last_cache_prompt{true};
+  std::atomic<bool> last_cache_persist{true};
   std::vector<PromptProgress> progress;
   // Report a scheduler admission before generation, as the HIP backend does.
   std::atomic<bool> admit{false};

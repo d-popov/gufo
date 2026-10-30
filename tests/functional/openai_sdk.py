@@ -28,6 +28,7 @@ from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from tool_streaming import check_tool_streaming
 from discovery import check_discovery
+from logprobs import check_logprobs, check_responses_logprobs
 from image_inputs import check_image_count, check_image_detail, check_image_inputs
 from tool_images import check_tool_images
 from tool_choice import check_tool_choice_cache
@@ -48,6 +49,7 @@ from cache_growth import check_cache_growth, check_unchanged_retry, log_offset
 from messages_tools import check_messages_tools
 from reasoning_budget import check_reasoning_budget
 from messages_count_tokens import check_messages_count_tokens, check_messages_image_counts
+from openai_count_tokens import check_openai_count_tokens
 from cache_depth import check_cache_depth
 from cache_stalls import check_cache_stalls
 from cache_rotation import check_cache_rotation
@@ -2755,9 +2757,9 @@ def check_server_metrics(client, model, checks, width, context, speculative, ser
     assert proposed > 0 if speculative != "off" else proposed == 0, final
 
 
-SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
+SDK_SUITES = ("discovery", "openai-count-tokens", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
               "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
-              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "logprobs", "responses-logprobs", "batch",
               "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix",
               "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection")
 
@@ -2796,8 +2798,8 @@ def main():
     parser.add_argument("--server-log", type=Path,
                         help="Server log; shows retry copies refused under memory pressure")
     args = parser.parse_args()
-    if args.suite in ("discovery", "messages-image-counts", "all") and args.expected_input_modalities is None:
-        parser.error("discovery and messages-image-counts require --expected-input-modalities text or text,image")
+    if args.suite in ("discovery", "openai-count-tokens", "messages-image-counts", "all") and args.expected_input_modalities is None:
+        parser.error("discovery, openai-count-tokens and messages-image-counts require --expected-input-modalities text or text,image")
     if args.suite in ("image-inputs", "image-count", "tool-images", "image-detail") and not args.vision:
         parser.error("image-inputs, image-count, tool-images, and image-detail require --vision and a loaded projector")
     if args.suite in ("all", "sampling-defaults") and not args.sampling_preset:
@@ -2840,6 +2842,9 @@ def main():
                                      "response": [recorder.response_hook]}
     )) as client:
         suites = {
+            "openai-count-tokens": lambda: check_openai_count_tokens(
+                client, args.model, checks, args.context, image_content,
+                args.expected_input_modalities.split(",")),
             "messages-count-tokens": lambda: check_messages_count_tokens(
                 client, args.model, checks, args.context),
             "messages-image-counts": lambda: check_messages_image_counts(
@@ -2904,6 +2909,8 @@ def main():
             "sampling-defaults": lambda: check_sampling_defaults(
                 client, args.model, checks, args.sampling_preset, args.sampling_overrides,
                 args.vision, args.server_thinking),
+            "logprobs": lambda: check_logprobs(client, args.model, checks, CompletionStreamFrame),
+            "responses-logprobs": lambda: check_responses_logprobs(client, args.model, checks),
             "sampling-ranges": lambda: check_sampling_ranges(client, args.model, checks),
             "batch": lambda: check_batches(
                 client, args.model, checks, args.concurrency, args.vision, args.speculative),

@@ -1308,6 +1308,19 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
   }
 }
 
+__global__ void ExpandQ8_0Kernel(const std::uint8_t* q8, float* out,
+                                 std::size_t count) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < count) {
+    const std::uint8_t* blk = q8 + (i / 32) * 34;
+    const __half d = *reinterpret_cast<const __half*>(blk);
+    const auto q = static_cast<const std::int8_t*>(
+        static_cast<const void*>(blk + 2))[i % 32];
+    out[i] = __half2float(d) * static_cast<float>(q);
+  }
+}
+
 /// One wave per weight row, kSmallGemmRows rows per block: the row is read
 /// once (four consecutive elements per lane per step) while up to eight
 /// tokens accumulate in registers, then a wave reduction per token.
@@ -2578,7 +2591,9 @@ __global__ void SelectScoreKernel(const float* q, const __half* blocks,
   const auto t0 = blockIdx.x;
   const auto complete = (*start_pos + first_token + t0 + 1) / ratio;
   const auto b = blockIdx.y * blockDim.x + threadIdx.x;
-  if (t0 >= n_tokens || complete <= budget || b >= complete)
+  // The position comes from the device, the row size from the host: a block
+  // past max_blocks has no score slot in this row.
+  if (t0 >= n_tokens || complete <= budget || b >= complete || b >= max_blocks)
     return;
   // Load both stored halves together. Unpacking preserves their exact F32
   // values while avoiding a separate narrow memory load for each component.
@@ -2697,7 +2712,8 @@ __launch_bounds__(kBlock) __global__
   __shared__ std::uint32_t state[3];  // threshold, remaining, bin count
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
-  const std::uint32_t complete = (pos + 1) / ratio;
+  // Only max_blocks scores exist per row (see SelectScoreKernel).
+  const std::uint32_t complete = min((pos + 1) / ratio, max_blocks);
   std::uint32_t* words = mask + static_cast<std::size_t>(t) * mask_words;
   for (std::uint32_t w = threadIdx.x; w < mask_words; w += blockDim.x) {
     words[w] = complete <= budget ? 0xFFFFFFFFu : 0u;
@@ -2897,7 +2913,9 @@ __global__ void CompactSelectionKernel(
   const std::uint32_t wave = i >> 5u;
   const std::uint32_t n_kv = *start_pos + t + 1;
   const std::uint32_t n_complete = n_kv / ratio;  // tail_start / ratio
-  const std::uint32_t n_words = (n_complete + 31) / 32;
+  // The position comes from the device, the row size from the host: blocks
+  // past mask_words have no mask bits and are not selected.
+  const std::uint32_t n_words = min((n_complete + 31) / 32, mask_words);
   const std::uint32_t* words = mask + static_cast<std::size_t>(t) * mask_words;
   std::uint32_t* out = lists + static_cast<std::size_t>(t) * capacity;
   std::uint32_t written = 0;  // selected blocks of the earlier passes
@@ -3255,7 +3273,9 @@ __global__ void AttentionKernel(
       std::uint32_t flags = 0;
       std::uint32_t count = 0;
       const std::uint32_t b0 = w0 + (i * 4);
-      const std::uint32_t word = b0 < n_complete ? words[b0 / 32] : 0u;
+      // Blocks past the mask row are unselected (see CompactSelectionKernel).
+      const std::uint32_t word =
+          b0 < n_complete && b0 / 32 < mask_words ? words[b0 / 32] : 0u;
       for (std::uint32_t k = 0; k < 4; ++k) {
         const std::uint32_t b = b0 + k;
         const bool set = b < n_complete && ((word >> (b % 32)) & 1u);
@@ -3947,9 +3967,12 @@ constexpr std::uint32_t kWmmaRatio = 4;
 constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
 // Row padding keeps a 16-byte-per-lane fragment read off a single bank group.
 constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
-// Union-mask capacity of the live visible extent: one bit per 4-token block,
-// 262,144 visible tokens. Rows may be strided wider.
-constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
+// The sparse window builds its union mask in passes of 256 threads x eight
+// words (one bit per 4-token block, 262,144 visible tokens per pass), so the
+// live extent is not bounded by the pass. A compact list entry keeps the block
+// index below its membership bits, which bounds the extent at 2^28 blocks.
+constexpr std::uint32_t kWmmaPassWords = 256 * 8;
+constexpr std::uint32_t kWmmaMemberShift = 28;
 
 /// Two row layouts share the kernel. The dense window packs 16 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
@@ -4097,89 +4120,164 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       ((start_pos + query_start + 1) / ratio);  // first always-visible block
   constexpr bool sparse = kPackHeads;
   // Four 512-block selections plus their incomplete tail. The same LDS
-  // stores a mask for arbitrary wider selections used by operator callers.
+  // stores the union words of wider selections used by operator callers
+  // while they fit.
   constexpr unsigned kListCapacity = 4 * 512 + 4;
   // A compact entry also carries which of the packed queries selected the
   // block, so the softmax reads its mask bits from the tile, not global.
   constexpr unsigned kMaskRows = kPackHeads ? kQueryRows : 1;
-  constexpr unsigned kMemberShift = 28;
+  constexpr unsigned kMemberShift = kWmmaMemberShift;
   static_assert(kMaskRows <= 32 - kMemberShift, "membership bits fit");
   __shared__ unsigned union_words[kListCapacity];
   __shared__ unsigned wave_counts[8];
   bool compact = false;
   unsigned selected = 0;
+  const unsigned word_count = (n_blocks + 31) / 32;
+  // A non-compact union keeps its words in LDS while they fit; past that the
+  // walk recomputes each word from the rows' masks.
+  const bool words_in_lds = word_count <= kListCapacity;
+  const unsigned live_rows = min(kQueryRows, n_tokens - query_start);
+  // Union word `w` once the always-visible tail and the live extent apply.
+  const auto clip_word = [&](unsigned w, unsigned bits) {
+    if (w * 32 >= tail_block)
+      bits = ~0u;
+    else if ((w + 1) * 32 > tail_block)
+      bits |= ~0u << (tail_block % 32);
+    if ((w + 1) * 32 > n_blocks)
+      bits &= (1u << (n_blocks % 32)) - 1u;
+    return bits;
+  };
   if (sparse) {
     // Consecutive word ranges per thread make the prefix scan preserve
     // increasing block order, including ties and the always-visible tail.
-    const unsigned live_rows = min(kQueryRows, n_tokens - query_start);
-    const unsigned word_count = (n_blocks + 31) / 32;
-    const unsigned words_per_thread = (word_count + 255) / 256;
+    // A pass covers 256 x 8 words; wider extents take several in block order.
     unsigned local_words[8];
     unsigned row_words[8][kMaskRows];
-    unsigned count = 0;
+    unsigned pass_first = 0;
+    unsigned pass_words = 0;
+    unsigned words_per_thread = 0;
+    const auto load_pass = [&](unsigned first_word) {
+      pass_first = first_word;
+      pass_words = min(word_count - first_word, kWmmaPassWords);
+      words_per_thread = (pass_words + 255) / 256;
+      unsigned count = 0;
 #pragma unroll
-    for (unsigned j = 0; j < 8; ++j) {
-      const unsigned w = tid * words_per_thread + j;
-      unsigned bits = 0;
+      for (unsigned j = 0; j < 8; ++j) {
+        const unsigned offset = tid * words_per_thread + j;
+        const unsigned w = first_word + offset;
+        unsigned bits = 0;
 #pragma unroll
-      for (unsigned r = 0; r < kMaskRows; ++r)
-        row_words[j][r] = 0;
-      if (j < words_per_thread && w < word_count) {
+        for (unsigned r = 0; r < kMaskRows; ++r)
+          row_words[j][r] = 0;
+        if (j < words_per_thread && offset < pass_words) {
 #pragma unroll
-        for (unsigned r = 0; r < kMaskRows; ++r) {
-          if (r < live_rows) {
-            row_words[j][r] = mask[size_t(query_start + r) * mask_words + w];
-            bits |= row_words[j][r];
+          for (unsigned r = 0; r < kMaskRows; ++r) {
+            if (r < live_rows) {
+              row_words[j][r] = mask[size_t(query_start + r) * mask_words + w];
+              bits |= row_words[j][r];
+            }
           }
+          bits = clip_word(w, bits);
         }
-        if (w * 32 >= tail_block)
-          bits = ~0u;
-        else if ((w + 1) * 32 > tail_block)
-          bits |= ~0u << (tail_block % 32);
-        if ((w + 1) * 32 > n_blocks)
-          bits &= (1u << (n_blocks % 32)) - 1u;
+        local_words[j] = bits;
+        count += __popc(bits);
       }
-      local_words[j] = bits;
-      count += __popc(bits);
-    }
-    unsigned scan = count;
+      return count;
+    };
+    // Block-wide exclusive prefix of `count` in thread order, and the total.
+    const auto scan_counts = [&](unsigned count, unsigned* prefix) {
+      unsigned scan = count;
 #pragma unroll
-    for (unsigned offset = 1; offset < 32; offset *= 2) {
-      unsigned before = __shfl_up(scan, offset, 32);
-      if (lane >= offset)
-        scan += before;
-    }
-    if (lane == 31)
-      wave_counts[wave] = scan;
-    __syncthreads();
-    unsigned prefix = scan - count;
+      for (unsigned offset = 1; offset < 32; offset *= 2) {
+        unsigned before = __shfl_up(scan, offset, 32);
+        if (lane >= offset)
+          scan += before;
+      }
+      if (lane == 31)
+        wave_counts[wave] = scan;
+      __syncthreads();
+      unsigned before = scan - count;
+      unsigned total = 0;
 #pragma unroll
-    for (unsigned w = 0; w < 8; ++w) {
-      if (w < wave)
-        prefix += wave_counts[w];
-      selected += wave_counts[w];
-    }
-    compact = selected <= kListCapacity;
+      for (unsigned w = 0; w < 8; ++w) {
+        if (w < wave)
+          before += wave_counts[w];
+        total += wave_counts[w];
+      }
+      *prefix = before;
+      return total;
+    };
+    // This thread's list entries of the loaded pass from `index` on; a
+    // bounded emission drops the entries past the list capacity.
+    const auto emit_entries = [&](unsigned index, bool bounded) {
 #pragma unroll
-    for (unsigned j = 0; j < 8; ++j) {
-      const unsigned word = tid * words_per_thread + j;
-      unsigned bits = local_words[j];
-      if (compact) {
+      for (unsigned j = 0; j < 8; ++j) {
+        const unsigned word = pass_first + tid * words_per_thread + j;
+        unsigned bits = local_words[j];
         while (bits) {
           unsigned bit = __builtin_ctz(bits);
           unsigned members = 0;
 #pragma unroll
           for (unsigned r = 0; r < kMaskRows; ++r)
             members |= ((row_words[j][r] >> bit) & 1u) << r;
-          union_words[prefix++] = (word * 32 + bit) | (members << kMemberShift);
+          if (!bounded || index < kListCapacity)
+            union_words[index] = (word * 32 + bit) | (members << kMemberShift);
+          ++index;
           bits &= bits - 1;
         }
-      } else if (j < words_per_thread && word < word_count) {
-        union_words[word] = bits;
+      }
+    };
+    const auto store_words = [&] {
+#pragma unroll
+      for (unsigned j = 0; j < 8; ++j) {
+        const unsigned offset = tid * words_per_thread + j;
+        if (j < words_per_thread && offset < pass_words)
+          union_words[pass_first + offset] = local_words[j];
+      }
+    };
+    if (word_count <= kWmmaPassWords) {
+      unsigned prefix = 0;
+      selected = scan_counts(load_pass(0), &prefix);
+      compact = selected <= kListCapacity;
+      if (compact)
+        emit_entries(prefix, false);
+      else
+        store_words();
+    } else {
+      // Count and emit in one read of the masks. Entries keep block order
+      // across passes, so the first kListCapacity are exact; an overflowing
+      // union is rewritten as words when they fit LDS.
+      for (unsigned first = 0; first < word_count; first += kWmmaPassWords) {
+        if (first != 0)
+          __syncthreads();  // every wave has read wave_counts
+        unsigned prefix = 0;
+        const unsigned total = scan_counts(load_pass(first), &prefix);
+        emit_entries(selected + prefix, true);
+        selected += total;
+      }
+      compact = selected <= kListCapacity;
+      if (!compact && words_in_lds) {
+        __syncthreads();  // the dropped list is overwritten
+        for (unsigned first = 0; first < word_count; first += kWmmaPassWords) {
+          load_pass(first);
+          store_words();
+        }
       }
     }
     __syncthreads();
   }
+  // Word `w` of the non-compact union.
+  const auto union_word = [&](std::uint32_t w) -> std::uint32_t {
+    if (words_in_lds)
+      return union_words[w];
+    unsigned bits = 0;
+#pragma unroll
+    for (unsigned r = 0; r < kMaskRows; ++r) {
+      if (r < live_rows)
+        bits |= mask[size_t(query_start + r) * mask_words + w];
+    }
+    return clip_word(w, bits);
+  };
   // First visible block at or after `b` (n_blocks when none). Uniform across
   // the block: every thread walks the same words.
   const auto next_block = [&](std::uint32_t b) -> std::uint32_t {
@@ -4187,7 +4285,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       return b;
     }
     while (b < tail_block && b < n_blocks) {
-      const std::uint32_t bits = union_words[b / 32] >> (b % 32);
+      const std::uint32_t bits = union_word(b / 32) >> (b % 32);
       // Never jump past the tail: from tail_block on every block is visible.
       if (bits != 0) {
         return min(b + static_cast<std::uint32_t>(__builtin_ctz(bits)),
@@ -6092,6 +6190,12 @@ bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
   return true;
 }
 
+void ExpandQ8_0(const void* q8, float* out, std::size_t count,
+                hipStream_t stream) {
+  hipLaunchKernelGGL(ExpandQ8_0Kernel, dim3(Blocks(count)), dim3(kThreads), 0,
+                     stream, static_cast<const std::uint8_t*>(q8), out, count);
+}
+
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        hipStream_t stream) {
   if (bf16) {
@@ -7761,7 +7865,7 @@ std::uint32_t WmmaCausalAttentionContextLimit(std::uint32_t heads,
   if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
       d != kWmmaHeadDim || ratio != kWmmaRatio)
     return 0;
-  return kWmmaMaxMaskWords * kWmmaRatio * 32;
+  return (std::uint32_t{1} << kWmmaMemberShift) * kWmmaRatio;
 }
 
 bool WmmaCausalAttention(const float* q, const float* gate,
@@ -7777,13 +7881,14 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     return false;
   }
   if (mask != nullptr) {
-    // The kernel's union mask covers the LIVE visible extent; mask_words is
-    // only the row stride and may be wider when the session capacity
-    // exceeds 262,144 tokens.
+    // The kernel reads the union mask over the LIVE visible extent;
+    // mask_words is only the row stride and may be wider (the session
+    // capacity), never narrower.
     const std::uint64_t live_blocks =
         (std::uint64_t{start_pos} + n_tokens + kWmmaRatio - 1) / kWmmaRatio;
     const std::uint64_t live_words = (live_blocks + 31) / 32;
-    if (live_words > kWmmaMaxMaskWords || live_words > mask_words)
+    if (live_blocks > (std::uint64_t{1} << kWmmaMemberShift) ||
+        live_words > mask_words)
       return false;
   }
   if (mask != nullptr) {
@@ -7915,6 +8020,54 @@ void MtpAddEmbedding(const float* embedding, float* residual,
                      stream, embedding, residual, hidden, streams);
 }
 
+/// One block: the softmax probability of the argmax row[0] names, written
+/// as float bits into row[1]. Nonfinite logits contribute nothing.
+__launch_bounds__(1024) __global__
+    void ArgmaxConfidenceKernel(const float* logits, std::int32_t* row,
+                                std::uint32_t vocab) {
+  __shared__ float partial[32];
+  const float top = logits[row[0]];
+  float sum = 0.0F;
+  // One block reads the whole row: issue a thread's next 16 loads together,
+  // then add them in the same order. One load per step waited on memory
+  // latency: 23 us over the draft head's 99,328 logits (now 9 us) and 48 us
+  // over the full head (now 14 us), with the same sums.
+  constexpr std::uint32_t kBatch = 16;
+  std::uint32_t i = threadIdx.x;
+  for (; i + (kBatch - 1) * blockDim.x < vocab; i += kBatch * blockDim.x) {
+    float l[kBatch];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k)
+      l[k] = logits[i + k * blockDim.x];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k)
+      if (isfinite(l[k]))
+        sum += __expf(l[k] - top);
+  }
+  for (; i < vocab; i += blockDim.x) {
+    const float l = logits[i];
+    if (isfinite(l))
+      sum += __expf(l - top);
+  }
+  sum = WaveSum(sum);
+  if ((threadIdx.x & 31U) == 0)
+    partial[threadIdx.x >> 5U] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0F;
+    for (unsigned w = 0; w < blockDim.x / 32U; ++w)
+      total += partial[w];
+    const float p = isfinite(top) && total > 0.0F ? 1.0F / total : 0.0F;
+    row[1] = __float_as_int(p);
+  }
+}
+
+void ArgmaxConfidence(const float* logits, std::int32_t* row,
+                      std::uint32_t vocab, hipStream_t stream) {
+  hipLaunchKernelGGL(ArgmaxConfidenceKernel, dim3(1), dim3(1024), 0, stream,
+                     logits, row, vocab);
+}
+
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream) {
   hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),
@@ -7972,16 +8125,22 @@ void GatherDraftLogits(float* logits, const std::int32_t* table,
 
 __global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
                                     std::uint32_t prefix,
-                                    const std::int32_t* table) {
+                                    const std::int32_t* table,
+                                    std::uint32_t table_rows) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n && ids[i] >= prefix)
-    ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
+  if (i >= n || ids[i] < prefix)
+    return;
+  // A row past the table reads as an empty slot (-1), not past the table.
+  const std::uint32_t row = ids[i] - prefix;
+  ids[i] =
+      row < table_rows ? static_cast<std::uint32_t>(table[row]) : UINT32_MAX;
 }
 
 void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
-                   const std::int32_t* table, hipStream_t stream) {
+                   const std::int32_t* table, std::uint32_t table_rows,
+                   hipStream_t stream) {
   hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
-                     stream, ids, n, prefix, table);
+                     stream, ids, n, prefix, table, table_rows);
 }
 
 void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,

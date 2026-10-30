@@ -208,10 +208,11 @@ def main():
     for limit in ("0", "-2", "4294967296"):
         check(["serve", "llm", "--max-tokens", limit], 2,
               "sampling and scheduling limits are invalid")
-    # The per-client cap defaults to --max-pending, so lowering the global
-    # queue alone is valid. An explicit per-client value is still bounded by it.
-    assert ("Maximum queued requests per client IP (default: --max-pending)"
-            in help_text)
+    # The per-client cap defaults to 8 but never exceeds --max-pending, so
+    # lowering the global queue alone is valid. An explicit per-client value
+    # is still bounded by it.
+    assert ("Maximum queued requests per client key or IP (default: 8, at most "
+            "--max-pending)" in help_text)
     for args in (["--max-pending", "2"], ["--max-pending", "1"],
                  ["--max-pending", "2", "--max-pending-per-client", "2"],
                  ["--max-pending-per-client", "16"]):

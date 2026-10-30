@@ -391,6 +391,36 @@ void CheckHcDownProjection(const void* w, const void* tiled,
   CheckHip(hipFree(activated), "HC activation free");
 }
 
+// Q8_0 inject and alpha/beta weights are expanded to F32 at load: every
+// value must equal its block scale times its code, and nothing past `count`
+// may be written.
+void CheckExpandQ8_0(std::size_t m, std::size_t k, std::uint32_t seed) {
+  const Q8Weights w = MakeWeights(m, k, seed);
+  const std::size_t count = m * k;
+  void* d_w = nullptr;
+  float* d_out = nullptr;
+  CheckHip(hipMalloc(&d_w, w.blocks.size()), "expand weights");
+  CheckHip(hipMalloc(&d_out, (count + 64) * 4), "expand output");
+  CheckHip(
+      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "expand weight upload");
+  CheckHip(hipMemset(d_out, 0x7F, (count + 64) * 4), "expand guards");
+  q::ExpandQ8_0(d_w, d_out, count, nullptr);
+  std::vector<float> out(count + 64);
+  CheckHip(hipMemcpy(out.data(), d_out, out.size() * 4, hipMemcpyDeviceToHost),
+           "expand download");
+  if (std::memcmp(out.data(), w.values.data(), count * 4) != 0)
+    throw std::runtime_error("expanded Q8_0 values differ from the codes");
+  for (std::size_t i = count; i < out.size(); ++i) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &out[i], sizeof(bits));
+    if (bits != 0x7F7F7F7FU)
+      throw std::runtime_error("Q8_0 expansion wrote past its count");
+  }
+  CheckHip(hipFree(d_out), "expand output free");
+  CheckHip(hipFree(d_w), "expand weights free");
+}
+
 /// A batch a few tokens past a full 128-token tile computes its tail with
 /// W8A8TailKernel; every row must equal the tiled kernel's row from a batch
 /// whose tail is too wide to split.
@@ -605,6 +635,139 @@ void CheckDenseAcrossStreams() {
   }
   for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
     CheckHip(hipFree(p), "free");
+}
+
+// A new stream's arena starts small. A batch whose Q8 activations outgrow it
+// adds a block, a small batch after that reuses the first one, and every
+// output matches the same launch on the default stream.
+void CheckArenaGrowth() {
+  constexpr std::size_t m = 2560, k = 6144, small = 8, large = 4096;
+  const Q8Weights w = MakeWeights(m, k, 0x6A0E1A11U);
+  std::vector<float> x(large * k);
+  std::uint32_t state = 0x6A0E1A12U;
+  for (float& v : x)
+    v = Uniform(&state, 2.0F);
+  void* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_y = nullptr;
+  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
+  CheckHip(hipMalloc(&d_y, large * m * 4), "hipMalloc");
+  CheckHip(
+      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "upload");
+  const auto dense = [&](std::size_t batch, hipStream_t stream) {
+    if (qfn_mmq_q8_0_dense(d_w, d_x, d_y, static_cast<int>(m),
+                           static_cast<int>(batch), static_cast<int>(k),
+                           stream) != 0)
+      throw std::runtime_error("MMQ dense failed");
+    CheckHip(hipStreamSynchronize(stream), "dense");
+    std::vector<float> y(batch * m);
+    CheckHip(hipMemcpy(y.data(), d_y, y.size() * 4, hipMemcpyDeviceToHost),
+             "download");
+    return y;
+  };
+  const std::vector<float> want_small = dense(small, nullptr);
+  const std::vector<float> want_large = dense(large, nullptr);
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+  for (int round = 0; round < 2; ++round) {
+    if (dense(small, stream) != want_small)
+      throw std::runtime_error("MMQ dense differs on a small arena");
+    if (dense(large, stream) != want_large)
+      throw std::runtime_error("MMQ dense differs after the arena grew");
+  }
+  qfn_mmq_release_stream(stream);
+  CheckHip(hipStreamDestroy(stream), "stream destroy");
+  for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
+    CheckHip(hipFree(p), "free");
+}
+
+// A graph captured on a stream bakes in that stream's arena addresses. A later
+// eager batch that outgrows the arena must not free or move them: replaying
+// the graph must still match, and must not write memory the arena released.
+void CheckArenaGraphReplay() {
+  constexpr std::size_t m = 2560, k = 6144, small = 8, large = 4096;
+  const Q8Weights w = MakeWeights(m, k, 0x6A0E1A21U);
+  std::vector<float> x(large * k);
+  std::uint32_t state = 0x6A0E1A22U;
+  for (float& v : x)
+    v = Uniform(&state, 2.0F);
+  void* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_y = nullptr;
+  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
+  CheckHip(hipMalloc(&d_y, large * m * 4), "hipMalloc");
+  CheckHip(
+      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "upload");
+  const auto launch = [&](std::size_t batch, hipStream_t stream) {
+    if (qfn_mmq_q8_0_dense(d_w, d_x, d_y, static_cast<int>(m),
+                           static_cast<int>(batch), static_cast<int>(k),
+                           stream) != 0)
+      throw std::runtime_error("MMQ dense failed");
+  };
+  const auto download = [&](std::size_t batch) {
+    std::vector<float> y(batch * m);
+    CheckHip(hipMemcpy(y.data(), d_y, y.size() * 4, hipMemcpyDeviceToHost),
+             "download");
+    return y;
+  };
+  launch(small, nullptr);
+  CheckHip(hipDeviceSynchronize(), "reference");
+  const std::vector<float> want_small = download(small);
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+  launch(small, stream);
+  CheckHip(hipStreamSynchronize(stream), "warm");
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t replay = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "capture");
+  launch(small, stream);
+  CheckHip(hipStreamEndCapture(stream, &graph), "capture end");
+  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+           "instantiate");
+  launch(large, stream);
+  CheckHip(hipStreamSynchronize(stream), "grow");
+  launch(small, stream);
+  CheckHip(hipStreamSynchronize(stream), "after grow");
+  // Take back whatever the arena released and fill it with a pattern.
+  constexpr std::size_t decoy_bytes = std::size_t{16} << 20;
+  std::vector<unsigned char*> decoys(8);
+  for (auto& d : decoys) {
+    CheckHip(hipMalloc(&d, decoy_bytes), "decoy");
+    CheckHip(hipMemset(d, 0x5A, decoy_bytes), "decoy fill");
+  }
+  CheckHip(hipMemset(d_y, 0, small * m * 4), "clear");
+  CheckHip(hipGraphLaunch(replay, stream), "replay");
+  CheckHip(hipStreamSynchronize(stream), "replay wait");
+  const bool output_ok = download(small) == want_small;
+  std::size_t touched = 0;
+  std::vector<unsigned char> host(decoy_bytes);
+  for (auto* d : decoys) {
+    CheckHip(hipMemcpy(host.data(), d, decoy_bytes, hipMemcpyDeviceToHost),
+             "decoy read");
+    for (unsigned char b : host)
+      touched += b != 0x5A;
+  }
+  for (auto* d : decoys)
+    CheckHip(hipFree(d), "decoy free");
+  CheckHip(hipGraphExecDestroy(replay), "graph free");
+  CheckHip(hipGraphDestroy(graph), "graph definition free");
+  qfn_mmq_release_stream(stream);
+  CheckHip(hipStreamDestroy(stream), "stream destroy");
+  for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
+    CheckHip(hipFree(p), "free");
+  if (!output_ok)
+    throw std::runtime_error("MMQ graph replay differs after the arena grew");
+  if (touched != 0)
+    throw std::runtime_error("MMQ graph replay wrote released arena memory");
 }
 
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
@@ -1034,6 +1197,8 @@ int main() {
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
     CheckDenseAcrossStreams();
+    CheckArenaGrowth();
+    CheckArenaGraphReplay();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
@@ -1052,6 +1217,10 @@ int main() {
     CheckMtpOutputHead(1.0F);
     // Small activations must retain products below F16's normal range.
     CheckMtpOutputHead(0.0001F);
+    // The hc_*_inject [4][10240] and stacked ssm_alpha/beta [96][2560]
+    // shapes.
+    CheckExpandQ8_0(4, 10240, 0xE8A4D1U);
+    CheckExpandQ8_0(96, 2560, 0xE8A4D2U);
     CheckW8A8Tail(320, 10240, 0x7A1320U);
     CheckW8A8Tail(640, 2560, 0x7A1640U);
     bool ok = true;
