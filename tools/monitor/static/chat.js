@@ -53,8 +53,8 @@ function failedToSave() {
 function plainChat(chat) {
   return {
     ...chat,
-    messages: chat.messages.map(({ role, content, hadImages, images, stats, error, steps }) => ({
-      role, content, hadImages: Boolean(hadImages || images?.length), stats, error,
+    messages: chat.messages.map(({ role, content, hadImages, images, stats, error, steps, steering }) => ({
+      role, content, hadImages: Boolean(hadImages || images?.length), stats, error, steering,
       steps: steps?.map(({ figures, ...rest }) => (figures ? { ...rest, figureCount: figures.length } : rest)),
     })),
   };
@@ -681,7 +681,7 @@ function renderMessages() {
   const messages = active()?.messages ?? [];
   for (const message of messages) {
     const block = document.createElement('article');
-    block.className = `message ${message.role}${message.error ? ' error' : ''}`;
+    block.className = `message ${message.role}${message.error ? ' error' : ''}${message.steering ? ' steering' : ''}`;
     fillMessage(block, message);
     root.append(block);
   }
@@ -921,11 +921,59 @@ function toApiMessages(messages) {
 
 function setBusy(on) {
   busy = on;
-  $('send').textContent = on ? 'Stop' : 'Send';
-  $('send').classList.toggle('secondary', on);
+  updateSendLabel();
   $('delete-chat').disabled = on;  // not while a reply is being written into it
   for (const id of ['update-memory', 'draft-guidelines']) $(id).disabled = on;  // the model is busy with the reply
   if (on) disarmDelete();
+}
+
+// ---------------------------------------------------------------- steering
+// A message sent while a reply is being written steers it: it waits in this queue, shown above
+// the message box, and is delivered at the next chance. A model call under way is interrupted at
+// once (what it wrote so far stays); tool calls under way finish first. Either way the reply goes
+// on from the steering message, as a new answer below it.
+let steerQueue = [];        // {text, images}
+let interruptRound = null;  // set while a model call streams: ends that call
+
+function renderSteerQueue() {
+  const root = $('steer-queue');
+  root.replaceChildren();
+  steerQueue.forEach((item, index) => {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    const text = document.createElement('span');
+    text.textContent = item.text || `${item.images.length} image${item.images.length === 1 ? '' : 's'}`;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'secondary';
+    remove.setAttribute('aria-label', 'Remove this queued message');
+    remove.textContent = '×';
+    remove.addEventListener('click', () => { steerQueue.splice(index, 1); renderSteerQueue(); });
+    chip.append(text, remove);
+    root.append(chip);
+  });
+  root.hidden = steerQueue.length === 0;
+}
+
+function updateSendLabel() {
+  const typed = $('prompt').value.trim() !== '' || pendingImages.length > 0;
+  $('send').textContent = !busy ? 'Send' : typed ? 'Steer' : 'Stop';
+  $('send').classList.toggle('secondary', busy && !typed);
+}
+
+// Queues what is in the message box as steering; false when the box is empty.
+function queueSteer() {
+  const text = $('prompt').value.trim();
+  if (!text && pendingImages.length === 0) return false;
+  steerQueue.push({ text, images: pendingImages });
+  $('prompt').value = '';
+  autosize();
+  pendingImages = [];
+  renderPreview();
+  renderSteerQueue();
+  updateSendLabel();
+  interruptRound?.();
+  return true;
 }
 
 async function send() {
@@ -952,7 +1000,7 @@ async function send() {
   const note = allowed.size ? toolkit.note(allowed, new Date().toISOString().slice(0, 10)) : null;
   const system = Projects.systemMessage(owner ? Projects.context(owner, chat.memory) : null, note?.content);
   const outgoing = [...(system ? [system] : []), ...toApiMessages(chat.messages)];
-  const reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [] };
+  let reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [] };
   chat.messages.push(reply);
   if (chat.title === 'New chat') chat.title = text.slice(0, 48) || 'Image chat';
   $('prompt').value = '';
@@ -960,20 +1008,20 @@ async function send() {
   pendingImages = [];
   renderPreview();
   renderMessages();
-  const block = $('messages').lastElementChild;
+  let block = $('messages').lastElementChild;
   updateHistory(chat);
   controller = new AbortController();
   replyingId = chat.id;
   setBusy(true);
   $('status').textContent = '';
 
-  const sentAt = performance.now();
+  let sentAt = performance.now();
   let firstAt = null;      // first piece of the whole reply
   let roundFirstAt = null; // first piece of this model call, for the live rate
   let roundPieces = 0;
   let pieces = 0;
   let queued = false;
-  const totals = { prompt: 0, cached: 0, completion: 0, cost: null, decode: 0 };
+  let totals = { prompt: 0, cached: 0, completion: 0, cost: null, decode: 0 };
   const stepArgs = new Map();  // each step's arguments, to word it if it is cut off
   const paint = () => {
     queued = false;
@@ -987,15 +1035,64 @@ async function send() {
     }
   };
   const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(paint); } };
+  // Ends the reply being built: its stopped tool steps, its totals, its place in the saved chat.
+  const closeReply = () => {
+    for (const step of reply.steps) {
+      if (step.state !== 'run') continue;
+      step.state = 'bad';
+      step.label = `${toolkit.label(step.name, stepArgs.get(step), true)} (stopped)`;
+    }
+    if (totals.prompt || totals.completion) {
+      const elapsed = firstAt ? (performance.now() - firstAt) / 1000 : 0;
+      reply.stats = {
+        tps: totals.decode > 0 ? totals.completion / totals.decode
+          : (elapsed > 0 && pieces > 1 ? pieces / elapsed : null),
+        ttft_ms: firstAt ? firstAt - sentAt : null,
+        prompt_tokens: totals.prompt, cached_tokens: totals.cached, completion_tokens: totals.completion,
+        cost_micro: totals.cost, calls: reply.steps.length || undefined,
+      };
+    }
+    delete reply.pending;
+    reply.reasoning = reply.reasoning || undefined;
+    if (!reply.steps.length) delete reply.steps;
+  };
+  // Delivers the queued steering: the reply so far is closed, the messages go under it, and a new
+  // reply starts below them. The model is sent them as user messages after what it had written.
+  const deliverSteering = () => {
+    closeReply();
+    for (const item of steerQueue) {
+      const message = { role: 'user', content: item.text, images: item.images, hadImages: item.images.length > 0, steering: true };
+      chat.messages.push(message);
+      outgoing.push(toApiMessages([message])[0]);
+    }
+    steerQueue = [];
+    renderSteerQueue();
+    reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [] };
+    chat.messages.push(reply);
+    totals = { prompt: 0, cached: 0, completion: 0, cost: null, decode: 0 };
+    firstAt = null;
+    pieces = 0;
+    sentAt = performance.now();
+    renderMessages();
+    block = $('messages').lastElementChild;
+    updateHistory(chat);
+  };
   try {
     for (let round = 0; ; round++) {
+      if (steerQueue.length) deliverSteering();
       const useTools = allowed.size > 0 && round < MAX_ROUNDS;
       let roundText = '';
       let separated = !reply.content;  // a blank line between the texts of two rounds
       roundFirstAt = null;
       roundPieces = 0;
-      const { usage, timings, toolCalls } = await streamCompletion({
-        model, messages: outgoing, effort: $('effort').value, signal: controller.signal,
+      const roundControl = new AbortController();
+      const stopRound = () => roundControl.abort();
+      controller.signal.addEventListener('abort', stopRound, { once: true });
+      interruptRound = stopRound;
+      let streamed;
+      try {
+        streamed = await streamCompletion({
+        model, messages: outgoing, effort: $('effort').value, signal: roundControl.signal,
         tools: useTools ? toolkit.schemas(allowed) : undefined,
         onDelta: (delta) => {
           if (!delta.content && !delta.reasoning_content) return;
@@ -1012,6 +1109,18 @@ async function send() {
           schedule();
         },
       });
+      } catch (error) {
+        // Interrupted for steering, not stopped: keep what was written and go on from the message.
+        if (error.name === 'AbortError' && !controller.signal.aborted && steerQueue.length) {
+          if (roundText) outgoing.push({ role: 'assistant', content: roundText });
+          continue;
+        }
+        throw error;
+      } finally {
+        interruptRound = null;
+        controller.signal.removeEventListener('abort', stopRound);
+      }
+      const { usage, timings, toolCalls } = streamed;
       if (usage) {
         totals.prompt += usage.prompt_tokens || 0;
         totals.cached += usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0;
@@ -1021,7 +1130,13 @@ async function send() {
         const rate = usage.completion_tokens_per_second || timings?.predicted_per_second;
         if (rate > 0 && usage.completion_tokens) totals.decode += usage.completion_tokens / rate;
       }
-      if (!useTools || toolCalls.length === 0) break;
+      if (!useTools || toolCalls.length === 0) {
+        if (steerQueue.length) {  // it arrived as the answer ended: answer it too
+          if (roundText) outgoing.push({ role: 'assistant', content: roundText });
+          continue;
+        }
+        break;
+      }
 
       // The model asked for the browser: run its calls here, show them, send back what they found.
       const calls = toolCalls.map((call, index) => {
@@ -1066,28 +1181,22 @@ async function send() {
     else if (stopped) reply.content = note;
     else { reply.content = `Error: ${error.message}`; reply.error = true; }
   } finally {
-    for (const step of reply.steps) {
-      if (step.state !== 'run') continue;
-      step.state = 'bad';
-      step.label = `${toolkit.label(step.name, stepArgs.get(step), true)} (stopped)`;
-    }
-    if (totals.prompt || totals.completion) {
-      const elapsed = firstAt ? (performance.now() - firstAt) / 1000 : 0;
-      reply.stats = {
-        tps: totals.decode > 0 ? totals.completion / totals.decode
-          : (elapsed > 0 && pieces > 1 ? pieces / elapsed : null),
-        ttft_ms: firstAt ? firstAt - sentAt : null,
-        prompt_tokens: totals.prompt, cached_tokens: totals.cached, completion_tokens: totals.completion,
-        cost_micro: totals.cost, calls: reply.steps.length || undefined,
-      };
-    }
+    closeReply();
     controller = null;
     replyingId = null;
     setBusy(false);
     $('status').textContent = '';
-    delete reply.pending;
-    reply.reasoning = reply.reasoning || undefined;
-    if (!reply.steps.length) delete reply.steps;
+    // Steering that was never delivered (Stop, an error) goes back into the message box, not lost.
+    if (steerQueue.length) {
+      const typed = $('prompt').value.trim();
+      $('prompt').value = [...steerQueue.map((item) => item.text), typed].filter(Boolean).join('\n\n');
+      pendingImages = [...steerQueue.flatMap((item) => item.images), ...pendingImages];
+      steerQueue = [];
+      renderSteerQueue();
+      renderPreview();
+      autosize();
+    }
+    updateSendLabel();
     updateHistory(chat);
     renderMessages();
     scheduleMemory(chat);
@@ -1146,11 +1255,12 @@ $('delete-project').addEventListener('click', () => {
 $('prompt').addEventListener('keydown', (event) => {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
   event.preventDefault();
-  if (!busy) $('composer').requestSubmit();
+  $('composer').requestSubmit();  // while a reply is written this steers it
 });
 $('composer').addEventListener('submit', (event) => {
   event.preventDefault();
-  if (busy) controller?.abort(); else send();
+  if (!busy) send();
+  else if (!queueSteer()) controller?.abort();
 });
 // The box grows with its text, up to its CSS limit.
 function autosize() {
@@ -1158,7 +1268,7 @@ function autosize() {
   box.style.height = 'auto';
   box.style.height = `${box.scrollHeight}px`;
 }
-$('prompt').addEventListener('input', autosize);
+$('prompt').addEventListener('input', () => { autosize(); updateSendLabel(); });
 $('effort').value = localStorage.getItem(EFFORT_KEY) || '';
 $('model').addEventListener('change', () => localStorage.setItem(MODEL_KEY, $('model').value));
 $('effort').addEventListener('change', () => localStorage.setItem(EFFORT_KEY, $('effort').value));

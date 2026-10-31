@@ -49,7 +49,11 @@ conversations are not private from whoever runs the monitor**. Image bytes are n
 The chat list shows the 200 most recent of the open project. If the monitor is older or sync is
 off, chats stay in the browser alone; an unknown account gets an in-memory copy and no database. A reply keeps being written when the page goes to the background or loses its network (a phone
 switching apps): the monitor generates it in a run that does not depend on the browser's connection,
-and the page reads the rest when it is back, from the event where it stopped. **Stop** ends the run
+and the page reads the rest when it is back, from the event where it stopped. **Steering:** a message sent while a reply is being written (the button reads *Steer*) is queued above the
+message box and steers the reply. A model call under way is interrupted at once and what it wrote so far
+stays; tool calls under way finish first, and the message follows their results. The reply then goes on from
+it as a new answer below. Press **Stop** on an empty box to end the reply; queued messages that were never
+delivered go back into the box. **Stop** ends the run
 and the generation; a run nobody has read for three minutes is stopped too, and a finished one stays
 readable for ten (kept in the monitor's memory only, for the user who started it). **Delete** removes the open chat,
 after a second click to confirm. Image bytes are not kept. A project's Export still downloads its notes as a file.
