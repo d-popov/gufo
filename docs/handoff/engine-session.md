@@ -82,3 +82,29 @@ Environment failures reported separately (not engine bugs): 7 skipped CPU tests 
    then decide the binary. Diagnose the intermittent `session_test` failures if the merged binary is chosen.
 3. Consider merging #875 afterwards; re-run Devlab for the merged range.
 4. Kernel 7.2.13 vs 7.2.12 (previous boot) is a suspect if memory headroom stays lower than before the reboot.
+
+## Goal for the next sessions
+Faster prefill ("in") and decode ("out") speed, and more simultaneously running sessions, on the same Strix Halo host.
+Memory is the limit for sessions: session state is 22.3 GB for 4 sessions (1x262144 + 3x98304) and the 3-slot sub class
+failed to load once desktop apps took ~11 GB. Candidate directions (not started, none verified):
+- Allocate or release session state by use (grow in blocks, free idle contexts) instead of up front.
+- Fixed small safety reserve instead of a loose headroom estimate.
+- Check the merged build's prefill (suspected slower) before adding anything else; baseline numbers are in `docs/SERVER.md`.
+- Keep the cheap small-head/draft-vocab MTP path and confidence-gated chains (already in).
+
+## Reference: "Avalon" results found while researching (as supplied by the user; unverified by me)
+The video https://www.youtube.com/watch?v=0F63pTS8Gt0 (Kai, 2026-10-31) is about the first entity below. Its
+relevance to Gufo is low: it fixes a discrete-GPU PCIe/VRAM split that Strix Halo's single memory pool does not have.
+- **Avalon (llama.cpp fork)**: a specialised fork that runs huge MoE models, specifically Qwen3.8-Flash-Next (125B
+  parameters), on one consumer GPU, by keeping non-resident expert weights in system RAM behind an adaptive
+  Least-Frequently-Used (LFU) expert cache, for high throughput under hardware memory limits.
+- **Avalon-2B (nuroai)**: a sub-3B self-reflective language model for on-device inference. GGUF-quantised, so it runs on
+  llama.cpp, Ollama and LM Studio. Uses reflection tokens ([Retrieval], [No Retrieval], [Utility:X]) to decide when to
+  fetch external information versus use internal knowledge.
+- **Avalon-M1 (general reasoning)**: a model series that runs agent organisations whose agents coordinate through a
+  message board and workspace. Trained with Reinforcement Learning from Collective Rewards (RLCR) for collective
+  reasoning, specialisation and communication; reported lower latency and better long-horizon performance than single agents.
+- **Avalon GloboCare (ALBT)**: a publicly traded company (NASDAQ: ALBT) accepted into the AMD AI Developer Program. Its
+  subsidiary Avalon Quantum AI LLC is building automated video generation and enterprise documentation tools on AMD
+  Instinct accelerators for LLM training and inference.
+Only the first is an inference engine; the other three are a model, a model series and a company that share the name.
