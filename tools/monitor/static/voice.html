@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>AI Inference – Voice</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/header.css">
+  <link rel="stylesheet" href="/static/voice.css">
+  <script src="/static/icons.js" defer></script>
+  <script src="/static/header.js" defer></script>
+  <script src="/static/talk.js" defer></script>
+  <script src="/static/voice.js" defer></script>
+</head>
+<body>
+  <header id="site-header" class="site-header"></header>
+  <main class="voice">
+    <h1>Voice</h1>
+    <p>How replies are spoken when you press a reply's speaker button or use Talk in the chat.
+      Your choices are kept on the server, so every device speaks the same.</p>
+    <p id="models" class="muted"></p>
+    <form id="voice-form" class="voice-form">
+      <label class="field">Voice
+        <select id="voice"></select>
+      </label>
+      <label class="field">Speed
+        <select id="speed">
+          <option value="0.8">Slow</option>
+          <option value="1">Normal</option>
+          <option value="1.25">Fast</option>
+          <option value="1.5">Faster</option>
+        </select>
+        <span class="hint">The pitch moves a little with the speed.</span>
+      </label>
+      <label class="field">Sample text
+        <textarea id="sample" rows="3" maxlength="400">Hello! This is how I will read your replies aloud.</textarea>
+      </label>
+      <div class="row">
+        <button id="play" type="button" class="secondary">Play sample</button>
+        <button id="save" type="submit">Save</button>
+        <span id="state" role="status"></span>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

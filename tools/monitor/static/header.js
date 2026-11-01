@@ -14,7 +14,7 @@
 window.GufoHeader = (() => {
   // The product name in the brand and the page titles.
   const SITE_NAME = 'AI Inference';
-  const PAGES = { portal: 'Portal', monitor: 'Monitor', chat: 'Chat' };
+  const PAGES = { portal: 'Portal', monitor: 'Monitor', chat: 'Chat', voice: 'Voice' };
 
   const $ = (id) => document.getElementById(id);
   const icon = (name) => window.GufoIcons.svg(name);
@@ -59,8 +59,7 @@ window.GufoHeader = (() => {
   }
 
   function build() {
-    const page = window.location.pathname === '/monitor' ? 'monitor'
-      : window.location.pathname === '/chat' ? 'chat' : 'portal';
+    const page = { '/monitor': 'monitor', '/chat': 'chat', '/voice': 'voice' }[window.location.pathname] ?? 'portal';
     document.title = `${SITE_NAME} – ${PAGES[page]}`;
     const link = (name, href, iconName) => {
       const node = el('a', { class: 'site-link', href }, icon(iconName), PAGES[name]);
@@ -85,6 +84,7 @@ window.GufoHeader = (() => {
       menuItem('menu-signin', 'log-in', 'Sign in'),
       menuItem('menu-signup', 'user-plus', 'Sign up'),
       menuItem('menu-admin-signin', 'shield-check', 'Admin sign-in'),
+      menuItem('menu-voice', 'volume-2', 'Voice settings'),
       menuItem('menu-admin-accounts', 'users', 'Admin: accounts'),
       menuItem('menu-admin-keys', 'key-round', 'Admin: API keys'),
       menuItem('menu-admin-pricing', 'tag', 'Admin: pricing'),
@@ -124,6 +124,7 @@ window.GufoHeader = (() => {
     for (const id of ['menu-admin-pricing', 'menu-admin-usage', 'menu-admin-deposits']) {
       $(id).hidden = !session.admin || !portalEnabled;  // need the credits portal
     }
+    $('menu-voice').hidden = !session.admin;  // talk mode is the admin's for now
     $('menu-admin-signout').hidden = !session.admin;
     $('site-link-monitor').hidden = !session.admin;
     $('site-link-chat').hidden = !(session.admin ||
@@ -235,6 +236,7 @@ window.GufoHeader = (() => {
         options.onAdminTab?.(name);
       });
     }
+    $('menu-voice').addEventListener('click', () => { window.location.href = '/voice'; });
     $('menu-admin-signout').addEventListener('click', adminSignOut);
   }
 

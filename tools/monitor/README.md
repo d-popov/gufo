@@ -74,13 +74,16 @@ and 1236, with the text server's key file) and start the monitor with
 `--chat-key-file`. Only Qwen3-ASR 1.7B and Qwen3-TTS 12Hz 1.7B (BF16 safetensors) work: Gufo does not load the audio
 GGUFs of other tools. TTS speaks Chinese, English, German, Italian, Portuguese, Spanish, Japanese, Korean, French and
 Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them. The page
-needs a secure context for the microphone (`localhost` or https). Beside the button the chat shows the speech models it
-uses (`Listening: …`, `Speaking: …`) and two controls: **Voice**, from the voices the speech server lists, and
-**Speed** (Slow, Normal, Fast, Faster). Both are kept in the browser. Every finished reply also has a small speaker button: it reads that reply aloud in the chosen voice
-and speed (press again to stop), so a typed conversation can be listened to without Talk. The server speaks at 1.0 only, so speed is
-playback rate and the pitch moves a little with it. Routes: `GET /api/chat/voice` (models and voices),
-`POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak` (`{text, voice?}` answers a WAV).
-`static/talk.js` holds the logic.
+needs a secure context for the microphone (`localhost` or https).
+
+The voice and speed are the account's, set on the **Voice settings** page (profile menu, `/voice`): pick a voice from
+the ones the speech server lists, pick a speed, play a sample of any text, and save. They are kept on the server, so
+every device speaks the same, and the chat itself has no voice controls. The page also names the speech models in
+use. The server speaks at 1.0 only, so speed is playback rate and the pitch moves a little with it. Every finished
+reply has a small speaker button that reads it aloud in the saved voice and speed (press again to stop), so a typed
+conversation can be listened to without Talk. Routes: `GET /api/chat/voice` (models, voices and the saved choice),
+`PUT /api/chat/voice-prefs` (`{voice, speed}`), `POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak`
+(`{text, voice?}` answers a WAV). `static/talk.js` holds the logic, `static/voice.js` the settings page.
 
 **Projects.** The first box in the toolbar picks a project: a folder of chats that share two
 plain Markdown notes, both editable in the **Project** panel.

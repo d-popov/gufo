@@ -327,6 +327,16 @@ class MonitorHttpTest(unittest.TestCase):
             response, _ = self.request(method, "/login")
             self.assertIn(response.status, (401, 404), method)
 
+    def test_voice_settings_page_is_the_admins_and_has_no_network_beyond_the_monitor(self):
+        response, _ = self.request("GET", "/voice")
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
+        response, data = self.request("GET", "/voice", {"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'id="voice-form"', data)
+        policy = response.getheader("Content-Security-Policy")
+        self.assertIn("connect-src 'self';", policy)
+        self.assertIn("script-src 'self';", policy)
+
     def test_chat_page_and_admin_proxy(self):
         response, _ = self.request("GET", "/chat")
         self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
@@ -497,7 +507,7 @@ class MonitorHttpTest(unittest.TestCase):
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
                      "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
-                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js", "talk.js",
+                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js", "talk.js", "voice.js", "voice.css",
                      "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
@@ -689,7 +699,8 @@ class TalkModeTest(unittest.TestCase):
     def serve(self, voice):
         monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", "monitor-key"), NoTelemetry())
         server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False,
-                                 chat_key="chat-key", voice=voice))
+                                 chat_key="chat-key", chat_store=gm.ChatStore(":memory:"),
+                                 voice=voice))
         self.addCleanup(lambda: (server.shutdown(), server.server_close()))
         return server.server_address[1]
 
@@ -771,7 +782,8 @@ class TalkModeTest(unittest.TestCase):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         status, data = self.get_voice(port)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan"}))
+            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan",
+            "prefs": {"voice": None, "speed": 1.0}}))
         self.assertEqual(FakeSpeech.seen, [])
         self.assertEqual(self.get_voice(port, admin=False)[0], 401)
         # A configured voice the server lacks is not offered as the default.
@@ -781,8 +793,49 @@ class TalkModeTest(unittest.TestCase):
         # Speech servers that do not answer leave the lists empty rather than failing the page.
         down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
         status, data = self.get_voice(down)
-        self.assertEqual((status, json.loads(data)),
-                         (200, {"asr": None, "tts": None, "voices": [], "voice": None}))
+        self.assertEqual((status, json.loads(data)), (200, {
+            "asr": None, "tts": None, "voices": [], "voice": None,
+            "prefs": {"voice": None, "speed": 1.0}}))
+
+    def put_prefs(self, port, body, admin=True):
+        return self.call_method(port, "PUT", "/api/chat/voice-prefs", json.dumps(body).encode(),
+                                "application/json", admin)
+
+    def call_method(self, port, method, path, body, content_type, admin=True):
+        headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
+        if admin:
+            headers["X-Admin-Token"] = ADMIN_TOKEN
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request(method, path, body, headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def test_voice_and_speed_are_kept_on_the_server_for_the_account(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
+        prefs = json.loads(self.get_voice(port)[1])["prefs"]
+        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25})
+        # null returns to the server's default voice.
+        self.assertEqual(self.put_prefs(port, {"voice": None, "speed": 1})[0], 200)
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0})
+        for bad in ({"voice": "aiden"}, {"speed": 1}, {"voice": "nobody", "speed": 1},
+                    {"voice": "../x", "speed": 1}, {"voice": "aiden", "speed": 3},
+                    {"voice": "aiden", "speed": 0.1}, {"voice": "aiden", "speed": "fast"},
+                    {"voice": "aiden", "speed": True}, {"voice": 5, "speed": 1}):
+            self.assertEqual(self.put_prefs(port, bad)[0], 400, bad)
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0})
+        self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1}, admin=False)[0], 401)
+        self.assertEqual(self.put_prefs(self.serve(None), {"voice": None, "speed": 1})[0], 404)
+
+    def test_prefs_belong_to_their_owner(self):
+        store = gm.ChatStore(":memory:")
+        store.set_voice_prefs("user:7", "serena", 1.5)
+        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5})
+        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0})
+        store.set_voice_prefs("admin", "ryan", 0.8)
+        self.assertEqual(store.voice_prefs("user:7")["voice"], "serena")
 
     def test_the_options_come_as_a_pair(self):
         args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2", "--tts-voice", "ryan"])

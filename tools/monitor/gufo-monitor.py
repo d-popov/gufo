@@ -76,6 +76,8 @@ STATIC_FILES = {
     "chatstore.js": (STATIC_DIR, _JS),
     "chatsync.js": (STATIC_DIR, _JS),
     "talk.js": (STATIC_DIR, _JS),
+    "voice.js": (STATIC_DIR, _JS),
+    "voice.css": (STATIC_DIR, _CSS),
     "markdown.js": (STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),
 }
@@ -550,6 +552,8 @@ class ChatRuns:
                 run.cancel()
 
 
+VOICE_NAME = re.compile(r"[\w.-]{1,64}")  # a speech server's voice name
+
 CHAT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
   owner TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
@@ -559,6 +563,8 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS items_rev ON items (owner, rev);
 CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('rev', 0);
+CREATE TABLE IF NOT EXISTS voice_prefs (
+  owner TEXT PRIMARY KEY, voice TEXT, speed REAL NOT NULL, updated INTEGER NOT NULL);
 """
 
 
@@ -606,6 +612,22 @@ class ChatStore:
         kind, item_id, updated, rev, deleted, body = row
         return {"kind": kind, "id": item_id, "updated": updated, "rev": rev,
                 "deleted": bool(deleted), "data": None if deleted else json.loads(body)}
+
+    def voice_prefs(self, owner: str) -> dict:
+        """How this owner's replies are spoken: {"voice": name or None for the server's default,
+        "speed": playback rate}. The same on every device."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT voice, speed FROM voice_prefs WHERE owner = ?", (owner,)).fetchone()
+        return {"voice": row[0], "speed": row[1]} if row else {"voice": None, "speed": 1.0}
+
+    def set_voice_prefs(self, owner: str, voice: str | None, speed: float) -> dict:
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO voice_prefs (owner, voice, speed, updated) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (owner) DO UPDATE SET voice = excluded.voice, speed = excluded.speed, "
+                "updated = excluded.updated", (owner, voice, speed, int(time.time() * 1000)))
+        return {"voice": voice, "speed": speed}
 
     def put(self, owner: str, kind: str, item_id: str, updated: int, data: dict) -> dict:
         """Store an item unless the stored one is newer: {"applied": bool, "item": stored}."""
@@ -2583,7 +2605,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(404, "talk mode is not configured (--asr-url and --tts-url)")
         if not self._admin():
             return self._error(401, "unauthorized")
-        self._json(200, json.dumps(self.server.voice.info(self.server.chat_key)).encode())
+        info = self.server.voice.info(self.server.chat_key)
+        store = self.server.chat_store
+        info["prefs"] = (store.voice_prefs(self._chat_owner()) if store is not None
+                         else {"voice": None, "speed": 1.0})
+        self._json(200, json.dumps(info).encode())
+
+    def _voice_prefs_put(self):
+        """PUT /api/chat/voice-prefs {voice, speed}: how the admin's replies are spoken, kept
+        server-side so every device speaks the same. voice null is the server's default."""
+        voice = self.server.voice
+        store = self.server.chat_store
+        if voice is None or store is None:
+            return self._error(404, "talk mode or the chat store is not configured")
+        if not self._admin():
+            return self._error(401, "unauthorized")
+        body = self._read_json(1 << 10)
+        name = body.get("voice") if body else None
+        speed = body.get("speed") if body else None
+        if (not body or "voice" not in body or isinstance(speed, bool)
+                or not isinstance(speed, (int, float)) or not 0.5 <= speed <= 2.0
+                or not (name is None or (isinstance(name, str) and VOICE_NAME.fullmatch(name)))):
+            return self._error(400, "expected {voice: name or null, speed: 0.5 to 2}")
+        offered = voice.info(self.server.chat_key)["voices"]
+        if name is not None and offered and name not in offered:
+            return self._error(400, "the speech server has no such voice")
+        self._json(200, json.dumps(store.set_voice_prefs(
+            self._chat_owner(), name, float(speed))).encode())
 
     def _voice_route(self, kind: str):
         """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
@@ -2752,6 +2800,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(status, answer, "application/json")
 
     def do_PUT(self):
+        if urllib.parse.urlsplit(self.path).path == "/api/chat/voice-prefs":
+            return self._voice_prefs_put()
         if urllib.parse.urlsplit(self.path).path.startswith("/api/library/"):
             return self._library("PUT")
         if urllib.parse.urlsplit(self.path).path.startswith("/api/chat/items/"):
@@ -2809,7 +2859,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if until is None:
             if path in ("/chat", "/api/chat/models") and self._chat_user() is not None:
                 return (self._chat_page() if path == "/chat" else self._chat_models())
-            if path in ("/monitor", "/chat"):
+            if path in ("/monitor", "/chat", "/voice"):
                 return self._redirect("/")  # sign in through the profile menu
             if path.startswith("/api/"):
                 return self._json(401, b'{"error":"unauthorized"}')
@@ -2818,6 +2868,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if path == "/chat":
             return self._chat_page()
+        if path == "/voice":
+            return self._file(STATIC_DIR / "voice.html", "text/html; charset=utf-8")
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
