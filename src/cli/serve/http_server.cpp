@@ -35,6 +35,7 @@
 #include "src/cli/serve/audio_websocket.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
+#include "src/cli/serve/http_authorization.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -229,65 +230,6 @@ bool ExpectsContinue(const HttpRequest& request) {
     return ToLower(header.first) == "expect" &&
            ToLower(header.second) == "100-continue";
   });
-}
-
-/// The credential of a single `Authorization: Bearer` header, or nullopt for
-/// none, several, or another scheme.
-std::optional<std::string_view> BearerCredential(const HttpRequest& request) {
-  std::string_view credential;
-  bool found = false;
-  for (const auto& [name, value] : request.headers) {
-    if (ToLower(name) == "authorization") {
-      if (found) {
-        return std::nullopt;
-      }
-      found = true;
-      credential = value;
-    }
-  }
-  const auto space = credential.find(' ');
-  if (space == std::string_view::npos ||
-      ToLower(credential.substr(0, space)) != "bearer") {
-    return std::nullopt;
-  }
-  credential.remove_prefix(space + 1);
-  while (credential.starts_with(' ')) {
-    credential.remove_prefix(1);
-  }
-  return credential;
-}
-
-/// Routes a monitoring key may read: health, readiness, models, props, slots
-/// and metrics. None of them submits work or returns generated content.
-bool IsMonitoringRoute(const HttpRequest& request) {
-  if (request.method != "GET")
-    return false;
-  static constexpr std::array<std::string_view, 13> kPaths = {
-      "/health",   "/v1/health", "/healthz",   "/ready", "/v1/ready",
-      "/readyz",   "/models",    "/v1/models", "/props", "/slots",
-      "/v1/slots", "/metrics",   "/v1/metrics"};
-  return std::ranges::find(kPaths, request.path) != kPaths.end();
-}
-
-/// Device, inode, size and modification time of `path`; zeros when missing.
-std::array<std::int64_t, 4> FileStamp(const std::filesystem::path& path) {
-  struct stat status{};
-  if (::stat(path.c_str(), &status) != 0)
-    return {};
-  return {static_cast<std::int64_t>(status.st_dev),
-          static_cast<std::int64_t>(status.st_ino),
-          static_cast<std::int64_t>(status.st_size),
-          static_cast<std::int64_t>(status.st_mtim.tv_sec) * 1'000'000'000 +
-              status.st_mtim.tv_nsec};
-}
-
-/// Appends `key=NAME` to request log details when a named key authorized it.
-std::string WithKeyField(std::string details, const HttpRequest& request) {
-  if (request.api_key == nullptr || request.api_key->name.empty())
-    return details;
-  if (!details.empty())
-    details += ' ';
-  return details + "key=" + request.api_key->name;
 }
 
 bool HasHeader(const HttpResponse& response, std::string_view name) {
@@ -1955,26 +1897,10 @@ HttpServer::HttpServer(std::string host, int port,
       asr_(std::move(asr)),
       images_(std::move(images)),
       embeddings_(std::move(embeddings)),
-      options_(std::move(options)) {
+      options_(std::move(options)),
+      api_keys_(options_.api_key, options_.api_key_file) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
-  }
-  if (!options_.api_key.empty() && !options_.api_key_file.empty()) {
-    throw std::invalid_argument(
-        "--api-key and --api-key-file are mutually exclusive");
-  }
-  if (!options_.api_key.empty()) {
-    api_keys_ = std::make_shared<const ApiKeyTable>(
-        ApiKeyTable::FromKey(options_.api_key));
-  } else if (!options_.api_key_file.empty()) {
-    // Stamp first: a write racing this load changes the stamp, so the accept
-    // loop reads the file again.
-    api_key_file_stamp_ = FileStamp(options_.api_key_file);
-    std::string error;
-    auto table = ApiKeyTable::Load(options_.api_key_file, &error);
-    if (!table)
-      throw std::invalid_argument("--api-key-file " + error);
-    api_keys_ = std::make_shared<const ApiKeyTable>(std::move(*table));
   }
   register_routes();
 }
@@ -2118,15 +2044,15 @@ void HttpServer::run(bool handle_signals) {
           " address=http://" +
           (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
           ":" + std::to_string(port_) + " auth=" +
-          (!options_.api_key_file.empty()
-               ? "key_file keys=" + std::to_string(api_keys()->size())
+          (api_keys_.from_file()
+               ? "key_file keys=" + std::to_string(api_keys_.table()->size())
            : options_.api_key.empty() ? std::string("off")
                                       : std::string("bearer")) +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
   while (!stopped_.load(std::memory_order_acquire)) {
     (void)device_lost();
-    reload_api_key_file();
+    api_keys_.reload_if_changed();
     if (handle_signals) {
       const int signal = shutdown_signal.load(std::memory_order_relaxed);
       if (signal != 0) {
@@ -2354,40 +2280,6 @@ bool HttpServer::device_lost() {
   return true;
 }
 
-std::shared_ptr<const ApiKeyTable> HttpServer::api_keys() const {
-  const std::lock_guard lock(api_keys_mutex_);
-  return api_keys_;
-}
-
-void HttpServer::reload_api_key_file() {
-  if (options_.api_key_file.empty())
-    return;
-  // The accept loop polls every 100 ms; a key change may take a second.
-  const auto now = std::chrono::steady_clock::now();
-  if (now - api_key_file_checked_ < std::chrono::seconds(1))
-    return;
-  api_key_file_checked_ = now;
-  const auto stamp = FileStamp(options_.api_key_file);
-  if (stamp == api_key_file_stamp_)
-    return;
-  api_key_file_stamp_ = stamp;
-  std::string error;
-  auto table = ApiKeyTable::Load(options_.api_key_file, &error);
-  if (!table) {
-    // Keep serving with the previous keys; a half-written or broken file must
-    // neither lock everyone out nor open the server.
-    Logger::Error("server", "event=api_keys_reload_failed reason=" + error);
-    return;
-  }
-  const std::size_t count = table->size();
-  {
-    const std::lock_guard lock(api_keys_mutex_);
-    api_keys_ = std::make_shared<const ApiKeyTable>(std::move(*table));
-  }
-  Logger::Info("server",
-               "event=api_keys_reloaded keys=" + std::to_string(count));
-}
-
 std::string HttpServer::default_model_id() const {
   if (backend_ != nullptr && backend_->ready())
     return backend_->model_id();
@@ -2403,41 +2295,9 @@ std::string HttpServer::default_model_id() const {
 }
 
 std::optional<HttpResponse> HttpServer::authorize(HttpRequest& req) const {
-  auto table = api_keys();
-  if (table == nullptr)
-    return std::nullopt;
-  const auto credential = BearerCredential(req);
-  const ApiKey* key = credential ? table->match(*credential) : nullptr;
-  if (key == nullptr) {
-    auto response = Err(401, "Unauthorized", "missing or invalid API key",
-                        "authentication_error", "invalid_api_key");
-    response.headers.emplace_back("WWW-Authenticate", "Bearer");
-    return response;
-  }
-  // The request keeps the table alive while it holds the key.
-  req.api_key = std::shared_ptr<const ApiKey>(std::move(table), key);
-  if (!key->name.empty())
-    req.client_id = key->name;
-  if (key->access == ApiKeyAccess::kMonitor && !IsMonitoringRoute(req)) {
-    return Err(403, "Forbidden",
-               "this API key may only read health, models, props, slots and "
-               "metrics",
-               "permission_error", "permission_denied");
-  }
-  if (!key->models.empty() && !IsMonitoringRoute(req)) {
-    // Every other route reaches a model, WebSocket upgrades included. Each
-    // service serves one model, so check the model of the service the route
-    // dispatches to; a model a client names in its body or query cannot
-    // steer this check.
-    const std::string model = route_model_id(req);
-    if (!model.empty() && !key->allows_model(model)) {
-      const std::string message =
-          "this API key may not use model '" + model + "'";
-      return Err(403, "Forbidden", message.c_str(), "permission_error",
-                 "model_not_allowed");
-    }
-  }
-  return std::nullopt;
+  return AuthorizeRequest(api_keys_, req, [this](const HttpRequest& request) {
+    return route_model_id(request);
+  });
 }
 
 std::string HttpServer::route_model_id(const HttpRequest& req) const {

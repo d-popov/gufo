@@ -1,13 +1,17 @@
 #include "src/cli/serve/api_keys.hpp"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <ranges>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/core/crypto/sha256.hpp"
 
 namespace gufo::server {
@@ -62,6 +66,18 @@ std::vector<std::string_view> SplitFields(std::string_view line) {
       fields.push_back(line.substr(start, position - start));
   }
   return fields;
+}
+
+/// Device, inode, size and modification time of `path`; zeros when missing.
+std::array<std::int64_t, 4> FileStamp(const std::filesystem::path& path) {
+  struct stat status{};
+  if (::stat(path.c_str(), &status) != 0)
+    return {};
+  return {static_cast<std::int64_t>(status.st_dev),
+          static_cast<std::int64_t>(status.st_ino),
+          static_cast<std::int64_t>(status.st_size),
+          static_cast<std::int64_t>(status.st_mtim.tv_sec) * 1'000'000'000 +
+              status.st_mtim.tv_nsec};
 }
 
 }  // namespace
@@ -186,6 +202,59 @@ const ApiKey* ApiKeyTable::match(std::string_view credential) const {
       return &key;
   }
   return nullptr;
+}
+
+ApiKeyAuthority::ApiKeyAuthority(std::string_view api_key,
+                                 std::filesystem::path api_key_file)
+    : file_(std::move(api_key_file)) {
+  if (!api_key.empty() && !file_.empty()) {
+    throw std::invalid_argument(
+        "--api-key and --api-key-file are mutually exclusive");
+  }
+  if (!api_key.empty()) {
+    table_ = std::make_shared<const ApiKeyTable>(ApiKeyTable::FromKey(api_key));
+  } else if (!file_.empty()) {
+    // Stamp first: a write racing this load changes the stamp, so the accept
+    // loop reads the file again.
+    stamp_ = FileStamp(file_);
+    std::string error;
+    auto table = ApiKeyTable::Load(file_, &error);
+    if (!table)
+      throw std::invalid_argument("--api-key-file " + error);
+    table_ = std::make_shared<const ApiKeyTable>(std::move(*table));
+  }
+}
+
+std::shared_ptr<const ApiKeyTable> ApiKeyAuthority::table() const {
+  const std::lock_guard lock(mutex_);
+  return table_;
+}
+
+void ApiKeyAuthority::reload_if_changed() {
+  if (file_.empty())
+    return;
+  // The accept loop polls every 100 ms; a key change may take a second.
+  const auto now = std::chrono::steady_clock::now();
+  if (now - checked_ < std::chrono::seconds(1))
+    return;
+  checked_ = now;
+  const auto stamp = FileStamp(file_);
+  if (stamp == stamp_)
+    return;
+  stamp_ = stamp;
+  std::string error;
+  auto table = ApiKeyTable::Load(file_, &error);
+  if (!table) {
+    Logger::Error("server", "event=api_keys_reload_failed reason=" + error);
+    return;
+  }
+  const std::size_t count = table->size();
+  {
+    const std::lock_guard lock(mutex_);
+    table_ = std::make_shared<const ApiKeyTable>(std::move(*table));
+  }
+  Logger::Info("server",
+               "event=api_keys_reloaded keys=" + std::to_string(count));
 }
 
 }  // namespace gufo::server

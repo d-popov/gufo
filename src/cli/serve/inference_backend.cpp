@@ -24,6 +24,7 @@
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/continuation_identity.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/session_classes.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -2632,21 +2633,7 @@ struct InferenceBackend::Impl {
     std::string build_info;
     /// Named session classes, each served under its name; empty when one
     /// model ID serves every session.
-    std::vector<TextSessionClass> classes;
-
-    /// The session class a request's served model selects. Without classes
-    /// every request uses the one pool class; the transport has already
-    /// refused other model names.
-    [[nodiscard]] std::size_t SessionClass(std::string_view model) const {
-      if (classes.empty() || model.empty())
-        return 0;
-      const auto found =
-          std::ranges::find(classes, model, &TextSessionClass::name);
-      if (found == classes.end())
-        throw std::invalid_argument("model '" + std::string(model) +
-                                    "' is not served by this process");
-      return static_cast<std::size_t>(found - classes.begin());
-    }
+    SessionClassSet classes;
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -2789,12 +2776,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     // The model and its shared scratch are sized for the largest class.
-    max_context = 0;
-    session_count = 0;
-    for (const auto& session_class : session_classes) {
-      max_context = std::max(max_context, session_class.max_context);
-      session_count += session_class.count;
-    }
+    const auto totals = SessionClassSet(session_classes).totals();
+    max_context = totals.max_context;
+    session_count = totals.sessions;
   }
   if (max_context == 0) {
     const std::uint64_t native =
@@ -3261,17 +3245,15 @@ bool InferenceBackend::load(
   if (!session_classes.empty()) {
     // The runner and its pool reach the largest class; each class's
     // sessions are created at its own context.
-    max_context = 0;
-    session_count = 0;
-    for (const auto& session_class : session_classes) {
-      if (session_class.max_context == 0) {
-        SetError(error, "session class '" + session_class.name +
-                            "' needs a nonzero context");
-        return false;
-      }
-      max_context = std::max(max_context, session_class.max_context);
-      session_count += session_class.count;
+    const SessionClassSet classes(session_classes);
+    if (const auto unsized = classes.missing_context(); !unsized.empty()) {
+      SetError(error,
+               "session class '" + unsized + "' needs a nonzero context");
+      return false;
     }
+    const auto totals = classes.totals();
+    max_context = totals.max_context;
+    session_count = totals.sessions;
   }
   if (max_context == 0)
     max_context = model->MaxContext();
@@ -3323,21 +3305,18 @@ bool InferenceBackend::load(
           speculative_config.backend == TextSpeculativeBackend::kMtp
               ? core::SessionMode::kSpeculative
               : core::SessionMode::kAutoregressive;
-      std::ostringstream line;
-      std::size_t context_tokens = 0, state_bytes = 0;
-      line << "event=session_classes classes=";
-      for (std::size_t i = 0; i < session_classes.size(); ++i) {
-        const auto& c = session_classes[i];
-        line << (i ? "," : "") << c.name << ':' << c.count << 'x'
-             << c.max_context;
-        context_tokens += c.count * c.max_context;
+      const SessionClassSet classes(session_classes);
+      const auto totals = classes.totals();
+      std::size_t state_bytes = 0;
+      for (const auto& c : session_classes)
         state_bytes += c.count * model->SessionBytes(mode, c.max_context);
-      }
-      line << " sessions=" << session_count
-           << " context_tokens=" << context_tokens
-           << " session_state_bytes=" << state_bytes
-           << " model_context=" << max_context;
-      Logger::Info("loader", line.str());
+      Logger::Info(
+          "loader",
+          "event=session_classes classes=" + classes.describe() +
+              " sessions=" + std::to_string(totals.sessions) +
+              " context_tokens=" + std::to_string(totals.context_tokens) +
+              " session_state_bytes=" + std::to_string(state_bytes) +
+              " model_context=" + std::to_string(max_context));
     }
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
@@ -3367,7 +3346,7 @@ bool InferenceBackend::load(
             : std::make_shared<TextRunnerPool>(
                   std::move(runner), session_classes,
                   std::move(runner_disk_cache), ram_cache_config);
-    new_state->classes = std::move(session_classes);
+    new_state->classes = SessionClassSet(std::move(session_classes));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3446,11 +3425,7 @@ std::vector<InferenceBackend::ServedModel> InferenceBackend::served_models()
   const auto state = impl_->Snapshot();
   if (state == nullptr || state->classes.empty())
     return TextGenerationBackend::served_models();
-  std::vector<ServedModel> models;
-  models.reserve(state->classes.size());
-  for (const auto& session_class : state->classes)
-    models.push_back({session_class.name, session_class.max_context});
-  return models;
+  return state->classes.served_models();
 #else
   return TextGenerationBackend::served_models();
 #endif
@@ -3602,7 +3577,7 @@ InferenceBackend::Result InferenceBackend::complete(
   if (state == nullptr) {
     return {};
   }
-  const auto session_class = state->SessionClass(model);
+  const auto session_class = state->classes.resolve(model);
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   return impl_->GenerateScheduled(
       state, std::move(prompt_tokens), request_start, max_tokens,
@@ -3634,7 +3609,7 @@ InferenceBackend::Result InferenceBackend::chat(
   if (state == nullptr) {
     return {};
   }
-  const auto session_class = state->SessionClass(request.model);
+  const auto session_class = state->classes.resolve(request.model);
   auto effective_sampling = sampling_config;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling);
@@ -3683,7 +3658,7 @@ InferenceBackend::start_complete(
         ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
         model, cache_persist);
   }
-  const auto session_class = state->SessionClass(model);
+  const auto session_class = state->classes.resolve(model);
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt_tokens), max_tokens, sampling_config, is_cancelled,
@@ -3724,7 +3699,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
-  const auto session_class = state->SessionClass(request.model);
+  const auto session_class = state->classes.resolve(request.model);
   auto effective_sampling = sampling_config;
   std::optional<sampling::JsonConstraint::ToolFormat> tool_format;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),

@@ -1,8 +1,12 @@
 #ifndef GUFO_SERVER_API_KEYS_HPP_
 #define GUFO_SERVER_API_KEYS_HPP_
 
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -58,6 +62,33 @@ public:
 
 private:
   std::vector<ApiKey> keys_;
+};
+
+/// The credentials a running server accepts: either the single `--api-key` or
+/// the table of an `--api-key-file`, which `reload_if_changed` re-reads while
+/// serving. Thread-safe; `table()` hands out immutable snapshots.
+class ApiKeyAuthority {
+public:
+  /// At most one of `api_key` and `api_key_file` may be set. Throws
+  /// std::invalid_argument when both are, or when the file does not load.
+  ApiKeyAuthority(std::string_view api_key, std::filesystem::path api_key_file);
+
+  /// Null when authentication is off.
+  [[nodiscard]] std::shared_ptr<const ApiKeyTable> table() const;
+  [[nodiscard]] bool from_file() const noexcept { return !file_.empty(); }
+
+  /// Replaces the table when the file changed, at most once a second. A file
+  /// that no longer parses is logged and the previous keys keep serving, so a
+  /// half-written file neither locks everyone out nor opens the server.
+  void reload_if_changed();
+
+private:
+  std::filesystem::path file_;
+  mutable std::mutex mutex_;
+  std::shared_ptr<const ApiKeyTable> table_;
+  /// Device, inode, size and modification time of the last loaded file.
+  std::array<std::int64_t, 4> stamp_{};
+  std::chrono::steady_clock::time_point checked_{};
 };
 
 }  // namespace gufo::server

@@ -156,8 +156,6 @@ private:
   /// Authenticates `req` and applies its key's access and model limits,
   /// recording the key on the request. Returns the refusal, if any.
   std::optional<HttpResponse> authorize(HttpRequest& req) const;
-  [[nodiscard]] std::shared_ptr<const ApiKeyTable> api_keys() const;
-  void reload_api_key_file();
   [[nodiscard]] std::string default_model_id() const;
   /// The served model of the service `req`'s route dispatches to, or "" when
   /// that service is not configured.
@@ -176,12 +174,7 @@ private:
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
   HttpServerOptions options_;
-  mutable std::mutex api_keys_mutex_;
-  /// Null when authentication is off.
-  std::shared_ptr<const ApiKeyTable> api_keys_;
-  /// Device, inode, size and modification time of the last loaded key file.
-  std::array<std::int64_t, 4> api_key_file_stamp_{};
-  std::chrono::steady_clock::time_point api_key_file_checked_{};
+  ApiKeyAuthority api_keys_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> device_lost_reported_{false};

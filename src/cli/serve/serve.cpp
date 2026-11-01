@@ -35,6 +35,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/session_classes.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
 
@@ -294,46 +295,6 @@ bool SplitNameValue(std::string_view spec, std::string_view flag,
   }
   *name = std::string(spec.substr(0, separator));
   *value = std::string(spec.substr(separator + 1));
-  return true;
-}
-
-// `--session-class NAME=COUNTxCONTEXT`: COUNT sessions of CONTEXT tokens,
-// served under model NAME. Names are unique across the invocation.
-bool AddSessionClass(std::string_view spec,
-                     std::vector<server::TextSessionClass>* classes,
-                     std::string* error) {
-  const auto invalid = [&] {
-    *error =
-        "--session-class expects NAME=COUNTxCONTEXT with COUNT and "
-        "CONTEXT at least 1, e.g. main=1x262144; got '" +
-        std::string(spec) + "'";
-    return false;
-  };
-  std::string name;
-  std::string shape;
-  if (!SplitNameValue(spec, "--session-class", &name, &shape, error))
-    return invalid();
-  const auto separator = shape.find('x');
-  if (separator == std::string::npos)
-    return invalid();
-  std::size_t count = 0;
-  std::uint32_t context = 0;
-  const auto* count_end = shape.data() + separator;
-  const auto* context_end = shape.data() + shape.size();
-  const auto parsed_count = std::from_chars(shape.data(), count_end, count);
-  const auto parsed_context =
-      std::from_chars(count_end + 1, context_end, context);
-  if (parsed_count.ec != std::errc{} || parsed_count.ptr != count_end ||
-      parsed_context.ec != std::errc{} || parsed_context.ptr != context_end ||
-      count == 0 || context == 0)
-    return invalid();
-  if (std::ranges::any_of(*classes,
-                          [&](const auto& c) { return c.name == name; })) {
-    *error = "--session-class name '" + name + "' is given twice";
-    return false;
-  }
-  classes->push_back(
-      {.name = std::move(name), .count = count, .max_context = context});
   return true;
 }
 
@@ -1352,7 +1313,7 @@ int RunServe(std::span<const char* const> args) {
         "Model",
         [&session_classes](std::string_view, std::string_view value,
                            std::string* err) {
-          return AddSessionClass(value, &session_classes, err);
+          return server::SessionClassSet::Add(value, &session_classes, err);
         });
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
@@ -1697,19 +1658,12 @@ int RunServe(std::span<const char* const> args) {
           (cache_disk_directory.empty() ? "off" : "enabled") + served_names);
     } else {
       // Each class by name, and the sessions and context all of them hold.
-      std::string classes;
-      std::size_t sessions = 0;
-      std::size_t context_tokens = 0;
-      for (const auto& c : session_classes) {
-        classes += (classes.empty() ? "" : ",") + c.name + ':' +
-                   std::to_string(c.count) + 'x' +
-                   std::to_string(c.max_context);
-        sessions += c.count;
-        context_tokens += c.count * c.max_context;
-      }
+      const server::SessionClassSet classes(session_classes);
+      const auto totals = classes.totals();
       load_log.Complete(
-          "classes=" + classes + " sessions=" + std::to_string(sessions) +
-          " context_tokens=" + std::to_string(context_tokens) +
+          "classes=" + classes.describe() +
+          " sessions=" + std::to_string(totals.sessions) +
+          " context_tokens=" + std::to_string(totals.context_tokens) +
           " speculative=" + speculation + " draft_limit=" +
           std::to_string(speculative_config.max_draft_tokens) +
           " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));

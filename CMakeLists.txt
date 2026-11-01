@@ -401,6 +401,7 @@ add_library(gufo_serving STATIC
   src/cli/serve/continuation_disk_store.cpp
   src/cli/serve/component_text_cache.cpp
   src/cli/serve/text_model_runner.cpp
+  src/cli/serve/session_classes.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/continuation_identity.cpp
   src/cli/serve/inference_backend.cpp)
@@ -437,6 +438,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
   src/cli/serve/api_keys.cpp
+  src/cli/serve/http_authorization.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
