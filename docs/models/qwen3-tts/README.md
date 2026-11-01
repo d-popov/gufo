@@ -46,6 +46,12 @@ Repeated Base requests reuse the same reference's encoder features and exact
 waveform-decoder state. One reference prefix is retained per runtime; changing
 voices replaces it. This preserves generated audio and reduces warm latency.
 
+## Training a voice
+
+`tools/audio/tts_finetune/` fine-tunes the Base model to one speaker with a stoppable, resumable run and a
+progress viewer ([README](../../../tools/audio/tts_finetune/README.md)). The result loads here as a `CustomVoice`
+voice. Nothing about a new language is validated: see the notes there.
+
 ## Sampling and streaming
 
 Default sampling follows the checkpoint: top-k 50, top-p 1, temperature 0.9
