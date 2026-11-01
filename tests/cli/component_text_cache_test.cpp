@@ -1962,19 +1962,20 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
 // capacity its sessions were created with; executions past it fail, as a
 // native session past its context does. Events record each work unit by the
 // first token of the request's prompt.
-class ClassRunner final : public Runner {
+class ClassRunner : public Runner {
 public:
   struct Event {
     bool advance;
     TextRunnerToken label;
   };
   std::unique_ptr<cache::Adapter> CreateSessionClassAdapter(
-      std::uint32_t max_context) const override {
+      std::uint32_t max_context, cache::ResourceLedger&) const override {
     auto adapter = std::make_unique<FakeAdapter>();
     const std::lock_guard lock(mutex);
     capacities[adapter.get()] = max_context;
     return adapter;
   }
+
   TextPrefillStep Prefill(TextRunnerState& state,
                           std::span<const TextRunnerToken> prompt,
                           std::size_t offset,
@@ -2086,6 +2087,49 @@ void SessionClassesNeverShareCachedState() {
     refused = true;
   }
   assert(refused);
+}
+// A runner that outlives its pool serves the next one: the new cache counts
+// the pinned bytes of its own class adapters, not those of the first.
+void SessionClassAccountingBelongsToTheCache() {
+  // Each class adapter's slots pin this many bytes, so a cache's count shows
+  // in its configuration line once it commits backing.
+  constexpr std::size_t kPinnedPerAdapter = 1 << 20;
+  class PinningRunner final : public ClassRunner {
+  public:
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->commit_backing = [](std::size_t) {};
+      return resources;
+    }
+    std::size_t PinnedCaptureBytes(const cache::Adapter&) const override {
+      return 1 << 20;
+    }
+  };
+  const auto previous_level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  auto runner = std::make_shared<PinningRunner>();
+  const std::vector<TextSessionClass> classes{
+      {.name = "large", .count = 1, .max_context = 4096},
+      {.name = "small", .count = 1, .max_context = 64}};
+  std::vector<std::string> configured;
+  for (int pool = 0; pool < 2; ++pool) {
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+    {
+      TextRunnerPool built(runner, classes);
+    }
+    std::clog.rdbuf(previous_sink);
+    const auto log = output.str();
+    const auto at = log.find("slot_pinned_bytes=");
+    assert(at != std::string::npos);
+    configured.push_back(log.substr(at, log.find(' ', at) - at));
+  }
+  Logger::SetLevel(previous_level);
+  const auto expected =
+      "slot_pinned_bytes=" + std::to_string(2 * kPinnedPerAdapter);
+  assert(configured[0] == expected);
+  assert(configured[1] == expected);
 }
 void SessionClassesNeedNamesAndFittingContexts() {
   const auto refuses = [](std::vector<TextSessionClass> classes) {
@@ -2424,6 +2468,7 @@ int main() {
   OverRamCaptureStagesPrivateStateUnderPressure(false);
   OverRamCaptureStagesPrivateStateUnderPressure(true);
   SessionClassesNeverShareCachedState();
+  SessionClassAccountingBelongsToTheCache();
   SessionClassesNeedNamesAndFittingContexts();
   SchedulerAdmitsOnlyIntoTheRequestClass();
   SchedulerQueueLimitsApplyPerClass();

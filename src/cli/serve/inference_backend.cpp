@@ -721,7 +721,6 @@ public:
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
     (void)ram;
-    ledger_ = &ledger;
     auto resources = hip::CreateHipComponentCacheResources(
         std::make_unique<models::qwen::ContinuationAdapter>(
             model_, max_context_, component_identity_, execution_policy_,
@@ -732,26 +731,23 @@ public:
     resources->reassignment_batch_size = 16;
     const auto& adapter =
         static_cast<models::qwen::ContinuationAdapter&>(*resources->adapter);
-    // With session classes the slots belong to the class adapters.
-    resources->pinned_bytes = [this, qwen = &adapter] {
-      std::size_t pinned = qwen->PinnedCaptureBytes();
-      const std::lock_guard lock(class_adapters_mutex_);
-      for (const auto* klass : class_adapters_)
-        pinned += klass->PinnedCaptureBytes();
-      return pinned;
+    resources->pinned_bytes = [qwen = &adapter] {
+      return qwen->PinnedCaptureBytes();
     };
     return resources;
   }
   // A session class keeps its sessions, and the identity of its cached
   // state, at its own context.
   [[nodiscard]] std::unique_ptr<cache::Adapter> CreateSessionClassAdapter(
-      std::uint32_t max_context) const override {
-    auto adapter = std::make_unique<models::qwen::ContinuationAdapter>(
+      std::uint32_t max_context, cache::ResourceLedger& ledger) const override {
+    return std::make_unique<models::qwen::ContinuationAdapter>(
         model_, max_context, ComponentIdentity(max_context), execution_policy_,
-        dflash_model_, DraftConfig(max_context), ledger_);
-    const std::lock_guard lock(class_adapters_mutex_);
-    class_adapters_.push_back(adapter.get());
-    return adapter;
+        dflash_model_, DraftConfig(max_context), &ledger);
+  }
+  [[nodiscard]] std::size_t PinnedCaptureBytes(
+      const cache::Adapter& adapter) const override {
+    return dynamic_cast<const models::qwen::ContinuationAdapter&>(adapter)
+        .PinnedCaptureBytes();
   }
   [[nodiscard]] std::optional<std::size_t> SessionStateBytes(
       std::uint32_t max_context) const override {
@@ -1201,10 +1197,6 @@ private:
   std::string draft_artifact_fingerprint_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
-  // The cache's ledger, and the adapters it made for session classes.
-  mutable cache::ResourceLedger* ledger_{nullptr};
-  mutable std::mutex class_adapters_mutex_;
-  mutable std::vector<const models::qwen::ContinuationAdapter*> class_adapters_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
@@ -2159,7 +2151,7 @@ public:
   // A session class keeps its sessions, and the identity of its cached
   // state, at its own context.
   [[nodiscard]] std::unique_ptr<cache::Adapter> CreateSessionClassAdapter(
-      std::uint32_t max_context) const override {
+      std::uint32_t max_context, cache::ResourceLedger&) const override {
     return std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
         model_, SessionMode(), max_context, ComponentIdentity(max_context));
   }

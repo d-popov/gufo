@@ -414,8 +414,18 @@ public:
   /// Continuation adapter whose slots hold sessions of max_context tokens,
   /// for one session class of a component-cache runner. Its components must
   /// match CreateComponentCacheResources' adapter, up to smaller payloads.
+  /// `ledger` is the cache's, which the adapter charges for what its slots
+  /// pin; it outlives the adapter.
   [[nodiscard]] virtual std::unique_ptr<cache::Adapter>
-  CreateSessionClassAdapter(std::uint32_t max_context) const;
+  CreateSessionClassAdapter(std::uint32_t max_context,
+                            cache::ResourceLedger& ledger) const;
+  /// Host bytes the slots of a class adapter this runner made pinned and
+  /// charged to the ledger. Zero when the runner pins nothing.
+  [[nodiscard]] virtual std::size_t PinnedCaptureBytes(
+      const cache::Adapter& adapter) const {
+    (void)adapter;
+    return 0;
+  }
   /// Per-request state claim for one session of max_context tokens. Defaults
   /// to ResourceClaim's claim, which is made for Descriptor().max_context.
   [[nodiscard]] virtual std::optional<std::size_t> SessionStateBytes(

@@ -573,7 +573,7 @@ std::unique_ptr<TextRunnerState> TextModelRunner::BindComponentState(
   throw std::logic_error("text runner has no component execution facade");
 }
 std::unique_ptr<cache::Adapter> TextModelRunner::CreateSessionClassAdapter(
-    std::uint32_t) const {
+    std::uint32_t, cache::ResourceLedger&) const {
   throw std::invalid_argument("text runner does not support session classes");
 }
 void TextModelRunner::ReconcileComponentState(TextRunnerState&,

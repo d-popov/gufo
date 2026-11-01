@@ -256,8 +256,8 @@ struct ComponentTextCache::Impl {
       klass.name = session_class.name;
       klass.max_context = session_class.max_context;
       if (named) {
-        klass.owned =
-            this->runner->CreateSessionClassAdapter(session_class.max_context);
+        klass.owned = this->runner->CreateSessionClassAdapter(
+            session_class.max_context, ledger);
         if (!klass.owned)
           throw std::logic_error("text runner returned no class adapter");
         RequireSharedBacking(*klass.owned);
@@ -324,6 +324,16 @@ struct ComponentTextCache::Impl {
         entries.push_back(std::move(entry));
       }
     }
+    // What the slots pinned: the runner's count for each class adapter, else
+    // the provider's for the one adapter.
+    const auto pinned_by_slots = [&]() -> std::size_t {
+      if (!named)
+        return resources->pinned_bytes ? resources->pinned_bytes() : 0;
+      std::size_t pinned = 0;
+      for (const auto& klass : classes)
+        pinned += this->runner->PinnedCaptureBytes(*klass.adapter);
+      return pinned;
+    };
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
     if (!ram_enabled) {
       // Only disk captures copy through backing, so without a disk cache no
@@ -331,8 +341,7 @@ struct ComponentTextCache::Impl {
       // backing, and request metadata.
       ram = options ? kDiskOnlyBackingBytes : 0;
       disk_backing = ram;
-      slot_pinned_bytes =
-          resources->pinned_bytes ? resources->pinned_bytes() : 0;
+      slot_pinned_bytes = pinned_by_slots();
       const auto staging = ledger.Limits().staging_bytes;
       const auto limit =
           std::min(ledger.Limits().ram_bytes,
@@ -357,8 +366,7 @@ struct ComponentTextCache::Impl {
       // pinned are missing from it. Add them back: in full to the ceiling,
       // and half to the automatic budget, which is half the available RAM.
       // The ledger charges them on top of the cache's own budget.
-      const auto pinned =
-          resources->pinned_bytes ? resources->pinned_bytes() : 0;
+      const auto pinned = pinned_by_slots();
       const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
       const auto automatic = measured + pinned / 2;
       const auto ceiling =
