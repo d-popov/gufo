@@ -47,7 +47,9 @@ window.GufoHeader = (() => {
     suspended: 'Suspended',
   };
 
-  // { pageUser, onAuth(tab), onSignOut(), onAdminTab(name), onSession(session, previous) }
+  // { pageUser, onAuth(tab), onSignOut(), onAdminTab(name), onSession(session, previous) };
+  // onAdminTab scrolls to an admin section; a page that has none leaves it out and the menu
+  // opens /monitor#name instead.
   let options = {};
   let session = { admin: false };
   let loaded = false;
@@ -233,7 +235,9 @@ window.GufoHeader = (() => {
     for (const name of ['accounts', 'keys', 'pricing', 'usage', 'deposits']) {
       $(`menu-admin-${name}`).addEventListener('click', () => {
         openMenu(false);
-        options.onAdminTab?.(name);
+        // A page without the admin sections sends you to the monitor, which has them all.
+        if (options.onAdminTab) options.onAdminTab(name);
+        else window.location.href = `/monitor#${name}`;
       });
     }
     $('menu-voice').addEventListener('click', () => { window.location.href = '/voice'; });

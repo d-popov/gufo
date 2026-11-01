@@ -509,6 +509,17 @@ function onSession(session) {
   else if (expired) window.location.reload();
 }
 
+// /monitor#keys (the profile menu's link from a page without admin sections) scrolls to that section
+// once it has loaded and shown itself.
+function showRequestedSection(tries = 0) {
+  const name = window.location.hash.slice(1);
+  if (!['accounts', 'keys', 'pricing', 'usage', 'deposits'].includes(name)) return;
+  const id = { accounts: 'accounts-section', keys: 'admin-keys-section', pricing: 'admin-pricing-section',
+    usage: 'admin-usage-section', deposits: 'admin-deposits-section' }[name];
+  if ($(id).hidden && tries < 20) { setTimeout(() => showRequestedSection(tries + 1), 300); return; }
+  showAdminSection(name);
+}
+
 function showAdminSection(name) {
   const section = $({ accounts: 'accounts-section', keys: 'admin-keys-section',
     pricing: 'admin-pricing-section', usage: 'admin-usage-section',
@@ -527,7 +538,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.GufoAdmin.init({ state: () => state, onChange: () => window.GufoHeader.refresh().catch(() => {}) });
   // Keys need the state's model list for their choices.
   loadState().then((ok) => ok && connect()).catch(() => connect())
-    .finally(() => window.GufoAdmin.load().catch(() => {}));
+    .finally(() => window.GufoAdmin.load().catch(() => {}).finally(() => showRequestedSection()));
   // The long-window tile changes slowly: once a minute, not with every poll.
   loadLongStats().catch(() => {});
   setInterval(() => loadLongStats().catch(() => {}), LONG_REFRESH_MS);
