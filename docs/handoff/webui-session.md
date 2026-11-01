@@ -2,7 +2,7 @@
 
 Code: `tools/monitor/` (`gufo-monitor.py`, stdlib-only Python 3.10+, and `static/*`), README in the same folder.
 Tests: `tests/tools/monitor_test.py` (run `cd tests/tools && python3 -m unittest monitor_test`, 71 tests) and Node
-tests `node tests/tools/{projects,markdown,chatstore,chatsync,tools,webtools,pybox,monitor_auth,monitor_icons}_test.js`.
+tests `node tests/tools/{projects,markdown,talk,chatstore,chatsync,tools,webtools,pybox,monitor_auth,monitor_icons}_test.js`.
 Live: `~/.local/bin/gufo-monitor` -> `gufo-monitor.service` (user unit, port 8099, public as `ai-ui.d-popov.com`).
 Admin token `~/.config/gufo-monitor/admin-token`; billing config `~/.config/gufo-monitor/billing.json`.
 Launcher flags added: `--chat-key-file` (owner key), `--chat-model qwen3.8-flash-next-sub`; new `--chat-store`

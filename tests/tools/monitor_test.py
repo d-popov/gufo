@@ -346,9 +346,9 @@ class MonitorHttpTest(unittest.TestCase):
             self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
             self.assertIn("img-src 'self' data:;", other.getheader("Content-Security-Policy"), path)
             self.assertNotIn("media-src", other.getheader("Content-Security-Policy"), path)
-        scripts = [name for name in ("icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "chat")
+        scripts = [name for name in ("icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "talk", "chat")
                    if f'src="/static/{name}.js"'.encode() in data]
-        self.assertEqual(scripts, ["icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "chat"])
+        self.assertEqual(scripts, ["icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "talk", "chat"])
         self.assertEqual([data.index(f'src="/static/{n}.js"'.encode()) for n in scripts],
                          sorted(data.index(f'src="/static/{n}.js"'.encode()) for n in scripts),
                          "tools.js and chat.js need the scripts they build on loaded first")
@@ -481,7 +481,8 @@ class MonitorHttpTest(unittest.TestCase):
             response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(json.loads(data), {"models": ["fn", "fn-sub"], "pricing": None,
                                             "billed": False, "python": False, "default": None,
-                                            "owner": "admin", "sync": False, "library": False})
+                                            "owner": "admin", "sync": False, "library": False,
+                                            "talk": False})
 
     def test_chat_default_model_is_offered_only_when_served(self):
         try:
@@ -496,7 +497,7 @@ class MonitorHttpTest(unittest.TestCase):
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
                      "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
-                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js",
+                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js", "talk.js",
                      "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
@@ -638,6 +639,128 @@ class AdminChatKeyTest(unittest.TestCase):
     def test_chat_key_file_option(self):
         self.assertEqual(gm.parse_args(["--chat-key-file", "/tmp/k"]).chat_key_file, Path("/tmp/k"))
         self.assertIsNone(gm.parse_args([]).chat_key_file)
+
+
+class FakeSpeech(http.server.BaseHTTPRequestHandler):
+    """Stands in for `gufo serve asr` and `gufo serve tts`: it records what it was sent."""
+
+    seen: list = []
+    refuse = False
+
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, status, body, content_type):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._reply(200, b'{"data":[{"id":"fake-speech"}]}', "application/json")
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        FakeSpeech.seen.append((self.path, self.headers.get("Authorization"),
+                                self.headers.get("Content-Type"), body))
+        if FakeSpeech.refuse:
+            return self._reply(403, b'{"error":{"message":"model not allowed"}}', "application/json")
+        if self.path == "/v1/audio/transcriptions":
+            return self._reply(200, b'{"text":"hello world"}', "application/json")
+        self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
+
+
+class TalkModeTest(unittest.TestCase):
+    """The chat's talk mode: the admin's utterances and replies go to Gufo's speech servers
+    with the chat key, and to nobody else."""
+
+    WAV = b"RIFF" + bytes(60)
+
+    def setUp(self):
+        FakeSpeech.seen = []
+        FakeSpeech.refuse = False
+        self.speech = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeech))
+        self.addCleanup(lambda: (self.speech.shutdown(), self.speech.server_close()))
+        self.url = f"http://127.0.0.1:{self.speech.server_address[1]}"
+
+    def serve(self, voice):
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", "monitor-key"), NoTelemetry())
+        server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False,
+                                 chat_key="chat-key", voice=voice))
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        return server.server_address[1]
+
+    def call(self, port, path, body, content_type, admin=True):
+        headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
+        if admin:
+            headers["X-Admin-Token"] = ADMIN_TOKEN
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request("POST", path, body, headers)
+        response = connection.getresponse()
+        data, kind = response.read(), response.getheader("Content-Type")
+        connection.close()
+        return response.status, data, kind
+
+    def test_without_speech_servers_the_routes_and_the_button_are_off(self):
+        port = self.serve(None)
+        self.assertEqual(self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")[0], 404)
+        self.assertEqual(self.call(port, "/api/chat/speak", b'{"text":"hi"}', "application/json")[0], 404)
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request("GET", "/api/chat/models", headers={"X-Admin-Token": ADMIN_TOKEN})
+        self.assertFalse(json.loads(connection.getresponse().read())["talk"])
+
+    def test_an_utterance_reaches_speech_recognition_as_a_multipart_upload(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url))
+        status, data, _ = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
+        self.assertEqual((status, json.loads(data)), (200, {"text": "hello world"}))
+        path, authorization, content_type, body = FakeSpeech.seen[-1]
+        self.assertEqual((path, authorization), ("/v1/audio/transcriptions", "Bearer chat-key"))
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
+        self.assertIn(b'name="model"\r\n\r\nfake-speech', body)
+        self.assertIn(b'name="response_format"\r\n\r\njson', body)
+        self.assertIn(b'filename="utterance.wav"\r\nContent-Type: audio/wav\r\n\r\n' + self.WAV, body)
+
+    def test_only_the_admin_sends_audio_and_only_wav_of_a_sane_size(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url))
+        self.assertEqual(self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav", admin=False)[0], 401)
+        self.assertEqual(self.call(port, "/api/chat/speak", b'{"text":"hi"}', "application/json", admin=False)[0], 401)
+        self.assertEqual(self.call(port, "/api/chat/transcribe", self.WAV, "application/json")[0], 415)
+        self.assertEqual(self.call(port, "/api/chat/transcribe", b"RIFF", "audio/wav")[0], 400)
+        with mock.patch.object(gm.VoiceServices, "UTTERANCE_MAX", 1000):
+            self.assertEqual(self.call(port, "/api/chat/transcribe", bytes(1001), "audio/wav")[0], 400)
+            self.assertEqual(self.call(port, "/api/chat/transcribe", bytes(1000), "audio/wav")[0], 200)
+        self.assertEqual(len(FakeSpeech.seen), 1)  # only the accepted upload was relayed
+
+    def test_a_reply_is_spoken_in_the_chosen_voice_and_comes_back_as_wav(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="narrator"))
+        status, data, kind = self.call(port, "/api/chat/speak", json.dumps({"text": "Hi there."}).encode(),
+                                       "application/json")
+        self.assertEqual((status, kind), (200, "audio/wav"))
+        self.assertTrue(data.startswith(b"RIFF"))
+        path, authorization, _, body = FakeSpeech.seen[-1]
+        self.assertEqual((path, authorization), ("/v1/audio/speech", "Bearer chat-key"))
+        self.assertEqual(json.loads(body), {"input": "Hi there.", "response_format": "wav",
+                                            "model": "fake-speech", "voice": "narrator"})
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"other"}', "application/json")
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "other")
+        for bad in (b'{"text":""}', b'{"text":5}', b'{"text":"x","voice":3}', b"{}",
+                    json.dumps({"text": "x" * (gm.VoiceServices.TEXT_MAX + 1)}).encode()):
+            self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:30])
+
+    def test_a_refusal_keeps_its_status_and_an_absent_server_is_a_bad_gateway(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url))
+        FakeSpeech.refuse = True
+        status, data, kind = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
+        self.assertEqual((status, kind), (403, "application/json"))
+        self.assertEqual(json.loads(data)["error"]["message"], "model not allowed")
+        down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
+        self.assertEqual(self.call(down, "/api/chat/transcribe", self.WAV, "audio/wav")[0], 502)
+
+    def test_the_options_come_as_a_pair(self):
+        args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2", "--tts-voice", "ryan"])
+        self.assertEqual((args.asr_url, args.tts_url, args.tts_voice), ("http://a:1", "http://t:2", "ryan"))
+        self.assertIsNone(gm.parse_args([]).asr_url)
 
 
 class ChatStoreTest(unittest.TestCase):

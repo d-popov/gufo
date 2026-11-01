@@ -63,6 +63,20 @@ code blocks, links, bullet and numbered lists (nested), quotes, rules and tables
 and `mailto` links are made; an image becomes a link, since the page loads no pictures a model names;
 raw HTML shows as text. Your own messages and errors stay as typed (`static/markdown.js`).
 
+**Talk mode.** With Gufo's speech servers running, the admin's chat gets a **Talk** button: it listens through the
+microphone, ends an utterance at a pause, sends it to speech recognition, sends the text as a chat message
+(thinking off, and the model is told its reply is read aloud) and speaks the reply sentence by sentence as it is
+written, then listens again. Tap Talk while it thinks or speaks to interrupt; tap it while it listens to stop.
+The microphone is ignored while a reply is thought out and spoken, so use it half-duplex; headphones are not needed.
+Run `gufo serve asr` and `gufo serve tts` (`~/.local/bin/gufo-speech` starts both in one container, on ports 1235
+and 1236, with the text server's key file) and start the monitor with
+`--asr-url http://127.0.0.1:1235 --tts-url http://127.0.0.1:1236 [--tts-voice ryan]`; the key is the admin's
+`--chat-key-file`. Only Qwen3-ASR 1.7B and Qwen3-TTS 12Hz 1.7B (BF16 safetensors) work: Gufo does not load the audio
+GGUFs of other tools. TTS speaks Chinese, English, German, Italian, Portuguese, Spanish, Japanese, Korean, French and
+Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them. The page
+needs a secure context for the microphone (`localhost` or https). Routes: `POST /api/chat/transcribe` (a WAV body)
+and `POST /api/chat/speak` (`{text, voice?}` answers a WAV). `static/talk.js` holds the logic.
+
 **Projects.** The first box in the toolbar picks a project: a folder of chats that share two
 plain Markdown notes, both editable in the **Project** panel.
 
@@ -189,6 +203,8 @@ Scripts send the admin token as `X-Admin-Token: <token>` or
 |---|---|---|
 | `--gufo URL` | `http://127.0.0.1:8080` | Gufo base URL |
 | `--gufo-key-file FILE` | none | file holding the server's `--api-key`; read and used only by the monitor |
+| `--asr-url URL`, `--tts-url URL` | off | `gufo serve asr` and `gufo serve tts` servers; both turn on the chat's talk mode (the admin's) |
+| `--tts-voice NAME` | the server's default | the voice talk mode speaks with (a CustomVoice speaker such as `ryan`, or a registered clone) |
 | `--chat-key-file FILE` | the monitor's key | file holding an inference key for the admin's chat; keeps `--gufo-key-file` read-only |
 | `--chat-model NAME` | the first served model | the model the chat page selects until a user picks another; the page then remembers that choice in the browser |
 | `--chat-store FILE` | `~/.config/gufo-monitor/chats.sqlite` | where every account's chats and projects are kept, so they follow the account between devices |
@@ -748,4 +764,5 @@ python3 tests/tools/billing_chain_test.py
 python3 tests/tools/library_test.py
 node tests/tools/librarytools_test.js
 node tests/tools/markdown_test.js
+node tests/tools/talk_test.js
 ```

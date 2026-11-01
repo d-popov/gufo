@@ -42,6 +42,8 @@ let controller = null;  // aborts the reply being made, and the page fetches it 
 const toolkit = (() => { try { return window.GufoTools.create(); } catch { return null; } })();
 let allowedTools = loadAllowedTools();  // what the user ticked in the Tools menu, kept between visits
 let pythonInstalled = false;            // set by loadModels: is the Python runtime on the monitor?
+let talk = null;                      // the spoken conversation (talk.js), once the Talk button is first used
+let talkAvailable = false;            // set by loadModels: has the monitor speech servers, and is this the admin?
 let libraryAvailable = false;           // set by loadModels: does this account have a library (the admin, on a monitor that keeps one)?
 
 // ---------------------------------------------------------------- history (this browser, kept in step with the monitor)
@@ -1006,7 +1008,8 @@ async function send() {
   chat.messages.push({ role: 'user', content: text, images: pendingImages, hadImages: pendingImages.length > 0 });
   // Earlier tool steps stay in the thread but not in what is sent: the answers carry them.
   const note = allowed.size ? toolkit.note(allowed, new Date().toISOString().slice(0, 10)) : null;
-  const system = Projects.systemMessage(owner ? Projects.context(owner, chat.memory) : null, note?.content);
+  const system = Projects.systemMessage(owner ? Projects.context(owner, chat.memory) : null, note?.content,
+    talk?.active ? talk.instruction : null);
   const outgoing = [...(system ? [system] : []), ...toApiMessages(chat.messages)];
   let reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [] };
   chat.messages.push(reply);
@@ -1036,6 +1039,7 @@ async function send() {
     const root = $('messages').parentElement;
     const atEnd = root.scrollHeight - root.scrollTop - root.clientHeight < 40;
     fillMessage(block, reply);
+    talk?.onReply(reply, false);
     if (atEnd) root.scrollTop = root.scrollHeight;
     if (roundFirstAt && roundPieces > 1) {
       const rate = roundPieces / ((performance.now() - roundFirstAt) / 1000);
@@ -1061,6 +1065,7 @@ async function send() {
       };
     }
     delete reply.pending;
+    talk?.onReply(reply, true);
     reply.reasoning = reply.reasoning || undefined;
     if (!reply.steps.length) delete reply.steps;
   };
@@ -1100,7 +1105,7 @@ async function send() {
       let streamed;
       try {
         streamed = await streamCompletion({
-        model, messages: outgoing, effort: $('effort').value, signal: roundControl.signal,
+        model, messages: outgoing, effort: talk?.active ? 'none' : $('effort').value, signal: roundControl.signal,
         tools: useTools ? toolkit.schemas(allowed) : undefined,
         onDelta: (delta) => {
           if (!delta.content && !delta.reasoning_content) return;
@@ -1281,6 +1286,60 @@ $('effort').value = localStorage.getItem(EFFORT_KEY) || '';
 $('model').addEventListener('change', () => localStorage.setItem(MODEL_KEY, $('model').value));
 $('effort').addEventListener('change', () => localStorage.setItem(EFFORT_KEY, $('effort').value));
 
+// ---------------------------------------------------------------- talk mode
+
+const TALK_LABEL = {
+  off: 'Talk', listening: 'Listening… (tap to stop)', hearing: 'Hearing you…', transcribing: 'Understanding…',
+  thinking: 'Thinking… (tap to interrupt)', speaking: 'Speaking… (tap to interrupt)', error: 'Talk',
+};
+
+async function speechError(response) {
+  let message = `${response.status}`;
+  try {
+    const body = await response.json();
+    message = typeof body.error === 'string' ? body.error : body.error?.message || message;
+  } catch { /* not JSON */ }
+  return new Error(`Speech: ${message}`);
+}
+
+function talkController() {
+  return window.GufoTalk.create({
+    ask: (text) => { $('prompt').value = text; if (busy) queueSteer(); else send(); },
+    stopReply: () => controller?.abort(),
+    transcribe: async (wav) => {
+      const response = await fetch('/api/chat/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav });
+      if (!response.ok) throw await speechError(response);
+      return (await response.json()).text ?? '';
+    },
+    synthesize: async (text) => {
+      const response = await fetch('/api/chat/speak', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+      });
+      if (!response.ok) throw await speechError(response);
+      return response.arrayBuffer();
+    },
+    setState: (state, detail) => {
+      const button = $('talk');
+      button.textContent = TALK_LABEL[state] ?? 'Talk';
+      button.setAttribute('aria-pressed', String(state !== 'off'));
+      button.classList.toggle('talking', state !== 'off');
+      button.classList.toggle('secondary', state === 'off');
+      if (state === 'error') $('status').textContent = detail;
+      else if (state === 'off') $('status').textContent = '';
+      else if (state === 'hearing' || state === 'listening') $('status').textContent = '';
+    },
+  });
+}
+
+$('talk').addEventListener('click', async () => {
+  talk ??= talkController();
+  try {
+    if (!talk.active) await talk.start();
+    else if (!talk.interrupt()) await talk.stop();
+  } catch (error) { $('status').textContent = error.message; }
+});
+window.addEventListener('pagehide', () => { talk?.stop(); });
+
 // ---------------------------------------------------------------- tools menu
 
 function loadAllowedTools() {
@@ -1385,6 +1444,8 @@ async function loadModels() {
     billed = data.billed;
     pythonInstalled = Boolean(data.python);
     libraryAvailable = data.library === true;
+    talkAvailable = data.talk === true && Boolean(window.GufoTalk);
+    $('talk').hidden = !talkAvailable;
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');

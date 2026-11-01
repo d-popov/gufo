@@ -75,6 +75,7 @@ STATIC_FILES = {
     "projects.js": (STATIC_DIR, _JS),
     "chatstore.js": (STATIC_DIR, _JS),
     "chatsync.js": (STATIC_DIR, _JS),
+    "talk.js": (STATIC_DIR, _JS),
     "markdown.js": (STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),
 }
@@ -737,6 +738,89 @@ class GufoClient:
             return json.loads(body)
         except ValueError:
             return None
+
+
+class VoiceServices:
+    """Gufo's speech servers behind the chat's talk mode: `gufo serve asr` turns a recorded
+    utterance into text and `gufo serve tts` turns a reply into audio. Each is its own Gufo
+    process (--asr-url, --tts-url); the browser reaches them only through the monitor, which
+    adds the admin's chat key."""
+
+    UTTERANCE_MAX = 8 << 20   # bytes of WAV the chat may send for one utterance
+    TEXT_MAX = 4000           # characters of reply text synthesized per request
+
+    def __init__(self, asr_url: str, tts_url: str, voice: str | None = None):
+        self.asr = asr_url.rstrip("/")
+        self.tts = tts_url.rstrip("/")
+        self.voice = voice
+        self._models: dict[str, str] = {}
+
+    @staticmethod
+    def _headers(key: str | None, content_type: str | None = None) -> dict[str, str]:
+        headers = {"User-Agent": "gufo-monitor"}
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
+
+    @staticmethod
+    def _open(request, timeout: float) -> tuple[int, bytes, str]:
+        """(status, body, content type); Gufo's refusals keep their status, an unreachable
+        one is a 502."""
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return (response.status, response.read(64 << 20),
+                        response.headers.get("Content-Type", "application/octet-stream"))
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, error.read(64 << 10), "application/json"
+            finally:
+                error.close()
+        except (OSError, TimeoutError):
+            return 502, b'{"error":{"message":"the speech server is unreachable"}}', "application/json"
+
+    def _model(self, base: str, key: str | None) -> str | None:
+        """The model id a speech server serves; each serves one, so it is asked once."""
+        if base not in self._models:
+            request = urllib.request.Request(base + "/v1/models", headers=self._headers(key))
+            status, body, _ = self._open(request, 5.0)
+            try:
+                self._models[base] = json.loads(body)["data"][0]["id"] if status == 200 else ""
+            except (ValueError, LookupError, TypeError):
+                self._models[base] = ""
+        return self._models[base] or None
+
+    def transcribe(self, wav: bytes, key: str | None) -> tuple[int, bytes, str]:
+        """POST an utterance (a WAV file) to the ASR server; its JSON answer has "text"."""
+        model = self._model(self.asr, key)
+        boundary = "gufo" + secrets.token_hex(16)
+        parts = [("model", model)] if model else []
+        parts.append(("response_format", "json"))
+        body = b"".join(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            for name, value in parts)
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+                 f'filename="utterance.wav"\r\nContent-Type: audio/wav\r\n\r\n').encode()
+        body += wav + f"\r\n--{boundary}--\r\n".encode()
+        request = urllib.request.Request(
+            self.asr + "/v1/audio/transcriptions", data=body, method="POST",
+            headers=self._headers(key, f"multipart/form-data; boundary={boundary}"))
+        return self._open(request, 120.0)
+
+    def speak(self, text: str, key: str | None, voice: str | None = None) -> tuple[int, bytes, str]:
+        """POST reply text to the TTS server; its answer is a WAV file."""
+        payload = {"input": text, "response_format": "wav"}
+        model = self._model(self.tts, key)
+        if model:
+            payload["model"] = model
+        voice = voice or self.voice
+        if voice:
+            payload["voice"] = voice
+        request = urllib.request.Request(
+            self.tts + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
+            headers=self._headers(key, "application/json"))
+        return self._open(request, 180.0)
 
 
 def _read_text(path: Path) -> str | None:
@@ -1917,7 +2001,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     def __init__(self, address, monitor: Monitor, admin: AdminAuth, secure_cookie: bool,
                  keys: KeyStore | None = None, billing=None, chat_key: str | None = None,
                  chat_model: str | None = None, chat_store: ChatStore | None = None,
-                 library=None):
+                 library=None, voice: VoiceServices | None = None):
         super().__init__(address, Handler)
         self.monitor = monitor
         self.admin = admin
@@ -1929,6 +2013,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.chat_model = chat_model
         # The private library (library.Library); None: /api/library/* and /mcp answer 404.
         self.library = library
+        # The speech servers of the chat's talk mode; None: its routes answer 404.
+        self.voice = voice
         # Opens the library's read routes and /mcp, nothing else; derived from the admin token.
         self.library_token = LIBRARY_TOKEN_PREFIX + admin.derive("library:read")
         self.runs = ChatRuns()
@@ -2325,6 +2411,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "owner": self._chat_owner(),
             "sync": self.server.chat_store is not None,
             "library": self.server.library is not None and self._admin(),
+            "talk": self.server.voice is not None and self._admin(),
         }).encode())
 
     def _chat_owner(self) -> str | None:
@@ -2474,6 +2561,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             if upstream is not None:
                 upstream.close()
+
+    def _voice_route(self, kind: str):
+        """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
+        and answers {"text"}; POST /api/chat/speak takes {"text", "voice"?} and answers a WAV
+        file. Both go to Gufo's speech servers with the admin's chat key."""
+        voice = self.server.voice
+        if voice is None:
+            return self._error(404, "talk mode is not configured (--asr-url and --tts-url)")
+        if not self._admin():
+            return self._error(401, "unauthorized")
+        key = self.server.chat_key
+        if kind == "transcribe":
+            # A browser page cannot send this type cross-site without a preflight.
+            if self.headers.get("Content-Type", "").split(";")[0].strip() != "audio/wav":
+                return self._error(415, "expected an audio/wav body")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if not 44 < length <= voice.UTTERANCE_MAX:
+                return self._error(400, f"expected a WAV of at most {voice.UTTERANCE_MAX >> 20} MiB")
+            status, answer, content_type = voice.transcribe(self.rfile.read(length), key)
+        else:
+            body = self._read_json(voice.TEXT_MAX * 4 + 1024)
+            text = body.get("text") if body else None
+            name = body.get("voice") if body else None
+            if not isinstance(text, str) or not text.strip() or len(text) > voice.TEXT_MAX:
+                return self._error(400, f"expected text of 1 to {voice.TEXT_MAX} characters")
+            if name is not None and not isinstance(name, str):
+                return self._error(400, "voice is a string")
+            status, answer, content_type = voice.speak(text, key, name)
+        self._send(status, answer, content_type if status == 200 else "application/json")
 
     # -- the private library: /api/library/* (read with the admin or the library token, change
     # with the admin's) and the MCP endpoint /mcp (the library token only)
@@ -2631,6 +2750,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._library("POST")
         if path == "/api/chat/completions":
             return self._chat_completion()
+        if path in ("/api/chat/transcribe", "/api/chat/speak"):
+            return self._voice_route(path.rsplit("/", 1)[1])
         if path.startswith("/api/chat/runs/"):
             return self._run_route("POST")
         self._mutation("POST")
@@ -2780,6 +2901,13 @@ def parse_args(argv=None):
     parser.add_argument("--chat-model", metavar="NAME",
                         help="the served model the chat page selects until a user picks another "
                              "(default: the first one listed)")
+    parser.add_argument("--asr-url", metavar="URL",
+                        help="a `gufo serve asr` server; with --tts-url it turns on the chat's "
+                             "talk mode (the admin's, using --chat-key-file)")
+    parser.add_argument("--tts-url", metavar="URL", help="a `gufo serve tts` server")
+    parser.add_argument("--tts-voice", metavar="NAME",
+                        help="the voice talk mode speaks with (a CustomVoice speaker or a "
+                             "registered clone); the server's default when unset")
     parser.add_argument("--chat-store", type=Path,
                         default=config / "gufo-monitor" / "chats.sqlite",
                         help="the chats and projects of every signed-in user, so one account sees "
@@ -2912,8 +3040,12 @@ def main(argv=None) -> int:
     except (OSError, sqlite3.Error) as error:
         print(f"gufo-monitor: --library-dir: {error}", file=sys.stderr)
         return 2
+    if bool(args.asr_url) != bool(args.tts_url):
+        print("gufo-monitor: --asr-url and --tts-url go together", file=sys.stderr)
+        return 2
+    voice = VoiceServices(args.asr_url, args.tts_url, args.tts_voice) if args.asr_url else None
     server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
-                    chat_key, args.chat_model, chat_store, library)
+                    chat_key, args.chat_model, chat_store, library, voice)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":
