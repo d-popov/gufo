@@ -8,6 +8,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/experimental/snapshot_transfer.hpp>
+#include <gufo/ext/platform/pages.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -17,9 +20,6 @@
 #include <vector>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/managed_alloc.hpp"
-#include "src/core/hip/snapshot_transfer.hpp"
-#include "src/core/platform/pages.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -1790,9 +1790,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   const Config& c = config();
   routed_max_rows_ = 0;
   routed_n_tiles_ = 0;
-  routed_64_tiles_ = 0;
-  routed_pair_tiles_ = 0;
-  routed_pair_offset_ = 0;
+  routed_wide_tiles_ = 0;
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
@@ -1820,13 +1818,10 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
     }
   };
   if (WidePrefill(n_tokens)) {
-    // Prefill batches: 64-token tiles for the down projection, then 128-token
-    // tiles for the paired gate/up projections.
-    append(64);
-    routed_64_tiles_ = n_tiles;
-    routed_pair_offset_ = n_tiles;
+    // Prefill batches: one map of 128-token tiles serves the paired gate/up
+    // and the down projections.
     append(128);
-    routed_pair_tiles_ = n_tiles - routed_pair_offset_;
+    routed_wide_tiles_ = n_tiles;
   } else {
     append(routed_tile_rows_);
     routed_n_tiles_ = n_tiles;
@@ -2658,12 +2653,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  rocm::Attention(
-      s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-      split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
-      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-      split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
-      c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0);
+  rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
+                  split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
+                  pos, c.num_heads, c.num_kv_heads, c.head_dim,
+                  c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
+                  split ? s_.attn_counts : nullptr,
+                  c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+                  c.indexer_top_k);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -2841,12 +2837,12 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                                      ? WeightType::kQ5_K
                                      : WeightType::kQ4_K;
     const bool gated_ok =
-        routed_64_tiles_ != 0
-            ? RoutedGatedF16Gemm(
-                  l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
-                  s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
-                  c.expert_ff, c.hidden_size, stream_)
+        routed_wide_tiles_ != 0
+            ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                                 gate_type, x_half, s_.routed_tiles,
+                                 routed_wide_tiles_, s_.routed_bounds,
+                                 s_.rows_token, s_.rows_slot, up_half,
+                                 c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
@@ -2864,15 +2860,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
-    // Prefill takes the 64-token down tiles: they decode each expert's
-    // weights over more rows, also where narrower tiles would be fewer.
-    const bool wide_down = routed_64_tiles_ != 0;
+    // Prefill takes the gate/up map's 128-token tiles: each wave decodes its
+    // rows' weights once for up to 128 tokens.
+    const bool wide_down = routed_wide_tiles_ != 0;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
                        s_.routed_tiles,
-                       wide_down ? routed_64_tiles_ : routed_n_tiles_,
-                       wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
+                       wide_down ? routed_wide_tiles_ : routed_n_tiles_,
+                       wide_down ? 128 : routed_tile_rows_, s_.routed_bounds,
                        s_.rows_slot, s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
                        c.expert_ff, stream_)) {

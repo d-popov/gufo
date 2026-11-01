@@ -1,3 +1,14 @@
+# Pre-migration serialization check needs neither HIP nor model weights:
+# it compiles continuation_identity.cpp itself for its own fixture path and
+# a HIP-free compile, instead of linking gufo_serving.
+add_executable(qwen38_flash_next_continuation_identity_test continuation_identity_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_identity.cpp)
+target_include_directories(qwen38_flash_next_continuation_identity_test PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_definitions(qwen38_flash_next_continuation_identity_test PRIVATE
+  GUFO_IDENTITY_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/continuation_identity")
+add_test(NAME qwen38_flash_next_continuation_identity_test COMMAND qwen38_flash_next_continuation_identity_test)
+set_tests_properties(qwen38_flash_next_continuation_identity_test PROPERTIES LABELS "cpu;qwen38_flash_next;cache;correctness")
+
 # Small operator checks are the default. Full-model qualification and
 # diagnostic probes are built explicitly so routine iterations stay focused.
 add_custom_target(qwen38_flash_next_tests)
@@ -30,7 +41,7 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
-  foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
+  foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops hc_route_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops snapshot_copy verification_sampling)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
@@ -39,15 +50,9 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)
 
-  add_executable(qwen38_flash_next_session_test EXCLUDE_FROM_ALL session_test.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
-  target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging
-    gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip hip::host)
+  add_executable(qwen38_flash_next_session_test EXCLUDE_FROM_ALL session_test.cpp)
+  target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_serving
+    gufo_qwen38_flash_next)
   add_executable(qwen38_flash_next_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp
     device_headroom_fault.cpp)
   target_link_libraries(qwen38_flash_next_snapshot_test PRIVATE
