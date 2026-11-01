@@ -6,8 +6,31 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
+// A microphone whose permission prompt the test answers when it chooses, and an audio context
+// that records what was opened and closed.
+const prompts = [];
+const contexts = [];
+const navigator = {
+  mediaDevices: {
+    getUserMedia: () => new Promise((resolve, reject) => prompts.push({ resolve, reject })),
+  },
+};
+class AudioContext {
+  constructor() { this.closed = false; this.sampleRate = 48000; this.destination = {}; contexts.push(this); }
+  resume() { return this.resumeGate ?? Promise.resolve(); }
+  close() { this.closed = true; return Promise.resolve(); }
+  createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+  createScriptProcessor() { return { connect() {}, disconnect() {} }; }
+  createGain() { return { gain: {}, connect() {} }; }
+}
+const microphone = () => {
+  const track = { stopped: false, stop() { this.stopped = true; } };
+  return { track, getTracks: () => [track] };
+};
+
 const window = {};
-vm.runInNewContext(fs.readFileSync('tools/monitor/static/talk.js', 'utf8'), { window, Float32Array, ArrayBuffer, DataView });
+vm.runInNewContext(fs.readFileSync('tools/monitor/static/talk.js', 'utf8'),
+  { window, Float32Array, ArrayBuffer, DataView, navigator, AudioContext, setTimeout });
 const { speakable, SentenceFeed, Vad, downsample, encodeWav } = window.GufoTalk;
 
 // Markup is not read out: links keep their label, addresses, code and emoji go.
@@ -76,4 +99,72 @@ assert.equal(wav.getUint32(40, true), 8);
 assert.deepEqual([2, 3, 4, 5].map((i) => wav.getInt16(44 + (i - 2) * 2, true)), [0, 32767, -32768, 16383]);
 assert.equal(wav.byteLength, 52);
 
-console.log('talk ok');
+// Starting waits on the microphone permission: a second tap or a stop meanwhile cancels it, and
+// a microphone granted late is given back instead of left open.
+(async () => {
+  const states = [];
+  const host = { ask() {}, stopReply() {}, transcribe: async () => '', synthesize: async () => new ArrayBuffer(0), setState: (s) => states.push(s) };
+  const reset = () => { prompts.length = 0; contexts.length = 0; states.length = 0; };
+
+  reset();
+  let talk = window.GufoTalk.create(host);
+  const first = talk.start();
+  await talk.start();                                   // a double tap while the prompt is open
+  assert.equal(prompts.length, 1);
+  assert.equal(talk.state, 'starting');
+  assert.equal(talk.active, true);
+  await talk.stop();                                    // the second tap cancels
+  assert.equal(talk.state, 'off');
+  const late = microphone();
+  prompts[0].resolve(late);
+  await first;
+  assert.equal(late.track.stopped, true);               // the late microphone is released
+  assert.equal(contexts.length, 0);
+  assert.equal(talk.state, 'off');
+  assert.deepEqual(states, ['starting', 'off']);
+
+  reset();                                              // a stop while the audio context resumes
+  talk = window.GufoTalk.create(host);
+  const second = talk.start();
+  const held = microphone();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const original = AudioContext.prototype.resume;
+  AudioContext.prototype.resume = function resume() { this.resumeGate = gate; return gate; };
+  prompts[0].resolve(held);
+  await new Promise((resolve) => setImmediate(resolve));
+  await talk.stop();
+  release();
+  await second;
+  AudioContext.prototype.resume = original;
+  assert.equal(held.track.stopped, true);
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0].closed, true);
+  assert.equal(talk.state, 'off');
+
+  reset();                                              // a start, then a stop, then a start again
+  talk = window.GufoTalk.create(host);
+  const third = talk.start();
+  await talk.stop();
+  const fourth = talk.start();
+  const stale = microphone();
+  const current = microphone();
+  prompts[0].resolve(stale);
+  prompts[1].resolve(current);
+  await Promise.all([third, fourth]);
+  assert.equal(stale.track.stopped, true);              // only the newest start keeps its microphone
+  assert.equal(current.track.stopped, false);
+  assert.equal(talk.state, 'listening');
+  await talk.stop();
+  assert.equal(current.track.stopped, true);
+  assert.equal(contexts.filter((c) => !c.closed).length, 0);
+
+  reset();                                              // a refused permission ends in off, with a reason
+  talk = window.GufoTalk.create(host);
+  const refused = talk.start();
+  prompts[0].reject(Object.assign(new Error('denied'), { name: 'NotAllowedError' }));
+  await assert.rejects(refused, /Microphone access was refused/);
+  assert.equal(talk.state, 'off');
+
+  console.log('talk ok');
+})().catch((error) => { console.error(error); process.exit(1); });

@@ -203,7 +203,7 @@
   const PRE_ROLL_MS = 400;
 
   // host: { ask(text), stopReply(), transcribe(wav: ArrayBuffer) -> text, synthesize(text) ->
-  // ArrayBuffer (a WAV file), setState(state, detail) }. States: off, listening, hearing,
+  // ArrayBuffer (a WAV file), setState(state, detail) }. States: off, starting, listening, hearing,
   // transcribing, thinking, speaking, error.
   function create(host) {
     let state = 'off';
@@ -215,6 +215,7 @@
     let frames = [];        // Float32Arrays of the utterance in progress
     let preRoll = [];       // the last PRE_ROLL_MS before speech started
     let turn = 0;           // bumps when a reply is abandoned, so late audio is dropped
+    let epoch = 0;          // bumps when a start is cancelled, so its late microphone is dropped
     let feed = new SentenceFeed();
     let replying = null;    // the reply object being spoken
     let replyDone = false;
@@ -318,18 +319,37 @@
       get state() { return state; },
       instruction: VOICE_NOTE,
 
+      // Taking the microphone can wait on a permission prompt; a second tap or stop() meanwhile
+      // cancels this start, and whatever it acquires afterwards is released.
       async start() {
         if (state !== 'off') return;
+        const mine = ++epoch;
+        set('starting');
+        let media;
         try {
-          stream = await navigator.mediaDevices.getUserMedia({
+          media = await navigator.mediaDevices.getUserMedia({
             audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
           });
         } catch (error) {
-          set('off');
+          if (mine === epoch) set('off');
           throw new Error(error.name === 'NotAllowedError' ? 'Microphone access was refused.' : `No microphone: ${error.message}`);
         }
-        context = new AudioContext();
-        await context.resume();
+        const release = (audio) => {
+          media.getTracks().forEach((track) => track.stop());
+          return audio?.close();
+        };
+        if (mine !== epoch) { release(); return; }
+        const audio = new AudioContext();
+        try {
+          await audio.resume();
+        } catch (error) {
+          await release(audio);
+          if (mine === epoch) set('off');
+          throw error;
+        }
+        if (mine !== epoch) { await release(audio); return; }
+        stream = media;
+        context = audio;
         source = context.createMediaStreamSource(stream);
         processor = context.createScriptProcessor(4096, 1, 1);
         processor.onaudioprocess = (event) => onFrame(new Float32Array(event.inputBuffer.getChannelData(0)));
@@ -339,20 +359,22 @@
         processor.connect(mute);
         mute.connect(context.destination);
         vad = new Vad();
-        state = 'listening';
         listen();
       },
 
       async stop() {
         if (state === 'off') return;
+        epoch += 1;  // a start still waiting for the microphone gives it back
+        if (state === 'starting') { set('off'); return; }
         stopPlayback();
         host.stopReply();
         processor?.disconnect();
         source?.disconnect();
         stream?.getTracks().forEach((track) => track.stop());
-        await context?.close();
+        const closing = context?.close();
         processor = source = stream = context = null;
         set('off');
+        await closing;
       },
 
       // The Talk button during a reply: stop talking and the reply, and listen again.

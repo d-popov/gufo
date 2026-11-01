@@ -1289,7 +1289,7 @@ $('effort').addEventListener('change', () => localStorage.setItem(EFFORT_KEY, $(
 // ---------------------------------------------------------------- talk mode
 
 const TALK_LABEL = {
-  off: 'Talk', listening: 'Listening… (tap to stop)', hearing: 'Hearing you…', transcribing: 'Understanding…',
+  off: 'Talk', starting: 'Starting… (tap to cancel)', listening: 'Listening… (tap to stop)', hearing: 'Hearing you…', transcribing: 'Understanding…',
   thinking: 'Thinking… (tap to interrupt)', speaking: 'Speaking… (tap to interrupt)', error: 'Talk',
 };
 
