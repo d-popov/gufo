@@ -704,20 +704,15 @@ public:
         max_context_(max_context),
         speculative_options_(speculative_options),
         dflash_policy_(dflash_policy),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
-    if (!artifact_fingerprint.empty()) {
-      const bool speculative = dflash_model_ != nullptr;
+        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        artifact_fingerprint_(std::move(artifact_fingerprint)),
+        draft_artifact_fingerprint_(std::move(draft_artifact_fingerprint)) {
+    component_identity_ = ComponentIdentity(max_context_);
+    if (!artifact_fingerprint_.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
-          .compatibility_identity = QwenCompatibilityIdentity(
-              artifact_fingerprint, draft_artifact_fingerprint, max_context_,
-              execution_policy_, speculative, speculative_options_,
-              dflash_policy_),
+          .compatibility_identity = component_identity_,
           .payload_version = kQwenComponentPayloadVersion,
       };
-      component_identity_ = persistence_->compatibility_identity;
-    } else {
-      component_identity_ =
-          QwenProcessIdentity(model_.get(), dflash_model_.get(), max_context_);
     }
   }
 
@@ -726,25 +721,41 @@ public:
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
     (void)ram;
+    ledger_ = &ledger;
     auto resources = hip::CreateHipComponentCacheResources(
         std::make_unique<models::qwen::ContinuationAdapter>(
             model_, max_context_, component_identity_, execution_policy_,
-            dflash_model_,
-            hip::QwenDFlashGpuDraftConfig{
-                .max_context = max_context_,
-                .max_draft_tokens = speculative_options_.max_draft_tokens,
-                .policy = dflash_policy_},
-            &ledger),
+            dflash_model_, DraftConfig(max_context_), &ledger),
         ledger, HipComponentCacheHooks());
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
     resources->reassignment_batch_size = 16;
     const auto& adapter =
         static_cast<models::qwen::ContinuationAdapter&>(*resources->adapter);
-    resources->pinned_bytes = [qwen = &adapter] {
-      return qwen->PinnedCaptureBytes();
+    // With session classes the slots belong to the class adapters.
+    resources->pinned_bytes = [this, qwen = &adapter] {
+      std::size_t pinned = qwen->PinnedCaptureBytes();
+      const std::lock_guard lock(class_adapters_mutex_);
+      for (const auto* klass : class_adapters_)
+        pinned += klass->PinnedCaptureBytes();
+      return pinned;
     };
     return resources;
+  }
+  // A session class keeps its sessions, and the identity of its cached
+  // state, at its own context.
+  [[nodiscard]] std::unique_ptr<cache::Adapter> CreateSessionClassAdapter(
+      std::uint32_t max_context) const override {
+    auto adapter = std::make_unique<models::qwen::ContinuationAdapter>(
+        model_, max_context, ComponentIdentity(max_context), execution_policy_,
+        dflash_model_, DraftConfig(max_context), ledger_);
+    const std::lock_guard lock(class_adapters_mutex_);
+    class_adapters_.push_back(adapter.get());
+    return adapter;
+  }
+  [[nodiscard]] std::optional<std::size_t> SessionStateBytes(
+      std::uint32_t max_context) const override {
+    return RequestStateBytes(max_context);
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
@@ -798,13 +809,10 @@ public:
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
         model_->GetConfig(), max_context_, execution_policy_);
-    usage.request_state_bytes += hip::QwenGpuArena::RecurrentStateBytes(
-        model_->GetConfig(), execution_policy_);
     std::size_t resident_weights = model_->GetResidentBytes();
     if (dflash_model_ != nullptr) {
       const auto draft = hip::QwenDFlashGpuExecutor::EstimateMemoryUsage(
           *dflash_model_, max_context_, MaximumDecodeBatchWidth());
-      usage.request_state_bytes += draft.request_state_bytes;
       usage.temporary_scratch_bytes += draft.temporary_scratch_bytes;
       resident_weights += dflash_model_->GetPackedWeightBytes();
     }
@@ -826,7 +834,7 @@ public:
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = usage.request_state_bytes,
+        .per_request_state_bytes = RequestStateBytes(max_context_),
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
         .retained_snapshot_capacity_bytes = snapshot_capacity,
         .retained_snapshot_ceiling_bytes = snapshot_ceiling,
@@ -1146,6 +1154,36 @@ public:
   }
 
 private:
+  // Restart-safe with artifact fingerprints, else bound to this process's
+  // loaded model. Both name the session context.
+  [[nodiscard]] cache::Identity ComponentIdentity(std::uint32_t context) const {
+    if (!artifact_fingerprint_.empty())
+      return QwenCompatibilityIdentity(
+          artifact_fingerprint_, draft_artifact_fingerprint_, context,
+          execution_policy_, dflash_model_ != nullptr, speculative_options_,
+          dflash_policy_);
+    return QwenProcessIdentity(model_.get(), dflash_model_.get(), context);
+  }
+  [[nodiscard]] hip::QwenDFlashGpuDraftConfig DraftConfig(
+      std::uint32_t context) const {
+    return {.max_context = context,
+            .max_draft_tokens = speculative_options_.max_draft_tokens,
+            .policy = dflash_policy_};
+  }
+  // Device state one session of `context` tokens holds: the target's, its
+  // recurrent state and the draft's.
+  [[nodiscard]] std::size_t RequestStateBytes(std::uint32_t context) const {
+    auto bytes = hip::QwenGpuExecutor::EstimateMemoryUsage(
+                     model_->GetConfig(), context, execution_policy_)
+                     .request_state_bytes;
+    bytes += hip::QwenGpuArena::RecurrentStateBytes(model_->GetConfig(),
+                                                    execution_policy_);
+    if (dflash_model_ != nullptr)
+      bytes += hip::QwenDFlashGpuExecutor::EstimateMemoryUsage(
+                   *dflash_model_, context, MaximumDecodeBatchWidth())
+                   .request_state_bytes;
+    return bytes;
+  }
   [[nodiscard]] std::size_t MaximumDecodeBatchWidth() const noexcept {
     const std::size_t rows_per_session = dflash_model_ != nullptr ? 8 : 1;
     return std::clamp<std::size_t>(max_context_ / rows_per_session, 1, 8);
@@ -1159,8 +1197,14 @@ private:
   speculative::DFlashDraftPolicy dflash_policy_{
       speculative::DFlashDraftPolicy::kAdaptive};
   hip::QwenExecutionPolicy execution_policy_;
+  std::string artifact_fingerprint_;
+  std::string draft_artifact_fingerprint_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
+  // The cache's ledger, and the adapters it made for session classes.
+  mutable cache::ResourceLedger* ledger_{nullptr};
+  mutable std::mutex class_adapters_mutex_;
+  mutable std::vector<const models::qwen::ContinuationAdapter*> class_adapters_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
@@ -2767,11 +2811,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
           ? reader->GetMetadataUint32("qwen4exp.context_length").value_or(0)
           : 0;
   if (!session_classes.empty()) {
-    // Only the Flash-Next runner creates sessions of unequal context.
-    if (architecture != "qwen4exp") {
+    // Only the Qwen runners create sessions of unequal context.
+    if (architecture != "qwen4exp" && architecture != "qwen35") {
       SetError(error,
-               "--session-class requires a Qwen3.8-Flash-Next model; this "
-               "GGUF's architecture is '" +
+               "--session-class requires a Qwen3.8 27B or Flash-Next model; "
+               "this GGUF's architecture is '" +
                    std::string(architecture) + "'");
       return false;
     }
@@ -2980,7 +3024,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), ram_cache_config);
+              std::move(resolved_disk_cache_config), ram_cache_config,
+              std::move(session_classes));
 #else
   (void)model_path;
   (void)max_context;
@@ -3006,10 +3051,24 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            std::vector<TextSessionClass> session_classes) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
+  }
+  if (!session_classes.empty()) {
+    // The model and its pool reach the largest class; each class's sessions
+    // are created at its own context.
+    const SessionClassSet classes(session_classes);
+    if (const auto unsized = classes.missing_context(); !unsized.empty()) {
+      SetError(error,
+               "session class '" + unsized + "' needs a nonzero context");
+      return false;
+    }
+    const auto totals = classes.totals();
+    max_context = totals.max_context;
+    session_count = totals.sessions;
   }
   if (max_context == 0)
     max_context = model->GetConfig().context_length;
@@ -3115,8 +3174,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         speculative_options, speculative_config.dflash_policy,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
-    new_state->model_id = runner->Descriptor().model_id;
-    new_state->max_context = max_context;
+    new_state->model_id = session_classes.empty()
+                              ? runner->Descriptor().model_id
+                              : session_classes.front().name;
+    new_state->max_context = session_classes.empty()
+                                 ? max_context
+                                 : session_classes.front().max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
       runner_disk_cache = TextRunnerDiskCacheOptions{
@@ -3125,11 +3188,23 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
+    if (!session_classes.empty()) {
+      Logger::Info("loader", SessionClassSet(session_classes)
+                                 .load_line(max_context, [&](std::uint32_t c) {
+                                   return *runner->SessionStateBytes(c);
+                                 }));
+    }
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
-    auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
+    auto runner_pool =
+        session_classes.empty()
+            ? std::make_shared<TextRunnerPool>(std::move(runner), session_count,
+                                               std::move(runner_disk_cache),
+                                               ram_cache_config)
+            : std::make_shared<TextRunnerPool>(
+                  std::move(runner), session_classes,
+                  std::move(runner_disk_cache), ram_cache_config);
+    new_state->classes = SessionClassSet(std::move(session_classes));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3305,18 +3380,10 @@ bool InferenceBackend::load(
           speculative_config.backend == TextSpeculativeBackend::kMtp
               ? core::SessionMode::kSpeculative
               : core::SessionMode::kAutoregressive;
-      const SessionClassSet classes(session_classes);
-      const auto totals = classes.totals();
-      std::size_t state_bytes = 0;
-      for (const auto& c : session_classes)
-        state_bytes += c.count * model->SessionBytes(mode, c.max_context);
-      Logger::Info(
-          "loader",
-          "event=session_classes classes=" + classes.describe() +
-              " sessions=" + std::to_string(totals.sessions) +
-              " context_tokens=" + std::to_string(totals.context_tokens) +
-              " session_state_bytes=" + std::to_string(state_bytes) +
-              " model_context=" + std::to_string(max_context));
+      Logger::Info("loader", SessionClassSet(session_classes)
+                                 .load_line(max_context, [&](std::uint32_t c) {
+                                   return model->SessionBytes(mode, c);
+                                 }));
     }
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,

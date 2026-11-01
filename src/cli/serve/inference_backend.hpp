@@ -78,8 +78,8 @@ public:
   /// accepted with) a `max_context` above its native context.
   ///
   /// Nonempty session_classes replace max_context and session_count: one
-  /// loaded Qwen3.8-Flash-Next model serves each class under its own name,
-  /// with sessions of its own context. Other models refuse them.
+  /// loaded Qwen3.8-Flash-Next or Qwen 27B model serves each class under its
+  /// own name, with sessions of its own context. Other models refuse them.
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
@@ -93,13 +93,16 @@ public:
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
+  /// Nonempty session_classes replace max_context and session_count; their
+  /// contexts must fit the loaded model's.
   bool load(std::shared_ptr<const hip::QwenGpuModel> model, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            std::vector<TextSessionClass> session_classes = {});
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,

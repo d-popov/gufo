@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -56,6 +57,12 @@ public:
 
   /// "NAME:COUNTxCONTEXT,..." for logs.
   [[nodiscard]] std::string describe() const;
+
+  /// The loader's `session_classes` log line: the classes, what they hold and
+  /// the device state they claim, from `session_bytes(context)` per session.
+  [[nodiscard]] std::string load_line(
+      std::size_t model_context,
+      const std::function<std::size_t(std::uint32_t)>& session_bytes) const;
 
 private:
   std::vector<TextSessionClass> classes_;

@@ -816,6 +816,12 @@ if (BUILD_TESTING)
       SKIP_RETURN_CODE 77)
   endif()
 
+  add_executable(session_classes_test tests/cli/session_classes_test.cpp)
+  target_link_libraries(session_classes_test PRIVATE gufo_serving)
+  add_test(NAME session_classes_test COMMAND session_classes_test)
+  set_tests_properties(session_classes_test PROPERTIES
+    LABELS "cpu;server;lifecycle")
+
   add_executable(continuation_cache_test tests/cli/continuation_cache_test.cpp)
   target_link_libraries(continuation_cache_test PRIVATE gufo_serving)
   add_test(NAME continuation_cache_test COMMAND continuation_cache_test)

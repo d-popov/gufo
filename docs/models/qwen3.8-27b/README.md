@@ -23,6 +23,18 @@ DRAFT=models/qwen3.8-27b/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
   --dflash-model "$DRAFT" --sessions 2 --context 32768
 ```
 
+One big session beside several smaller ones (each class its own model name and
+context; see [session classes](../../SERVER.md#session-classes)):
+
+```sh
+./result/bin/gufo serve llm --model "$MODEL" --speculative dflash2 \
+  --dflash-model "$DRAFT" \
+  --session-class qwen3.8-27b=1x163840 --session-class qwen3.8-27b-sub=7x65536
+```
+
+Each session costs about 3 GiB of recurrent and scratch state plus 64 KiB of
+KV per context token, so that layout holds about 90 GiB beside Q6_K weights.
+
 Substitute `Qwen3.8-27B-UD-Q8_K_XL.gguf` for Q8. Targets and drafts need not
 have matching precision. Use the Q4_K_M DFlash2 draft with either target.
 

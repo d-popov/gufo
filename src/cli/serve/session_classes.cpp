@@ -94,4 +94,18 @@ std::string SessionClassSet::describe() const {
   return text;
 }
 
+std::string SessionClassSet::load_line(
+    std::size_t model_context,
+    const std::function<std::size_t(std::uint32_t)>& session_bytes) const {
+  const auto sum = totals();
+  std::size_t state_bytes = 0;
+  for (const auto& c : classes_)
+    state_bytes += c.count * session_bytes(c.max_context);
+  return "event=session_classes classes=" + describe() +
+         " sessions=" + std::to_string(sum.sessions) +
+         " context_tokens=" + std::to_string(sum.context_tokens) +
+         " session_state_bytes=" + std::to_string(state_bytes) +
+         " model_context=" + std::to_string(model_context);
+}
+
 }  // namespace gufo::server

@@ -91,8 +91,8 @@ available memory.
 
 #### Session classes
 
-Qwen3.8-Flash-Next can serve several model names from one loaded copy of the
-weights, each backed by its own group of sessions:
+Qwen3.8-Flash-Next and the Qwen 27B can serve several model names from one loaded
+copy of the weights, each backed by its own group of sessions:
 
 ```bash
 gufo serve llm --model models/flash-next.gguf \
@@ -106,7 +106,9 @@ gufo serve llm --model models/flash-next.gguf \
 Names must be unique; COUNT and CONTEXT must be at least 1, and CONTEXT may
 not exceed the model's native context. The model and its shared scratch are
 loaded for the largest class; each session allocates state for its own
-class's context only. Other model families refuse the option at startup.
+class's context only. Other model families refuse the option at startup. On the
+27B each class also gets its own draft-model state, and a request longer than
+its class's context is refused with a message naming the larger class.
 
 - The request `model` field selects the class by exact name, and unknown
   names return `404 model_not_found`. Chat Completions requires `model`
