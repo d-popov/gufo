@@ -76,7 +76,8 @@ GGUFs of other tools. TTS speaks Chinese, English, German, Italian, Portuguese, 
 Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them. The page
 needs a secure context for the microphone (`localhost` or https). Beside the button the chat shows the speech models it
 uses (`Listening: …`, `Speaking: …`) and two controls: **Voice**, from the voices the speech server lists, and
-**Speed** (Slow, Normal, Fast, Faster). Both are kept in the browser. The server speaks at 1.0 only, so speed is
+**Speed** (Slow, Normal, Fast, Faster). Both are kept in the browser. Every finished reply also has a small speaker button: it reads that reply aloud in the chosen voice
+and speed (press again to stop), so a typed conversation can be listened to without Talk. The server speaks at 1.0 only, so speed is
 playback rate and the pitch moves a little with it. Routes: `GET /api/chat/voice` (models and voices),
 `POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak` (`{text, voice?}` answers a WAV).
 `static/talk.js` holds the logic.

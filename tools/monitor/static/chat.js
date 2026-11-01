@@ -679,6 +679,22 @@ function fillMessage(block, message) {
     img.alt = image.name;
     block.append(img);
   }
+  if (talkAvailable && message.role === 'assistant' && !message.error && !message.pending && message.content) {
+    const speak = document.createElement('button');
+    speak.type = 'button';
+    speak.className = 'speak secondary';
+    speak.setAttribute('aria-label', 'Read this reply aloud');
+    speak.setAttribute('aria-pressed', 'false');
+    speak.title = 'Read aloud';
+    speak.append(window.GufoIcons.svg('volume-2'));
+    if (reading === message) {
+      speak.classList.add('reading');
+      speak.setAttribute('aria-pressed', 'true');
+      speak.replaceChildren(window.GufoIcons.svg('square'));
+    }
+    speak.addEventListener('click', () => readAloud(message, speak));
+    block.append(speak);
+  }
   if (message.stats) {
     const meta = document.createElement('div');
     meta.className = 'meta';
@@ -1304,6 +1320,40 @@ async function speechError(response) {
   return new Error(`Speech: ${message}`);
 }
 
+// One piece of text as a WAV file, in the voice chosen beside the Talk button.
+async function synthesizeSpeech(text) {
+  const response = await fetch('/api/chat/speak', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, ...($('voice').value ? { voice: $('voice').value } : {}) }),
+  });
+  if (!response.ok) throw await speechError(response);
+  return response.arrayBuffer();
+}
+
+// Reads one reply aloud when its speaker button is pressed; pressing it again stops it.
+let reader = null;
+let reading = null;  // the message being read
+function readAloud(message, button) {
+  reader ??= window.GufoTalk.createReader({
+    synthesize: synthesizeSpeech,
+    speed: () => Number($('voice-speed').value) || 1,
+    error: (text) => { $('status').textContent = text; },
+  });
+  if (reading === message) { reader.stop(); return; }
+  const mark = (on) => {
+    button.classList.toggle('reading', on);
+    button.setAttribute('aria-pressed', String(on));
+    button.title = on ? 'Stop reading' : 'Read aloud';
+    button.replaceChildren(window.GufoIcons.svg(on ? 'square' : 'volume-2'));
+  };
+  reading = message;
+  mark(true);
+  reader.speak(message.content, () => {
+    if (reading === message) reading = null;
+    mark(false);
+  });
+}
+
 function talkController() {
   return window.GufoTalk.create({
     ask: (text) => { $('prompt').value = text; if (busy) queueSteer(); else send(); },
@@ -1314,14 +1364,7 @@ function talkController() {
       if (!response.ok) throw await speechError(response);
       return (await response.json()).text ?? '';
     },
-    synthesize: async (text) => {
-      const response = await fetch('/api/chat/speak', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, ...($('voice').value ? { voice: $('voice').value } : {}) }),
-      });
-      if (!response.ok) throw await speechError(response);
-      return response.arrayBuffer();
-    },
+    synthesize: synthesizeSpeech,
     setState: (state, detail) => {
       const button = $('talk');
       button.textContent = TALK_LABEL[state] ?? 'Talk';
@@ -1377,7 +1420,7 @@ $('talk').addEventListener('click', async () => {
     else if (!talk.interrupt()) await talk.stop();
   } catch (error) { $('status').textContent = error.message; }
 });
-window.addEventListener('pagehide', () => { talk?.stop(); });
+window.addEventListener('pagehide', () => { talk?.stop(); reader?.stop(); });
 
 // ---------------------------------------------------------------- tools menu
 
@@ -1483,7 +1526,9 @@ async function loadModels() {
     billed = data.billed;
     pythonInstalled = Boolean(data.python);
     libraryAvailable = data.library === true;
+    const couldSpeak = talkAvailable;
     talkAvailable = data.talk === true && Boolean(window.GufoTalk);
+    if (talkAvailable !== couldSpeak && active()) renderMessages();
     $('talk').hidden = !talkAvailable;
     if (talkAvailable) loadVoiceInfo();
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened

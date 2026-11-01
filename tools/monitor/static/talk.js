@@ -400,5 +400,73 @@
     };
   }
 
-  window.GufoTalk = { speakable, SentenceFeed, Vad, downsample, encodeWav, rmsOf, VOICE_NOTE, create };
+  // Reads a finished text aloud, sentence by sentence: the next sentence is synthesized while the
+  // current one plays. host: { synthesize(text) -> ArrayBuffer (a WAV file), speed?() -> playback
+  // rate, error?(message) }. Starting a text stops the one being read; stop() ends it. The
+  // `done` callback of a text runs exactly once, when it ends, is stopped or fails.
+  function createReader(host) {
+    let context = null;
+    let turn = 0;
+    let player = null;
+    let active = null;
+
+    const finish = (mine) => {
+      if (mine !== turn || !active) return;
+      const done = active;
+      active = null;
+      done();
+    };
+    const stop = () => {
+      turn += 1;
+      try { player?.stop(); } catch { /* already finished */ }
+      player = null;
+      if (active) {
+        const done = active;
+        active = null;
+        done();
+      }
+    };
+    const fetchAudio = (sentence) => {
+      const audio = host.synthesize(sentence).then((wav) => context.decodeAudioData(wav));
+      audio.catch(() => {});  // a failure matters only if this sentence is reached
+      return audio;
+    };
+    const play = (buffer) => new Promise((resolve) => {
+      const node = context.createBufferSource();
+      node.buffer = buffer;
+      node.playbackRate.value = host.speed?.() ?? 1;
+      node.connect(context.destination);
+      node.onended = resolve;
+      player = node;
+      node.start();
+    });
+
+    return {
+      get speaking() { return active !== null; },
+      stop,
+      async speak(text, done = () => {}) {
+        stop();
+        const mine = turn;
+        active = done;
+        try {
+          context ??= new AudioContext();
+          await context.resume();
+          const sentences = new SentenceFeed().feed(text, true);
+          let next = sentences.length ? fetchAudio(sentences[0]) : null;
+          for (let i = 0; i < sentences.length; i++) {
+            const buffer = await next;
+            if (mine !== turn) return;
+            next = i + 1 < sentences.length ? fetchAudio(sentences[i + 1]) : null;
+            await play(buffer);
+            if (mine !== turn) return;
+          }
+        } catch (error) {
+          if (mine === turn) host.error?.(error.message);
+        }
+        finish(mine);
+      },
+    };
+  }
+
+  window.GufoTalk = { speakable, SentenceFeed, Vad, downsample, encodeWav, rmsOf, VOICE_NOTE, create, createReader };
 })();

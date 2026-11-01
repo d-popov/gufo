@@ -22,6 +22,9 @@ select:focus-visible, textarea:focus-visible, .button:focus-visible { outline: 2
 .message img { display: block; max-width: min(100%, 320px); max-height: 240px; object-fit: contain; margin-top: var(--space-2); border-radius: var(--radius-sm); }
 .message .meta { margin-top: var(--space-2); padding-top: var(--space-2); border-top: 1px solid var(--line); color: var(--muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: normal; }
 .message .live { color: var(--muted); }
+.message .speak { display: inline-flex; align-items: center; justify-content: center; margin-top: var(--space-2); padding: 2px 8px; min-height: 26px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.message .speak:hover, .message .speak.reading { color: var(--accent); }
+.message .speak svg { width: 16px; height: 16px; display: block; margin: 0; }
 .message .md { white-space: normal; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
