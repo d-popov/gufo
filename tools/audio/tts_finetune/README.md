@@ -46,3 +46,10 @@ exports a checkpoint on demand.
 `--weights fp32` keeps small updates that a learning rate of 2e-6 would lose in bf16 weights (the
 official script trains bf16 weights); compute is bf16 either way. `--attn sdpa` is the default because
 `flash_attention_2` is not built for this GPU.
+
+**A new language is not validated.** The upstream script handles one speaker and gives the model no
+language tag for it. A community thread ([QwenLM/Qwen3-TTS#323](https://github.com/QwenLM/Qwen3-TTS/issues/323))
+reports a Bengali fine-tune that kept a Hindi accent and suggests registering a codec language ID in
+`config.json` and training with it; its author had not tried that, and the 20+ hours of data it advises is
+that commenter's rule of thumb. Neither is tested here. Start with a small pilot (a few hours of clean
+audio, one or two epochs, `--max-steps`) and listen before committing days of GPU time.
