@@ -59,6 +59,9 @@ details.thinking div { margin-top: 6px; }
 #model { max-width: 220px; }
 #status { margin-left: auto; min-height: 1.2em; color: var(--muted); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
 #send { min-width: 84px; }
+.talk-options { display: inline-flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.talk-options[hidden] { display: none; }
+.speech-models { color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 #talk.talking { background: var(--accent); color: var(--surface); border-color: var(--accent); }
 #talk.talking[aria-pressed=true]::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: currentColor; animation: talk-pulse 1.2s ease-in-out infinite; }
 @keyframes talk-pulse { 50% { opacity: .25; } }

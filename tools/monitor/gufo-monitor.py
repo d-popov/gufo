@@ -791,6 +791,21 @@ class VoiceServices:
                 self._models[base] = ""
         return self._models[base] or None
 
+    def info(self, key: str | None) -> dict:
+        """The models behind talk mode and the voices the speech model offers: what the chat
+        page shows and lets the admin pick. A server that does not answer leaves its field empty."""
+        voices: list[str] = []
+        request = urllib.request.Request(self.tts + "/v1/audio/voices", headers=self._headers(key))
+        status, body, _ = self._open(request, 5.0)
+        try:
+            if status == 200:
+                voices = [v["id"] for v in json.loads(body)["data"] if isinstance(v.get("id"), str)]
+        except (ValueError, LookupError, TypeError):
+            voices = []
+        default = self.voice if self.voice in voices else (voices[0] if voices else None)
+        return {"asr": self._model(self.asr, key), "tts": self._model(self.tts, key),
+                "voices": voices, "voice": default}
+
     def transcribe(self, wav: bytes, key: str | None) -> tuple[int, bytes, str]:
         """POST an utterance (a WAV file) to the ASR server; its JSON answer has "text"."""
         model = self._model(self.asr, key)
@@ -2562,6 +2577,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if upstream is not None:
                 upstream.close()
 
+    def _voice_info(self):
+        """GET /api/chat/voice: the speech models and voices of talk mode, for the admin's chat."""
+        if self.server.voice is None:
+            return self._error(404, "talk mode is not configured (--asr-url and --tts-url)")
+        if not self._admin():
+            return self._error(401, "unauthorized")
+        self._json(200, json.dumps(self.server.voice.info(self.server.chat_key)).encode())
+
     def _voice_route(self, kind: str):
         """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
         and answers {"text"}; POST /api/chat/speak takes {"text", "voice"?} and answers a WAV
@@ -2780,6 +2803,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._run_route("GET")
         if path == "/api/chat/sync":
             return self._sync_route("GET")
+        if path == "/api/chat/voice":
+            return self._voice_info()
         until = self._admin_until()
         if until is None:
             if path in ("/chat", "/api/chat/models") and self._chat_user() is not None:

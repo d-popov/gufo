@@ -658,6 +658,8 @@ class FakeSpeech(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/v1/audio/voices":
+            return self._reply(200, b'{"data":[{"id":"aiden"},{"id":"ryan"}]}', "application/json")
         self._reply(200, b'{"data":[{"id":"fake-speech"}]}', "application/json")
 
     def do_POST(self):
@@ -756,6 +758,31 @@ class TalkModeTest(unittest.TestCase):
         self.assertEqual(json.loads(data)["error"]["message"], "model not allowed")
         down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
         self.assertEqual(self.call(down, "/api/chat/transcribe", self.WAV, "audio/wav")[0], 502)
+
+    def get_voice(self, port, admin=True):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request("GET", "/api/chat/voice", headers={"X-Admin-Token": ADMIN_TOKEN} if admin else {})
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def test_the_chat_learns_which_models_and_voices_talk_mode_has(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        status, data = self.get_voice(port)
+        self.assertEqual((status, json.loads(data)), (200, {
+            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan"}))
+        self.assertEqual(FakeSpeech.seen, [])
+        self.assertEqual(self.get_voice(port, admin=False)[0], 401)
+        # A configured voice the server lacks is not offered as the default.
+        other = self.serve(gm.VoiceServices(self.url, self.url, voice="nobody"))
+        self.assertEqual(json.loads(self.get_voice(other)[1])["voice"], "aiden")
+        self.assertEqual(self.get_voice(self.serve(None))[0], 404)
+        # Speech servers that do not answer leave the lists empty rather than failing the page.
+        down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
+        status, data = self.get_voice(down)
+        self.assertEqual((status, json.loads(data)),
+                         (200, {"asr": None, "tts": None, "voices": [], "voice": None}))
 
     def test_the_options_come_as_a_pair(self):
         args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2", "--tts-voice", "ryan"])

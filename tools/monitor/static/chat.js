@@ -3,6 +3,8 @@
 const OLD_STORAGE_KEY = 'gufo-chat-histories-v1';  // the last 10 chats of the first version, moved to the store
 const SCOPE_KEY = 'gufo-chat-project';
 const EFFORT_KEY = 'gufo-chat-effort';
+const VOICE_KEY = 'gufo-chat-voice';
+const SPEED_KEY = 'gufo-chat-speed';
 const BROWSER_KEY = 'gufo-chat-browser';
 const TOOLS_KEY = 'gufo-chat-tools';
 const MODEL_KEY = 'gufo-chat-model';
@@ -1306,6 +1308,7 @@ function talkController() {
   return window.GufoTalk.create({
     ask: (text) => { $('prompt').value = text; if (busy) queueSteer(); else send(); },
     stopReply: () => controller?.abort(),
+    speed: () => Number($('voice-speed').value) || 1,
     transcribe: async (wav) => {
       const response = await fetch('/api/chat/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav });
       if (!response.ok) throw await speechError(response);
@@ -1313,7 +1316,8 @@ function talkController() {
     },
     synthesize: async (text) => {
       const response = await fetch('/api/chat/speak', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, ...($('voice').value ? { voice: $('voice').value } : {}) }),
       });
       if (!response.ok) throw await speechError(response);
       return response.arrayBuffer();
@@ -1330,6 +1334,41 @@ function talkController() {
     },
   });
 }
+
+// The speech models and voices the monitor reports: shown beside the Talk button, and the voice
+// and speed chosen here are kept for the next visit.
+let voiceInfoLoaded = false;
+async function loadVoiceInfo() {
+  if (voiceInfoLoaded) return;
+  try {
+    const response = await fetch('/api/chat/voice');
+    if (!response.ok) throw await speechError(response);
+    const info = await response.json();
+    const select = $('voice');
+    select.replaceChildren(...info.voices.map((name) => {
+      const option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      return option;
+    }));
+    const saved = localStorage.getItem(VOICE_KEY);
+    const pick = [saved, info.voice].find((name) => name && info.voices.includes(name));
+    if (pick) select.value = pick;
+    const speed = localStorage.getItem(SPEED_KEY);
+    if ([...$('voice-speed').options].some((option) => option.value === speed)) $('voice-speed').value = speed;
+    const parts = [];
+    if (info.asr) parts.push(`Listening: ${info.asr}`);
+    if (info.tts) parts.push(`Speaking: ${info.tts}`);
+    $('speech-models').textContent = parts.length ? parts.join(' · ') : 'Speech servers are not answering';
+    $('talk-options').hidden = false;
+    voiceInfoLoaded = true;
+  } catch (error) {
+    $('speech-models').textContent = error.message;
+    $('talk-options').hidden = false;
+  }
+}
+$('voice').addEventListener('change', () => localStorage.setItem(VOICE_KEY, $('voice').value));
+$('voice-speed').addEventListener('change', () => localStorage.setItem(SPEED_KEY, $('voice-speed').value));
 
 $('talk').addEventListener('click', async () => {
   talk ??= talkController();
@@ -1446,6 +1485,7 @@ async function loadModels() {
     libraryAvailable = data.library === true;
     talkAvailable = data.talk === true && Boolean(window.GufoTalk);
     $('talk').hidden = !talkAvailable;
+    if (talkAvailable) loadVoiceInfo();
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');

@@ -74,8 +74,12 @@ and 1236, with the text server's key file) and start the monitor with
 `--chat-key-file`. Only Qwen3-ASR 1.7B and Qwen3-TTS 12Hz 1.7B (BF16 safetensors) work: Gufo does not load the audio
 GGUFs of other tools. TTS speaks Chinese, English, German, Italian, Portuguese, Spanish, Japanese, Korean, French and
 Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them. The page
-needs a secure context for the microphone (`localhost` or https). Routes: `POST /api/chat/transcribe` (a WAV body)
-and `POST /api/chat/speak` (`{text, voice?}` answers a WAV). `static/talk.js` holds the logic.
+needs a secure context for the microphone (`localhost` or https). Beside the button the chat shows the speech models it
+uses (`Listening: …`, `Speaking: …`) and two controls: **Voice**, from the voices the speech server lists, and
+**Speed** (Slow, Normal, Fast, Faster). Both are kept in the browser. The server speaks at 1.0 only, so speed is
+playback rate and the pitch moves a little with it. Routes: `GET /api/chat/voice` (models and voices),
+`POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak` (`{text, voice?}` answers a WAV).
+`static/talk.js` holds the logic.
 
 **Projects.** The first box in the toolbar picks a project: a folder of chats that share two
 plain Markdown notes, both editable in the **Project** panel.

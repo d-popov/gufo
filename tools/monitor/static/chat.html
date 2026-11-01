@@ -94,6 +94,20 @@
         </div>
         <button id="talk" type="button" class="secondary" aria-pressed="false" hidden
                 title="Talk with the model: it listens, answers aloud, and listens again">Talk</button>
+        <span id="talk-options" class="talk-options" hidden>
+          <label class="effort" title="The voice that reads replies aloud">Voice
+            <select id="voice" aria-label="Voice"></select>
+          </label>
+          <label class="effort" title="How fast replies are spoken; the pitch moves a little with it">Speed
+            <select id="voice-speed" aria-label="Speaking speed">
+              <option value="0.8">Slow</option>
+              <option value="1" selected>Normal</option>
+              <option value="1.25">Fast</option>
+              <option value="1.5">Faster</option>
+            </select>
+          </label>
+          <span id="speech-models" class="speech-models"></span>
+        </span>
         <span id="status" role="status"></span>
         <button id="send" type="submit">Send</button>
       </div>
