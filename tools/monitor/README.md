@@ -58,6 +58,11 @@ and the generation; a run nobody has read for three minutes is stopped too, and 
 readable for ten (kept in the monitor's memory only, for the user who started it). **Delete** removes the open chat,
 after a second click to confirm. Image bytes are not kept. A project's Export still downloads its notes as a file.
 
+**Markdown.** Replies are shown formatted: headings, bold, italics, strikethrough, inline code and fenced
+code blocks, links, bullet and numbered lists (nested), quotes, rules and tables. Only `http`, `https`
+and `mailto` links are made; an image becomes a link, since the page loads no pictures a model names;
+raw HTML shows as text. Your own messages and errors stay as typed (`static/markdown.js`).
+
 **Projects.** The first box in the toolbar picks a project: a folder of chats that share two
 plain Markdown notes, both editable in the **Project** panel.
 
@@ -119,6 +124,50 @@ with a policy of its own, `default-src 'none'; connect-src 'none'`, so the model
 no network (not `fetch`, `XMLHttpRequest`, `WebSocket` or the prototype's `fetch`), no
 cookies or storage of the monitor, and no files of the host. The page hands it the runtime's
 files, which only signed-in chat users can download. Figures are not kept after a reload.
+
+## Library
+
+A private library of Markdown pages, kept on this server in `--library-dir` (default
+`~/.config/gufo-monitor/library`): `pages/*.md` are the truth (plain files, front matter, wiki
+links `[[slug|text]]` that Obsidian reads too), `sources/` keeps the original PDFs and texts,
+and `index.sqlite` is a cache rebuilt from the pages (SQLite FTS5, BM25 over sections, plus the
+link graph). Edit pages by hand or with `PUT /api/library/pages/SLUG`; the index follows within
+two seconds.
+
+**Building it (admin).** The **Library** panel of `/monitor`, or `POST /api/library/ingest`
+with `{"text": …}` or `{"pdf_base64": …}` and optional `title`, `filename`, `tags` and `digest`,
+files a document and answers `{"job": ID}`; `GET /api/library/jobs/ID` shows the log and result.
+The same document (by hash) replaces itself. With `digest` (the default) the model, with the
+admin's chat key and model, reads up to 6 windows of 20 000 characters and returns a title, a
+summary, tags and up to 12 concepts per window; each concept becomes a page of its own (or gains
+the new source in its `## Sources` list when a concept page already answers to the name). A model
+that cannot answer only costs the digest: the document is filed anyway. PDF text comes from
+poppler's `pdftotext`, which must be installed; a scanned PDF has no text layer and is refused.
+
+**Linking.** Every added or saved page has its plain mentions of other pages' titles and aliases
+turned into links (first mention per page; never inside code, headings, links or addresses), and
+every other page that mentions its names gets the link too. A name two pages answer to is not
+linked. `POST /api/library/relink` re-links the whole library; deleting a page turns the links to
+it back into text.
+
+**Reading.** `GET /api/library/search?q=` (every word first, any word if none has all),
+`GET /api/library/pages[?kind=]`, `GET /api/library/pages/SLUG?offset=&limit=` with the page's
+links and backlinks. In the chat, the Tools menu has **Library search** and **Library pages**
+(admin only); the page calls `POST /api/library/call` with its session, so the model never
+sees a token. A tool call is shown in the thread like any other and the system note tells the
+model to keep library text out of web searches and URLs.
+
+**MCP.** `POST /mcp` is a Streamable HTTP MCP server (stateless, JSON responses) with the tools
+`search_library`, `read_library` and `list_library`, running the same code as the routes above.
+It takes only the **library token**, shown in the panel (`GET /api/library/token`): a read-only
+bearer derived from the admin token that opens `/mcp` and the library's read routes and nothing
+else, so a client never holds the admin token or an inference key. It changes when the admin
+token does. A request with a foreign `Origin` is refused.
+
+**Privacy.** The files and index stay on this server. What a tool returns goes to the model
+that is answering (the local Gufo, unless you point the chat elsewhere), and a model that is
+also allowed web tools could copy private text into a search query: untick the web tools for
+library chats when that matters. Library text is untrusted data to the model, like web pages.
 
 ## Run
 
@@ -696,4 +745,7 @@ node tests/tools/monitor_auth_test.js
 python3 tests/tools/monitor_test.py
 python3 tests/tools/billing_test.py
 python3 tests/tools/billing_chain_test.py
+python3 tests/tools/library_test.py
+node tests/tools/librarytools_test.js
+node tests/tools/markdown_test.js
 ```

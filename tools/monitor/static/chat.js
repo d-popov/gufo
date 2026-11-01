@@ -42,6 +42,7 @@ let controller = null;  // aborts the reply being made, and the page fetches it 
 const toolkit = (() => { try { return window.GufoTools.create(); } catch { return null; } })();
 let allowedTools = loadAllowedTools();  // what the user ticked in the Tools menu, kept between visits
 let pythonInstalled = false;            // set by loadModels: is the Python runtime on the monitor?
+let libraryAvailable = false;           // set by loadModels: does this account have a library (the admin, on a monitor that keeps one)?
 
 // ---------------------------------------------------------------- history (this browser, kept in step with the monitor)
 
@@ -658,8 +659,15 @@ function fillMessage(block, message) {
   const text = document.createElement('div');
   const waiting = message.pending && !message.content && !message.reasoning;
   if (waiting) text.className = 'live';
-  text.textContent = waiting ? 'Waiting for the model…'
+  const shown = waiting ? 'Waiting for the model…'
     : message.content || (message.hadImages ? '[Image attached; image bytes are not retained after reload]' : '');
+  // Replies are Markdown; what you typed, an error and the placeholders stay as written.
+  if (message.role === 'assistant' && !message.error && !waiting && message.content && window.GufoMarkdown) {
+    text.className = 'md';
+    text.append(window.GufoMarkdown.render(shown));
+  } else {
+    text.textContent = shown;
+  }
   block.append(text);
   for (const image of message.images ?? []) {
     const img = document.createElement('img');
@@ -1290,6 +1298,7 @@ function selectedTools() {
   if (!toolkit) return new Set();
   const ids = new Set(allowedTools);
   if (!pythonInstalled) ids.delete('run_python');
+  if (!libraryAvailable) for (const id of ['search_library', 'read_library']) ids.delete(id);
   return ids;
 }
 
@@ -1303,7 +1312,8 @@ function renderToolsMenu() {
   const menu = $('tools-menu');
   menu.replaceChildren();
   for (const tool of toolkit ? window.GufoTools.CATALOG : []) {
-    const missing = tool.id === 'run_python' && !pythonInstalled;
+    const library = tool.id === 'search_library' || tool.id === 'read_library';
+    const missing = (tool.id === 'run_python' && !pythonInstalled) || (library && !libraryAvailable);
     const option = document.createElement('label');
     option.className = `tool-option${missing ? ' off' : ''}`;
     const box = document.createElement('input');
@@ -1316,7 +1326,8 @@ function renderToolsMenu() {
     name.textContent = tool.name;
     const hint = document.createElement('span');
     hint.className = 'hint';
-    hint.textContent = missing ? 'Not installed on the monitor: run tools/monitor/fetch-pyodide.py' : tool.hint;
+    hint.textContent = !missing ? tool.hint
+      : library ? 'Only the admin has a library.' : 'Not installed on the monitor: run tools/monitor/fetch-pyodide.py';
     option.append(box, name, hint);
     menu.append(option);
   }
@@ -1373,6 +1384,7 @@ async function loadModels() {
     prices = data.pricing;
     billed = data.billed;
     pythonInstalled = Boolean(data.python);
+    libraryAvailable = data.library === true;
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');

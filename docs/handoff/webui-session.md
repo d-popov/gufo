@@ -2,7 +2,7 @@
 
 Code: `tools/monitor/` (`gufo-monitor.py`, stdlib-only Python 3.10+, and `static/*`), README in the same folder.
 Tests: `tests/tools/monitor_test.py` (run `cd tests/tools && python3 -m unittest monitor_test`, 71 tests) and Node
-tests `node tests/tools/{projects,chatstore,chatsync,tools,webtools,pybox,monitor_auth,monitor_icons}_test.js`.
+tests `node tests/tools/{projects,markdown,chatstore,chatsync,tools,webtools,pybox,monitor_auth,monitor_icons}_test.js`.
 Live: `~/.local/bin/gufo-monitor` -> `gufo-monitor.service` (user unit, port 8099, public as `ai-ui.d-popov.com`).
 Admin token `~/.config/gufo-monitor/admin-token`; billing config `~/.config/gufo-monitor/billing.json`.
 Launcher flags added: `--chat-key-file` (owner key), `--chat-model qwen3.8-flash-next-sub`; new `--chat-store`
@@ -47,6 +47,16 @@ Launcher flags added: `--chat-key-file` (owner key), `--chat-model qwen3.8-flash
 - **Model list robustness**: `_poll_info` keeps the last list on a refused/failed `/v1/models` and re-polls every poll
   while empty; the chat loads models first, retries every 5 s, and degrades if `projects.js`/`chatstore.js` are missing.
 - Default chat model via `--chat-model`; the user's pick is remembered in localStorage.
+- **Private library** (not yet committed or restarted into the live service): `library.py` (Markdown pages + SQLite FTS5/BM25
+  index + link graph, ingest/digest jobs, auto-linking both ways), `library_mcp.py` (stateless Streamable HTTP MCP: `search_library`,
+  `read_library`, `list_library`), routes `/api/library/*` and `POST /mcp` in `gufo-monitor.py`, admin panel `static/libraryadmin.js`
+  (monitor page), chat tools `static/librarytools.js` (admin only, via `POST /api/library/call`). `--library-dir`, default
+  `~/.config/gufo-monitor/library`. The read-only **library token** (`glib-…`, HMAC of the admin token) is the only credential `/mcp`
+  accepts; the admin token and inference keys are never given to MCP clients. Tests: `tests/tools/library_test.py`,
+  `librarytools_test.js`. Verified on a scratch monitor (port 18097, not the live service) against the real Gufo and
+  `qwen3.8-flash-next-sub`: a Markdown text and a text-layer PDF digested in ~13 s each (summary, aliases, tags, 5 concept pages
+  each), cross-links in both directions, a third document linking back into an older page, and a real chat that searched,
+  read and cited library pages by slug (15 tool calls). A scanned PDF and a very long document were not tried. PDF needs `pdftotext`.
 - Earlier work in the same folder: Python (Pyodide) and web tools, API-key admin, credits portal.
 
 ## Known gaps / ideas
@@ -58,3 +68,5 @@ Launcher flags added: `--chat-key-file` (owner key), `--chat-model qwen3.8-flash
 - Chat sync stores messages only; image bytes are intentionally never stored.
 - Possible: server-pushed sync (SSE) instead of 45 s polling; more media sources (Openverse timed out from the shell);
   per-user storage view/delete in admin; mobile verification on a real device.
+- Library: no OCR for scanned PDFs; concepts come from the first 6x20k characters of a document; web tools and library tools can be
+  ticked together (the system note forbids copying library text into web queries, nothing enforces it); portal users have no library.

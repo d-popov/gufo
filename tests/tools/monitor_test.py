@@ -346,9 +346,9 @@ class MonitorHttpTest(unittest.TestCase):
             self.assertIn("connect-src 'self';", other.getheader("Content-Security-Policy"), path)
             self.assertIn("img-src 'self' data:;", other.getheader("Content-Security-Policy"), path)
             self.assertNotIn("media-src", other.getheader("Content-Security-Policy"), path)
-        scripts = [name for name in ("icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chatsync", "chat")
+        scripts = [name for name in ("icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "chat")
                    if f'src="/static/{name}.js"'.encode() in data]
-        self.assertEqual(scripts, ["icons", "webtools", "pybox", "tools", "header", "projects", "chatstore", "chatsync", "chat"])
+        self.assertEqual(scripts, ["icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "chat"])
         self.assertEqual([data.index(f'src="/static/{n}.js"'.encode()) for n in scripts],
                          sorted(data.index(f'src="/static/{n}.js"'.encode()) for n in scripts),
                          "tools.js and chat.js need the scripts they build on loaded first")
@@ -481,7 +481,7 @@ class MonitorHttpTest(unittest.TestCase):
             response, data = self.request("GET", "/api/chat/models", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(json.loads(data), {"models": ["fn", "fn-sub"], "pricing": None,
                                             "billed": False, "python": False, "default": None,
-                                            "owner": "admin", "sync": False})
+                                            "owner": "admin", "sync": False, "library": False})
 
     def test_chat_default_model_is_offered_only_when_served(self):
         try:
@@ -496,7 +496,7 @@ class MonitorHttpTest(unittest.TestCase):
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
                      "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
-                     "projects.js", "chatstore.js", "chatsync.js",
+                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js",
                      "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)

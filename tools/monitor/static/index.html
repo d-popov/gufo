@@ -12,6 +12,7 @@
   <script src="/static/icons.js" defer></script>
   <script src="/static/header.js" defer></script>
   <script src="/static/admin.js" defer></script>
+  <script src="/static/libraryadmin.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -250,6 +251,51 @@
               <th class="num">At credit</th><th>Delta check</th><th>Receiver</th><th>Tx</th>
             </tr>
           </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="admin-library-section" hidden>
+      <div class="section-head">
+        <h2 class="with-icon"><span data-icon="database"></span>Library</h2>
+        <span id="admin-library-count" class="muted"></span>
+      </div>
+      <p class="muted keys-note">Private Markdown pages the chat's library tools and MCP clients search. A new document is
+        digested, filed and linked: its mentions of existing pages become links, and so do mentions of it in them.
+        PDF needs poppler's <code>pdftotext</code> on this server; a scanned PDF has no text to read.</p>
+      <form id="admin-library-form" class="key-form">
+        <h3>Add a document</h3>
+        <label for="admin-library-file">PDF, Markdown or text file</label>
+        <input id="admin-library-file" type="file" accept=".pdf,.md,.markdown,.txt,application/pdf,text/markdown,text/plain">
+        <label for="admin-library-text">or paste text</label>
+        <textarea id="admin-library-text" rows="6" spellcheck="false"></textarea>
+        <label for="admin-library-title">Title (optional)</label>
+        <input id="admin-library-title" maxlength="120" autocomplete="off">
+        <label><input type="checkbox" id="admin-library-digest" checked> Let the model digest it (summary, tags, concept pages)</label>
+        <div class="form-actions">
+          <button type="submit" id="admin-library-submit" class="with-icon"><span data-icon="plus"></span>Add to library</button>
+          <span id="admin-library-state" class="muted" role="status"></span>
+        </div>
+      </form>
+      <p id="admin-library-error" class="bad" hidden></p>
+      <div id="admin-library-job" class="accounts-message" hidden><ul id="admin-library-log" class="verify-list"></ul></div>
+      <div class="inline-form">
+        <button type="button" id="admin-library-relink" class="with-icon"><span data-icon="refresh-cw"></span>Re-link all pages</button>
+        <button type="button" id="admin-library-show-token" class="with-icon"><span data-icon="link"></span>MCP address and token</button>
+      </div>
+      <div id="admin-library-secret" class="key-secret" hidden>
+        <p>MCP clients connect to this address (Streamable HTTP) and send the token as <code>Authorization: Bearer TOKEN</code>.
+          It reads the library and nothing else; it changes when the admin token does.</p>
+        <code id="admin-library-endpoint"></code>
+        <button type="button" id="admin-library-copy-endpoint" class="with-icon"><span data-icon="copy"></span>Copy address</button>
+        <code id="admin-library-token"></code>
+        <button type="button" id="admin-library-copy-token" class="with-icon"><span data-icon="copy"></span>Copy token</button>
+        <button type="button" id="admin-library-hide-token" class="link">Done</button>
+      </div>
+      <div class="table-wrap">
+        <table id="admin-library-pages" class="data" hidden>
+          <thead><tr><th>Page</th><th>Kind</th><th class="num">Characters</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>

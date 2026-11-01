@@ -977,6 +977,9 @@ window.GufoAdmin = (() => {
     init,
     load,
     renderKeys,
+    el,
+    request,
+    copy,
     get admin() { return keysAdmin; },
   };
 })();
