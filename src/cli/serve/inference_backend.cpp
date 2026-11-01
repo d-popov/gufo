@@ -2098,7 +2098,6 @@ public:
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
-
     }
   }
 
