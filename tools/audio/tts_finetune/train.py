@@ -9,8 +9,8 @@
 Stop it any time with Ctrl-C, SIGTERM or `status.py OUTPUT_DIR stop`: it finishes the optimizer step
 in hand, saves a checkpoint (weights, optimizer, data position, random state) and exits. Start it
 again with --resume auto to continue from there, at most one optimizer step behind. A second Ctrl-C
-exits at once without saving. Checkpoints are also written every --checkpoint-minutes and at every
-epoch's end, so a crash loses at most that long.
+exits at once without saving. A checkpoint is also written every --checkpoint-minutes, so a crash
+loses at most that long.
 
 OUTPUT_DIR/
   state.json       what the run is doing now (read by status.py)
@@ -59,7 +59,8 @@ def parse_args(argv=None):
     p.add_argument("--weights", default="fp32", choices=["fp32", "bf16"],
                    help="dtype of the weights being trained; fp32 keeps small updates (bf16 compute either way)")
     p.add_argument("--log-every", type=int, default=10, help="optimizer steps between progress lines")
-    p.add_argument("--checkpoint-minutes", type=float, default=30.0)
+    p.add_argument("--checkpoint-minutes", type=float, default=30.0,
+                   help="minutes between resume checkpoints (a save of the 1.7B model takes 15-75 s: 1-6%% of a 30-minute interval)")
     p.add_argument("--keep", type=int, default=2, help="resume checkpoints kept (each holds weights and optimizer)")
     p.add_argument("--resume", default="none", help="'auto' (newest in OUTPUT_DIR/ckpt), a checkpoint directory, or 'none'")
     p.add_argument("--export-every-epoch", action="store_true", help="also write checkpoint-epoch-N/ in the final layout")
@@ -237,10 +238,10 @@ def train_loop(accelerator, model, optimizer, dataset, collate, step_fn, args, r
                 save_checkpoint(accelerator, run, args.keep, dict(progress), speaker)
                 last_checkpoint = time.monotonic()
         # The epoch is complete (a resume at its very end lands here with nothing left to do).
+        # No checkpoint is forced here: writing 10-20 GB is worth doing on a timer, not at every
+        # epoch boundary, which for a small dataset comes every few seconds.
         progress["epoch"] = epoch + 1
         progress["step_in_epoch"] = 0
-        save_checkpoint(accelerator, run, args.keep, dict(progress), speaker)
-        last_checkpoint = time.monotonic()
         if export_epoch is not None:
             export_epoch(epoch, speaker)
     return "done", speaker

@@ -248,21 +248,28 @@ def main() -> None:
     parser.add_argument("--mixed-tokens", type=int, default=700)
     parser.add_argument("--prefill-words", type=int, default=4500, help="about 12k tokens")
     parser.add_argument("--lead-s", type=float, default=25.0, help="how long generators run before prefills start")
+    parser.add_argument("--phases", default="decode,prefill,mixed", help="which of decode, prefill and mixed to run")
+    parser.add_argument("--shapes", default="1x1,2x2,4x4,6x2,2x6",
+                        help="mixed runs as GENERATORSxPREFILLERS (those that fit --max-sessions)")
     parser.add_argument("--seed", type=int, default=7000)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     bench = Bench(args)
     bench.warm()
+    phases = set(args.phases.split(","))
     counts = [n for n in (1, 2, 4, 8) if n <= args.max_sessions]
-    for n in counts:
-        print("decode", json.dumps(bench.decode(n)), flush=True)
-    for n in counts:
-        print("prefill", json.dumps(bench.prefill(n)), flush=True)
-    shapes = [(1, 1), (2, 2), (4, 4), (6, 2), (2, 6)]
-    for g, p in shapes:
-        if g + p <= args.max_sessions:
-            print("mixed", json.dumps(bench.mixed(g, p)), flush=True)
+    if "decode" in phases:
+        for n in counts:
+            print("decode", json.dumps(bench.decode(n)), flush=True)
+    if "prefill" in phases:
+        for n in counts:
+            print("prefill", json.dumps(bench.prefill(n)), flush=True)
+    if "mixed" in phases:
+        for shape in args.shapes.split(","):
+            g, p = (int(x) for x in shape.split("x"))
+            if g + p <= args.max_sessions:
+                print("mixed", json.dumps(bench.mixed(g, p)), flush=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"args": {k: str(v) for k, v in vars(args).items()}, **bench.results}, indent=1))

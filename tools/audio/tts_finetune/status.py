@@ -82,7 +82,7 @@ def describe(out: Path) -> list[str]:
                      f"trained {clock(state.get('train_seconds'))}  remaining {clock(eta)}")
     lines.append(f"checkpoint {state.get('last_checkpoint', 'none yet')} ({ago(state.get('last_checkpoint_at'))})  "
                  f"samples seen {state.get('samples_seen', 0)}")
-    if (out / "STOP").exists():
+    if (out / "STOP").exists() and status in ("running", "saving"):
         lines.append("a stop was requested; it saves after the current step")
     if status.startswith("stopped"):
         lines.append("resume:  train.py ... --resume auto")

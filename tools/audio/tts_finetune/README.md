@@ -6,7 +6,7 @@ progress files and a progress viewer. Nothing here is part of Gufo's runtime.
 
 ```sh
 # once: upstream scripts, qwen-tts and its pinned dependencies beside Unsloth Studio's ROCm PyTorch,
-# and a Base model (0.6B for trials, 1.7B for the real thing)
+# and the 1.7B Base model (the upstream step fails on 0.6B: its text embedding is wider than its talker)
 tools/audio/tts_finetune/setup.sh ~/qwen3-tts-train 1.7B
 T=~/qwen3-tts-train
 
@@ -31,8 +31,10 @@ tools/audio/tts_finetune/status.py runs/bg1 history  # the loss curve
 **Stop and continue.** Ctrl-C, SIGTERM or `status.py ... stop` finishes the optimizer step in hand, saves
 a checkpoint and exits; run the same `train.py` command again (`--resume auto`) and it continues at the
 next step, with the same data order, optimizer state and random state. A second Ctrl-C quits without
-saving. A checkpoint is also written every `--checkpoint-minutes` (default 30) and at the end of every
-epoch, so a crash or power cut loses at most that long. `--max-steps N` stops after N optimizer steps,
+saving. A checkpoint is also written every `--checkpoint-minutes` (default 30), so a crash or power cut loses
+at most that long, and none at epoch boundaries. Writing the 22 GB of the 1.7B model took 13 s once and
+65-77 s on later saves in a short trial (disk-bound, each save also deletes an old one), so 30 minutes
+costs about 1-4% of the run; shorten it only for a flaky machine. `--max-steps N` stops after N optimizer steps,
 for trials. `tests/tools/tts_finetune_test.py` checks, on a toy model, that stopping after any step and
 resuming reaches exactly the weights of an uninterrupted run, with an epoch that does not divide into
 accumulation groups.

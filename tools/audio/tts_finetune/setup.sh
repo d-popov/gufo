@@ -3,7 +3,8 @@
 #   - the upstream finetuning scripts at a pinned commit (dataset.py, prepare_data.py)
 #   - qwen-tts and its pinned dependencies, installed beside (not into) Unsloth Studio's Python,
 #     which supplies the ROCm PyTorch. Use run.sh to run anything with both.
-#   - optionally a Base model: setup.sh [DIR] 0.6B|1.7B
+#   - optionally the 1.7B Base model: setup.sh [DIR] 1.7B  (the upstream step does not run on the 0.6B model:
+#     its text embedding is wider than its talker, and the script adds the two)
 set -eu
 DIR=${1:-$HOME/qwen3-tts-train}
 SIZE=${2:-}
@@ -16,13 +17,13 @@ fi
 git -C "$DIR/Qwen3-TTS" checkout -q "$PIN"
 # transformers and accelerate are pinned by qwen-tts; torch, torchaudio and friends come from Studio.
 "$PY" -m pip install -q --target "$DIR/deps" --no-deps qwen-tts==0.1.1 transformers==4.57.3 accelerate==1.12.0 \
-  tokenizers huggingface_hub sox onnxruntime einops
+  "tokenizers>=0.22.0,<=0.23.0" "huggingface_hub>=0.34.0,<1.0" sox onnxruntime einops
 case "$SIZE" in
   "") ;;
-  0.6B|1.7B)
-    hf download "Qwen/Qwen3-TTS-12Hz-$SIZE-Base" --local-dir "$DIR/Qwen3-TTS-12Hz-$SIZE-Base"
+  1.7B)
+    hf download "Qwen/Qwen3-TTS-12Hz-1.7B-Base" --local-dir "$DIR/Qwen3-TTS-12Hz-1.7B-Base"
     hf download Qwen/Qwen3-TTS-Tokenizer-12Hz --local-dir "$DIR/Qwen3-TTS-Tokenizer-12Hz" ;;
-  *) echo "size is 0.6B or 1.7B" >&2; exit 2 ;;
+  *) echo "the model is 1.7B" >&2; exit 2 ;;
 esac
 cat > "$DIR/run.sh" <<RUN
 #!/bin/sh
