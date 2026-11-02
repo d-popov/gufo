@@ -21,3 +21,12 @@ reports it), plus `*-plain.jsonl` without the prefix for `wer.py`. `wer.py` work
 Check the data's licence before publishing a model trained on it. FLEURS is CC-BY-4.0 (attribution required) and
 Common Voice is CC0. A dataset card's claim of permission (for instance for audio taken from video sites) is not
 something this tooling can verify.
+
+`export.py --checkpoint OUT/checkpoint-N --base Qwen3-ASR-1.7B --out DIR` turns a checkpoint into a model directory
+`gufo serve asr` loads: the trainer writes one `model.safetensors`, Gufo reads the released model's two shards, so the
+tensors are re-split along the base model's index (the tied output head, which the trainer saves once, is written again).
+Step 600 of 888 of the Bulgarian run scored WER 16.4% and CER 6.2% on the 150 FLEURS test clips the stock model scored
+58.7% and 19.8% on.
+
+Two things the upstream script does that cost time: it ignores `--save_steps` on a resumed run (the interval saved in the
+checkpoint wins), and resuming with another micro-batch size ends the run at once with no steps done.

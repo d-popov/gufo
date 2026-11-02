@@ -22,6 +22,7 @@ def load(name):
 
 
 wer = load("wer")
+export = load("export")
 try:
     import numpy
     import soundfile
@@ -49,6 +50,29 @@ class ErrorRateTest(unittest.TestCase):
     def test_insertions_and_an_empty_hypothesis_are_counted(self):
         self.assertEqual(wer.error_rates([("a b", "a b c d")])["wer"], 1.0)
         self.assertEqual(wer.error_rates([("a b", "")])["wer"], 1.0)
+
+
+class ExportTest(unittest.TestCase):
+    INDEX = {"thinker.model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+             "thinker.model.layers.0.w": "model-00001-of-00002.safetensors",
+             "thinker.audio_tower.w": "model-00002-of-00002.safetensors",
+             "thinker.lm_head.weight": "model-00002-of-00002.safetensors"}
+
+    def test_tensors_go_to_the_shards_the_base_models_index_names_and_a_tied_head_counts_as_present(self):
+        names = [n for n in self.INDEX if n != "thinker.lm_head.weight"]  # the trainer saves tied weights once
+        shards = export.split_by_index(names, self.INDEX)
+        self.assertEqual(sorted(shards["model-00001-of-00002.safetensors"]),
+                         ["thinker.model.embed_tokens.weight", "thinker.model.layers.0.w"])
+        self.assertEqual(sorted(shards["model-00002-of-00002.safetensors"]), ["thinker.audio_tower.w", "thinker.lm_head.weight"])
+
+    def test_a_checkpoint_that_does_not_match_the_base_model_is_refused(self):
+        names = [n for n in self.INDEX if n != "thinker.lm_head.weight"]
+        with self.assertRaises(SystemExit):
+            export.split_by_index(names[:-1], self.INDEX)                    # a tensor missing
+        with self.assertRaises(SystemExit):
+            export.split_by_index(names + ["thinker.surprise"], self.INDEX)  # one the base does not have
+        with self.assertRaises(SystemExit):
+            export.split_by_index([n for n in names if "embed" not in n], self.INDEX)  # no embedding to tie the head to
 
 
 @unittest.skipIf(prep is None, "numpy and soundfile are not installed")
