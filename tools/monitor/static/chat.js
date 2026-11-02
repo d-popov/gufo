@@ -803,13 +803,7 @@ function editMessage(message, block) {
     const images = message.images ?? [];
     if (busy || chat.shared || (!text && !images.length)) return;
     if (!$('model').value) { $('status').textContent = 'No served model yet; try again in a moment.'; return; }
-    const at = chat.messages.indexOf(message);
-    if (at < 0) return;
-    chat.messages.length = at;
-    $('prompt').value = text;
-    pendingImages = images;
-    renderPreview();
-    send();
+    send({ chat, message, text, images });
   };
   resend.addEventListener('click', submit);
   cancel.addEventListener('click', renderMessages);
@@ -1153,21 +1147,26 @@ function runLanguageCommand(chat, command) {
   say(command.auto ? 'The language will be detected again.' : `This chat now uses ${Lang.label(chat.language)}.`);
 }
 
-async function send() {
+// Sends the composer's text. With `edit` ({chat, message, text, images}) it resends an edited message instead: the
+// composer is left alone, and the message and everything below it go only once nothing can stop the new ask.
+async function send(edit = null) {
   // A memory update that is still running would be missed by this chat's first message.
   if (memoryJob) {
     $('status').textContent = 'Updating the project memory first…';
     await memoryJob.catch(() => {});
     $('status').textContent = '';
   }
-  const text = $('prompt').value.trim();
+  const text = edit ? edit.text : $('prompt').value.trim();
+  const images = edit ? edit.images : pendingImages;
   const model = $('model').value;
-  if (busy || active()?.shared || (!text && pendingImages.length === 0)) return;
+  if (busy || active()?.shared || (!text && images.length === 0)) return;
+  if (edit && (active() !== edit.chat || !edit.chat.messages.includes(edit.message))) return;  // the chat moved on while waiting
   if (!model) { $('status').textContent = 'No served model yet; try again in a moment.'; return; }
   if (!active()) newChat();
   const chat = active();
-  const command = Lang.parseCommand(text);
+  const command = edit ? null : Lang.parseCommand(text);
   if (command) { runLanguageCommand(chat, command); return; }
+  if (edit) chat.messages.length = chat.messages.indexOf(edit.message);
   clearTimeout(memoryTimer);
   const allowed = selectedTools();
   const owner = projectOf(chat);
@@ -1175,11 +1174,11 @@ async function send() {
   // the start of its prompt and force it to be read again.
   chat.memory ??= owner?.memory ?? '';
   // A spoken message brings the language the recognizer heard; it settles what the chat is in.
-  const spoken = heard && heard.text === text ? heard.language : null;
-  heard = null;
+  const spoken = !edit && heard && heard.text === text ? heard.language : null;
+  if (!edit) heard = null;
   if (spoken) chat.language = Lang.track(chat.language ?? Lang.EMPTY, spoken, text);
   renderLanguage();
-  chat.messages.push({ role: 'user', content: text, images: pendingImages, hadImages: pendingImages.length > 0,
+  chat.messages.push({ role: 'user', content: text, images, hadImages: images.length > 0,
     ...(spoken ? { language: spoken } : {}) });
   // Earlier tool steps stay in the thread but not in what is sent: the answers carry them.
   const note = allowed.size ? toolkit.note(allowed, new Date().toISOString().slice(0, 10)) : null;
@@ -1191,10 +1190,12 @@ async function send() {
     ...(chat.language?.spoken ? { language: chat.language.spoken } : {}) };
   chat.messages.push(reply);
   if (chat.title === 'New chat') chat.title = text.slice(0, 48) || 'Image chat';
-  $('prompt').value = '';
-  autosize();
-  pendingImages = [];
-  renderPreview();
+  if (!edit) {
+    $('prompt').value = '';
+    autosize();
+    pendingImages = [];
+    renderPreview();
+  }
   renderMessages();
   let block = $('messages').lastElementChild;
   updateHistory(chat);
