@@ -237,6 +237,11 @@ class NoTelemetry:
         return {}
 
 
+def has_script(page: bytes, name: str) -> bool:
+    """Whether the page loads /static/NAME, which pages name with a ?v= version."""
+    return re.search(rb'src="/static/' + re.escape(name.encode()) + rb'(\?v=\d+)?"', page) is not None
+
+
 def serve(server):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -313,13 +318,13 @@ class MonitorHttpTest(unittest.TestCase):
     def test_one_listener_serves_portal_and_monitor_pages(self):
         response, data = self.request("GET", "/")
         self.assertEqual(response.status, 200)  # the public portal page
-        self.assertIn(b'src="/static/portal.js"', data)
+        self.assertTrue(has_script(data, "portal.js"))
         self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
         self.assertNotIn(b"<script>", data)
         response, data = self.request("GET", "/monitor", {"X-Admin-Token": ADMIN_TOKEN})
         self.assertEqual(response.status, 200)
-        self.assertIn(b'src="/static/app.js"', data)
-        self.assertIn(b'src="/static/admin.js"', data)
+        self.assertTrue(has_script(data, "app.js"))
+        self.assertTrue(has_script(data, "admin.js"))
         self.assertNotIn(b"<script>", data)
 
         # Without --billing-config the portal API is absent, not the monitor's.
@@ -359,10 +364,10 @@ class MonitorHttpTest(unittest.TestCase):
             self.assertIn("img-src 'self' data:;", other.getheader("Content-Security-Policy"), path)
             self.assertNotIn("media-src", other.getheader("Content-Security-Policy"), path)
         scripts = [name for name in ("icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "talk", "chat")
-                   if f'src="/static/{name}.js"'.encode() in data]
+                   if has_script(data, f"{name}.js")]
         self.assertEqual(scripts, ["icons", "librarytools", "webtools", "pybox", "tools", "header", "projects", "markdown", "chatstore", "chatsync", "talk", "chat"])
-        self.assertEqual([data.index(f'src="/static/{n}.js"'.encode()) for n in scripts],
-                         sorted(data.index(f'src="/static/{n}.js"'.encode()) for n in scripts),
+        position = lambda n: data.index(f'src="/static/{n}.js'.encode())  # noqa: E731  (a ?v= version may follow)
+        self.assertEqual([position(n) for n in scripts], sorted(position(n) for n in scripts),
                          "tools.js and chat.js need the scripts they build on loaded first")
 
         payload = {
@@ -841,6 +846,30 @@ class TalkModeTest(unittest.TestCase):
                                     "application/json")
         self.assertEqual(status, 400)
 
+    def test_voices_of_a_language_server_are_listed_and_a_chosen_one_speaks_on_its_own_server(self):
+        other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
+        self.addCleanup(lambda: (other.shutdown(), other.server_close()))
+        routed = f"http://127.0.0.1:{other.server_address[1]}"
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan", routes={"bulgarian": routed}))
+        info = json.loads(self.get_voice(port)[1])
+        self.assertEqual(info["voices"], ["aiden", "ryan"])
+        self.assertEqual(info["routed"], [{"voice": "plamen", "language": "bulgarian"}])
+        self.assertEqual(self.put_prefs(port, {"voice": "plamen", "speed": 1})[0], 200)
+        self.assertEqual(self.put_prefs(port, {"voice": "nobody", "speed": 1})[0], 400)
+        # Chosen by name, it speaks every reply, English ones too, on its own server; others keep their language routing.
+        FakeSpeechTwo.seen.clear()
+        FakeSpeech.seen.clear()
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"plamen","language":"english"}', "application/json")
+        self.assertEqual((len(FakeSpeechTwo.seen), len(FakeSpeech.seen)), (1, 0))
+        self.assertEqual(json.loads(FakeSpeechTwo.seen[-1][3])["voice"], "plamen")
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"aiden","language":"english"}', "application/json")
+        self.assertEqual((len(FakeSpeechTwo.seen), len(FakeSpeech.seen)), (1, 1))
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"aiden","language":"bulgarian"}', "application/json")
+        self.assertEqual(len(FakeSpeechTwo.seen), 2)
+        # A language server that is down is simply not listed.
+        down = self.serve(gm.VoiceServices(self.url, self.url, routes={"bulgarian": "http://127.0.0.1:9"}))
+        self.assertEqual(json.loads(self.get_voice(down)[1])["routed"], [])
+
     def test_a_reply_is_spoken_by_the_server_that_speaks_its_language(self):
         # A second server holds a model fine-tuned for one language; the rest go to the first.
         other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
@@ -895,7 +924,7 @@ class TalkModeTest(unittest.TestCase):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         status, data = self.get_voice(port)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan", "design": False,
+            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan", "routed": [], "design": False,
             "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
         self.assertEqual(FakeSpeech.seen, [])
         self.assertEqual(self.get_voice(port, admin=False)[0], 401)
@@ -907,7 +936,7 @@ class TalkModeTest(unittest.TestCase):
         down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
         status, data = self.get_voice(down)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": None, "tts": None, "voices": [], "voice": None, "design": False,
+            "asr": None, "tts": None, "voices": [], "voice": None, "routed": [], "design": False,
             "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
 
     def put_prefs(self, port, body, admin=True):
@@ -1629,7 +1658,7 @@ class KeyAdminHttpTest(unittest.TestCase):
         # Path=/: the browser sends the one cookie to the page and to /api/.
         response, data = self.request("GET", "/monitor", admin)
         self.assertEqual(response.status, 200)
-        self.assertIn(b'src="/static/app.js"', data)
+        self.assertTrue(has_script(data, "app.js"))
         self.assertNotIn(b"data-monitor-signout", data)
         for path in ("/api/state", "/api/keys"):
             response, _ = self.request("GET", path, admin)

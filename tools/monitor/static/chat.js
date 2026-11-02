@@ -1386,7 +1386,9 @@ async function speechError(response) {
 }
 
 // One piece of text as a WAV file, in the voice chosen on the voice settings page.
-async function synthesizeSpeech(text, language) {
+async function synthesizeSpeech(text, spoken) {
+  // What the text itself is written in beats what the chat last heard.
+  const language = Lang.textLanguage?.(text) ?? spoken;
   const response = await fetch('/api/chat/speak', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}),

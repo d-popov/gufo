@@ -883,13 +883,31 @@ class VoiceServices:
             pass
         return []
 
+    def _routed_voices(self, key: str | None) -> list[dict]:
+        """The voices of the language-specific servers, [{"voice", "language"}], for those that answer."""
+        found = []
+        for language, base in self.routes.items():
+            for name in self._voices(base, key):
+                found.append({"voice": name, "language": language})
+        return found
+
+    def _voice_server(self, name: str | None, key: str | None) -> str | None:
+        """The language-specific server that offers the voice NAME, if one does: a voice chosen by name speaks on
+        its own server, whatever language the reply is in."""
+        if not name or not self.routes:
+            return None
+        for language, base in self.routes.items():
+            if name in self._voices(base, key):
+                return base
+        return None
+
     def info(self, key: str | None) -> dict:
         """The models behind talk mode and the voices the speech model offers: what the chat
         page shows and lets the admin pick. A server that does not answer leaves its field empty."""
         voices = self._voices(self.tts, key)
         default = self.voice if self.voice in voices else (voices[0] if voices else None)
         return {"asr": self._model(self.asr, key), "tts": self._model(self.tts, key),
-                "voices": voices, "voice": default,
+                "voices": voices, "voice": default, "routed": self._routed_voices(key),
                 "design": bool(self.design and self._model(self.design, key))}
 
     def transcribe(self, wav: bytes, key: str | None) -> tuple[int, bytes, str]:
@@ -946,7 +964,7 @@ class VoiceServices:
         server speaks with the chosen voice if it has it, else with its first."""
         if (voice or self.voice) == DESIGN_VOICE:
             return self._design(text, key, language, instructions)
-        base = self.routes.get(language or "", self.tts)
+        base = self._voice_server(voice or self.voice, key) or self.routes.get(language or "", self.tts)
         payload = {"input": text, "response_format": "wav"}
         model = self._model(base, key)
         if model:
@@ -2941,7 +2959,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if name == DESIGN_VOICE:
             if not offered["design"]:
                 return self._error(400, "no VoiceDesign server is answering (--tts-design-url)")
-        elif name is not None and offered["voices"] and name not in offered["voices"]:
+        elif (name is not None and offered["voices"]
+              and name not in offered["voices"] + [r["voice"] for r in offered["routed"]]):
             return self._error(400, "the speech server has no such voice")
         avatar = body.get("avatar")
         if avatar is not None and not isinstance(avatar, bool):

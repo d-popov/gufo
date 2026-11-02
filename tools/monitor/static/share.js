@@ -188,7 +188,8 @@ async function refreshInfo() {
 
 const speakBody = (text, lang) => JSON.stringify({ text, ...(lang ? { language: lang } : {}) });
 
-async function synthesize(text, lang) {
+async function synthesize(text, spoken) {
+  const lang = Lang.textLanguage(text) ?? spoken;
   const response = await fetch(`${API}/speak`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: speakBody(text, lang) });
   if (!response.ok) throw new Error(await failure(response));
   return response.arrayBuffer();

@@ -36,6 +36,18 @@ async function load() {
     option.textContent = name;
     return option;
   }));
+  // Voices of the language-specific servers, grouped by language: one chosen here speaks every reply on its own server.
+  for (const language of [...new Set((info.routed ?? []).map((r) => r.language))]) {
+    const group = document.createElement('optgroup');
+    group.label = `${language[0].toUpperCase()}${language.slice(1)}`;
+    for (const { voice } of info.routed.filter((r) => r.language === language)) {
+      const option = document.createElement('option');
+      option.value = voice;
+      option.textContent = voice;
+      group.append(option);
+    }
+    $('voice').append(group);
+  }
   // With a VoiceDesign server there is one more choice: the voice the Voice instructions describe.
   if (info.design) {
     const option = document.createElement('option');
@@ -44,7 +56,7 @@ async function load() {
     $('voice').append(option);
   }
   const wanted = info.prefs.voice ?? info.voice;
-  if (info.voices.includes(wanted) || (info.design && wanted === 'designed')) $('voice').value = wanted;
+  if (info.voices.includes(wanted) || (info.routed ?? []).some((r) => r.voice === wanted) || (info.design && wanted === 'designed')) $('voice').value = wanted;
   // The option nearest the saved rate.
   const rates = [...$('speed').options].map((option) => Number(option.value));
   const nearest = rates.reduce((best, rate) => (Math.abs(rate - info.prefs.speed) < Math.abs(best - info.prefs.speed) ? rate : best));

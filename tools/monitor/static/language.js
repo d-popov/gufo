@@ -95,5 +95,26 @@
     return `${title(state.language)} (${state.declared.length ? 'chosen' : 'detected'})`;
   }
 
-  window.GufoLanguage = { EMPTY, track, parseCommand, declare, note, label, normalize };
+  // The language with a voice of its own that a text is written in, judged by its letters and a few telltale words, or
+  // null when that is not clear. Bulgarian is Cyrillic with the letter ъ or one of its own common words (това, ще,
+  // много, какво…), with none of the letters only Russian, Ukrainian, Belarusian or Macedonian use and none of
+  // Russian's own words (что, это, очень…). This picks the voice for a reply that was typed or whose language was never
+  // heard, so a Bulgarian sentence is not read by an English voice.
+  const BULGARIAN_WORDS = new Set(['това', 'съм', 'ще', 'много', 'какво', 'още', 'защото', 'който', 'която', 'което',
+    'нещо', 'няма', 'тук', 'мога', 'може', 'които', 'какво', 'здравей', 'благодаря', 'моля', 'добре', 'разбира']);
+  const RUSSIAN_WORDS = new Set(['что', 'это', 'очень', 'есть', 'был', 'была', 'было', 'быть', 'меня', 'тебя', 'нет',
+    'потому', 'который', 'которая', 'если', 'когда', 'сегодня', 'хорошо', 'спасибо', 'пожалуйста', 'привет', 'можно']);
+  function textLanguage(text) {
+    text = String(text ?? '');
+    const letters = text.match(/\p{L}/gu) ?? [];
+    if (letters.length < 4) return null;
+    const cyrillic = letters.filter((letter) => /\p{Script=Cyrillic}/u.test(letter)).length;
+    if (cyrillic / letters.length < 0.6) return null;
+    if (/[ыэёўіїєґѓќѕљњџ]/iu.test(text)) return null;
+    const words = text.toLowerCase().match(/[\p{L}]+/gu) ?? [];
+    if (words.some((word) => RUSSIAN_WORDS.has(word))) return null;
+    return /ъ/iu.test(text) || words.some((word) => BULGARIAN_WORDS.has(word)) ? 'bulgarian' : null;
+  }
+
+  window.GufoLanguage = { EMPTY, track, parseCommand, declare, note, label, normalize, textLanguage };
 })();
