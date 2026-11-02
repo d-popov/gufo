@@ -39,9 +39,10 @@
       <div id="chat-total" class="chat-total" title="Total for this chat"></div>
     </div>
     <section id="share-panel" class="project-panel" aria-label="Share this chat" hidden>
-      <p class="hint">Anyone with the link can chat with this server's model, speak to it and hear it answer, without signing in,
-        until the link expires, runs out of messages, or you revoke it on <a href="/shares">Shared chats</a>. They use your
-        model and your voice; they get nothing else of yours.</p>
+      <p class="hint">This chat becomes a room: everyone with the link sees the same conversation and can write in it, speak to it and
+        hear it answer, without signing in, until the link expires, runs out of messages, or you revoke it on
+        <a href="/shares">Shared chats</a>. They use your model and your voice. While it is shared the chat continues in the room, you
+        included.</p>
       <label class="field">Name
         <input id="share-title" type="text" maxlength="80" autocomplete="off">
       </label>
@@ -56,8 +57,6 @@
           <input id="share-audio" type="number" min="1" max="10000" value="400">
         </label>
       </div>
-      <label class="check"><input id="share-include" type="checkbox"> Start from this conversation (their copy; text only)</label>
-      <label class="check"><input id="share-log" type="checkbox" checked> Keep their messages so I can read them (their page says so)</label>
       <div class="row">
         <button id="share-create" type="button">Make link</button>
         <button id="share-close" type="button" class="secondary">Close</button>
@@ -107,6 +106,8 @@
               title="Hide the avatar (turn it back on in Voice settings)"></button>
       <div id="avatar-face"></div>
     </aside>
+    <p id="shared-banner" class="shared-banner" role="status" hidden>This chat is shared: it continues in the room, with everyone who has
+      the link. <a id="shared-open" href="#" target="_blank" rel="noopener">Open the room</a></p>
     <form id="composer">
       <div id="steer-queue" class="steer-queue" aria-live="polite" hidden></div>
       <div id="preview" class="preview" aria-live="polite"></div>

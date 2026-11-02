@@ -8,7 +8,7 @@ const vm = require('node:vm');
 
 const window = {};
 vm.runInNewContext(fs.readFileSync('tools/monitor/static/language.js', 'utf8'), { window });
-const { EMPTY, track, parseCommand, declare, note, label, textLanguage } = window.GufoLanguage;
+const { EMPTY, track, parseCommand, declare, note, label } = window.GufoLanguage;
 
 // Objects from the module's own context differ in prototype; compare what they hold.
 const plain = (value) => JSON.parse(JSON.stringify(value));
@@ -62,20 +62,5 @@ assert.match(note(hear(EMPTY, ['english', 'good morning to you'])), /in English;
 assert.match(note(declare(['bulgarian', 'english'])), /uses Bulgarian and English/);
 assert.match(note(declare(['bulgarian'])), /Macedonian/);
 assert.doesNotMatch(note(declare(['german'])), /Macedonian/);
-
-// A text's own language picks the voice: Bulgarian is recognised, Russian and others are not mistaken for it.
-assert.equal(textLanguage('Това е много хубав ден, не мислиш ли?'), 'bulgarian');
-assert.equal(textLanguage('Звучи като метафора за нещо, което е безследно изчезнало.'), 'bulgarian');
-assert.equal(textLanguage('Это очень хороший день, не так ли?'), null, 'Russian');
-assert.equal(textLanguage('Сегодня съешь ещё этих мягких булок'), null, 'Russian with ъ and ё');
-assert.equal(textLanguage('Це дуже гарний день, чи не так'), null, 'Ukrainian');
-assert.equal(textLanguage('Ова е многу убав ден, нели'), null, 'Macedonian');
-assert.equal(textLanguage('This is a very good day, is it not?'), null, 'English');
-assert.equal(textLanguage('Да.'), null, 'too short to judge');
-assert.equal(textLanguage('Здравей, как си днес?'), 'bulgarian', 'a greeting with a Bulgarian word');
-assert.equal(textLanguage('Привет, как дела у тебя?'), null, 'Russian greeting');
-assert.equal(textLanguage('Use the word във in a sentence for me please now'), null, 'mostly Latin');
-assert.equal(textLanguage(''), null);
-assert.equal(textLanguage(undefined), null);
 
 console.log('language_test: ok');

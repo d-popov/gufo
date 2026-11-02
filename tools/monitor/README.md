@@ -70,53 +70,39 @@ written, then listens again. Tap Talk while it thinks or speaks to interrupt; ta
 The microphone is ignored while a reply is thought out and spoken, so use it half-duplex; headphones are not needed.
 Run `gufo serve asr` and `gufo serve tts` (`~/.local/bin/gufo-speech` starts both in one container, on ports 1235
 and 1236, with the text server's key file) and start the monitor with
-`--asr-url http://127.0.0.1:1235 --tts-url http://127.0.0.1:1236 [--tts-voice ryan]`; the key is the admin's
+`--asr-url http://127.0.0.1:1235 --tts-url http://127.0.0.1:1236 [--tts-voice plamen]`; the key is the admin's
 `--chat-key-file`. Only Qwen3-ASR 1.7B and Qwen3-TTS 12Hz 1.7B (BF16 safetensors) work: Gufo does not load the audio
-GGUFs of other tools. TTS speaks Chinese, English, German, Italian, Portuguese, Spanish, Japanese, Korean, French and
-Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them, unless
-another TTS server holds a model for it: `--tts-route bulgarian=http://127.0.0.1:1237` (repeatable) sends replies in that
-language there, using its own voice if the chosen one is not among its voices. The page needs a secure context for the
+GGUFs of other tools. The speech model here is a Bulgarian fine-tune of Qwen3-TTS (one voice, `plamen`; it also speaks English and the model's
+other languages, with a Bulgarian accent), see `tools/audio/tts_finetune`. The language the chat has heard goes along with each reply, and a
+voice saved before the speech model changed is replaced by the model's first. The page needs a secure context for the
 microphone (`localhost` or https).
 
-**Shared chats.** *Share* on the chat page (the admin's) makes a public link, `GUFO_PUBLIC_URL/s/TOKEN`, that lets a friend chat
-with this server's model, press Talk to speak to it and hear it answer, with no account and no sign-in. You choose an expiry
-(1, 7 or 30 days, or never), a number of messages (default 100) and of speech requests (default 400), and whether the visitor
-starts from a copy of the open chat (text only, off by default). `/shares` (profile menu, *Shared chats*) lists every link
-with its use and state, copies it, **revokes** it (the link stops working at once) and removes revoked or expired ones.
+**Shared chats.** *Share* on the chat page (the admin's) turns the open chat into a room with a public link,
+`GUFO_PUBLIC_URL/s/TOKEN`. Everyone with the link sees the same conversation, which the monitor keeps, and can write in it, press
+Talk to speak to it and have replies read aloud, with no account and no sign-in. Pages poll it about every 1.5 s; a reply appears
+as it is written. Each person is shown by a name they choose (the model is told who said what), one reply is written at a time, and
+the room starts from the chat's latest 60 messages (text only). You choose an expiry (1, 7 or 30 days, or never), a number of
+messages (default 100) and of speech requests (default 400). `/shares` (profile menu, *Shared chats*) lists the links with their use
+and state, opens a room, **reads** a whole conversation, **revokes** a link (it stops working at once) and removes revoked or
+expired ones.
 
-A visitor's conversation is kept only in their own browser, unless the link was made with **Keep their messages so I can read
-them** (on by default in the dialog): then the monitor also keeps the text of what they said and what the model answered
-(not audio; up to 2000 messages per link, removed with the link), the visitor's page says "The owner of this link can read this
-conversation", and **Read** on `/shares` shows it, one block per visitor (each browser tab names its conversation, so two people on one link are not mixed). A link made without it keeps nothing.
+The room *is* your chat. While the link is active the chat carries a banner, its own composer is off, and you continue it in the
+room like everyone else; what is said there is added to the chat's history after your messages. Your original messages are never
+rewritten (they keep their images, reasoning and every field), and the server refuses any device's copy that would remove the
+mark or overwrite the room. Revoking frees the chat with everything said in the room in its history; deleting the chat ends its
+room.
 
-What a link allows is only that: the visitor gets a fresh conversation kept in their own browser, the model, your saved
-voice, and the limits. They get no key, none of your chats, projects, memory, tools or library, and nothing of the monitor:
-every other route still answers 401 to them. The monitor builds each request to the model itself from a whitelist (the
-visitor's plain text only; no system messages, tools, images, model choice or long answers; thinking off, answers capped at
-1024 tokens), speaks with your voice and voice instructions, and caps reply length, message count, and size. A link is
-rate-limited (6 chats and 24 speech requests a minute), at most 2 replies are written and at most 2 speech requests run for all links at once (another gets "busy" at once and costs its link nothing), and an address
-that tries many wrong links is slowed down. Wrong, revoked and expired links answer the same 404, and the log shows only the
-first four characters of a token. The costs are yours: guests use your inference key and the GPU, and nothing is billed to
-the credits portal. Treat a link like a password: whoever has it can use it until it ends. `--shares-file` holds them
-(mode 0600); without `GUFO_PUBLIC_URL` the links point at this machine's own address.
-
-**Style.** Two optional texts on the Voice settings page, kept per account: a *reply style* ("short, spoken, informal; no
-lists"), added to the model's system message in every chat, and *voice instructions* ("relaxed, warm, a little
-playful"), sent as `instructions` with every spoken reply. The first works with any model. The second depends on the
-speech model: VoiceDesign takes a voice description there, while whether the stock CustomVoice voices or a fine-tuned
-voice follow it has to be heard (the sample button on the page uses the text as typed). Each is at most 300 characters;
-`PUT /api/chat/voice-prefs` takes `reply_style` and `voice_style` (omitted keeps the old value, an empty string clears it).
-`--tts-design-url URL` names a `gufo serve tts` running a **VoiceDesign** model; the voice list then gains *Designed voice*,
-spoken by that server from the voice instructions as the description ("calm, low, warm"), with no voice name. Without a
-description it refuses. Not every speech model follows instructions, which is why this one is a separate server.
-
-**Avatar.** A small animated face sits over the corner of the chat (talk mode has to exist). It blinks, sways, and its
-mouth follows the loudness of the audio being played, so it works with any voice, speed or language and needs no model
-or asset. It looks attentive while the microphone listens, leans in while it hears you, and shows a thinking pose
-(gaze up, three dots) while your words are understood and while a reply is written, typed or spoken. Drag it anywhere;
-the place is remembered in the browser. It is on by default; its close button turns it off for the account, and the **Voice settings** page turns it
-back on. The setting is kept on the server with the voice (`PUT /api/chat/avatar {enabled}`, or `avatar` in
-`PUT /api/chat/voice-prefs`). `static/avatar.js`.
+What a link allows is only that: the shared conversation, the model, your saved voice, and the limits. A visitor gets no key, none
+of your other chats, projects, memory, tools or library, and nothing of the monitor: every other route still answers 401 to them.
+The monitor builds each request to the model itself from the conversation and a whitelist (plain text only; no system messages,
+tools, images or model choice; thinking off, answers capped at 1024 tokens), speaks with your voice, and caps message count and
+size. A link is rate-limited (6 messages and 24 speech requests a minute), at most 2 replies are written and at most 2 speech
+requests run for all links at once (another gets "busy" at once and costs its link nothing), and an address that tries many wrong
+links is slowed down. Wrong, revoked and expired links answer the same 404, and the log shows only the first four characters of a
+token. The costs are yours: guests use your inference key and the GPU, and nothing is billed to the credits portal. Treat a link
+like a password: whoever has it can read and write in the room until it ends. `--shares-file` holds them (mode 0600); without
+`GUFO_PUBLIC_URL` the links point at this machine's own address. A file from an earlier version is carried over, its logged
+conversations included.
 
 `--asr-ignore-language chinese` (repeatable) treats an utterance the recognizer hears as that language as noise: no text comes
 back and talk mode keeps listening. Qwen3-ASR names breath and random sounds as Chinese often enough for this to matter.

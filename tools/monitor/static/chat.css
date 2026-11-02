@@ -237,3 +237,6 @@ input[type="text"]:focus-visible { outline: 2px solid var(--focus); outline-offs
 #talk, #share-chat { display: inline-flex; align-items: center; gap: 6px; }
 #talk[hidden], #share-chat[hidden] { display: none; }
 #talk svg, #share-chat svg { width: 16px; height: 16px; flex: none; }
+
+.shared-banner { margin: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--accent); border-radius: var(--radius-sm); background: var(--accent-soft); font-size: var(--text-sm); }
+.shared-banner[hidden] { display: none; }

@@ -719,6 +719,23 @@ function fillMessage(block, message) {
   }
 }
 
+// A chat that is shared continues in its room, so its own composer is off and a note points to the room.
+function renderShared() {
+  const shared = active()?.shared;
+  $('shared-banner').hidden = !shared;
+  if (shared) $('shared-open').href = shared.url;
+  for (const id of ['prompt', 'send', 'talk']) $(id).disabled = Boolean(shared);
+  $('prompt').placeholder = shared ? 'This chat is shared: write in the room' : 'Message Gufo…';
+}
+
+function markShared(shared) {
+  const chat = active();
+  if (!chat) return;
+  chat.shared = shared;
+  saveChat(chat);
+  renderShared();
+}
+
 // The language this chat is assumed to be in, beside the controls; hidden until it is known.
 function renderLanguage() {
   const chip = $('language');
@@ -729,6 +746,7 @@ function renderLanguage() {
 
 function renderMessages() {
   renderLanguage();
+  renderShared();
   const root = $('messages');
   root.replaceChildren();
   const messages = active()?.messages ?? [];
@@ -1067,7 +1085,7 @@ async function send() {
   }
   const text = $('prompt').value.trim();
   const model = $('model').value;
-  if (busy || (!text && pendingImages.length === 0)) return;
+  if (busy || active()?.shared || (!text && pendingImages.length === 0)) return;
   if (!model) { $('status').textContent = 'No served model yet; try again in a moment.'; return; }
   if (!active()) newChat();
   const chat = active();
@@ -1386,13 +1404,10 @@ async function speechError(response) {
 }
 
 // One piece of text as a WAV file, in the voice chosen on the voice settings page.
-async function synthesizeSpeech(text, spoken) {
-  // What the text itself is written in beats what the chat last heard.
-  const language = Lang.textLanguage?.(text) ?? spoken;
+async function synthesizeSpeech(text, language) {
   const response = await fetch('/api/chat/speak', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}),
-      ...(voicePrefs.voice_style ? { instructions: voicePrefs.voice_style } : {}) }),
+    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}) }),
   });
   if (!response.ok) throw await speechError(response);
   return response.arrayBuffer();
@@ -1530,14 +1545,14 @@ const playThroughAvatar = (context, node) => {
 
 // How replies are spoken: the voice and speed from the account's voice settings (/voice), read
 // when the chat learns that talk mode exists.
-let voicePrefs = { voice: null, speed: 1, avatar: true, reply_style: '', voice_style: '' };
+let voicePrefs = { voice: null, speed: 1, avatar: true, reply_style: '' };
 async function loadVoicePrefs() {
   try {
     const response = await fetch('/api/chat/voice');
     if (!response.ok) return;
     const info = await response.json();
     voicePrefs = { voice: info.prefs?.voice ?? info.voice ?? null, speed: Number(info.prefs?.speed) || 1,
-      avatar: info.prefs?.avatar !== false, reply_style: info.prefs?.reply_style ?? '', voice_style: info.prefs?.voice_style ?? '' };
+      avatar: info.prefs?.avatar !== false, reply_style: info.prefs?.reply_style ?? '' };
     showAvatar(voicePrefs.avatar);
   } catch { /* the defaults speak */ }
 }
@@ -1660,7 +1675,7 @@ async function loadModels() {
     if (talkAvailable !== couldSpeak && active()) renderMessages();
     $('talk').hidden = !talkAvailable;
     if (talkAvailable) loadVoicePrefs();
-    if (data.share === true && window.GufoShare && !sharing) { sharing = true; window.GufoShare.init({ chat: active }); }
+    if (data.share === true && window.GufoShare && !sharing) { sharing = true; window.GufoShare.init({ chat: active, shared: markShared }); }
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');

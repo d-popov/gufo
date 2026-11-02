@@ -1,27 +1,19 @@
 'use strict';
 
-// The page of a shared chat link (/s/TOKEN): a lean chat for a visitor who has no account. It keeps the conversation in
-// this page only, talks to /api/share/TOKEN/* (the secret in the URL is the only credential) and shows what the owner
-// allowed: the model, the voice, and how many messages and speech requests are left.
+// The page of a shared chat (/s/TOKEN): one conversation that everyone with the link sees and writes in. The monitor keeps it;
+// this page polls it a little over once a second, posts what the visitor types or says, and reads the model's reply as it is
+// written (the asker's own connection streams it, which is what feeds Talk). The secret in the URL is the only credential.
 const $ = (id) => document.getElementById(id);
 const TOKEN = location.pathname.split('/')[2] ?? '';
 const API = `/api/share/${encodeURIComponent(TOKEN)}`;
+const POLL_MS = 1500;
 const Lang = window.GufoLanguage;
-// This page's conversation has a name of its own, so the owner (if they chose to read what is said) sees one visitor's
-// conversation apart from another's on the same link. It lasts as long as the tab.
-const CONVERSATION = (() => {
-  const key = `gufo-share-conversation-${TOKEN.slice(0, 8)}`;
-  try {
-    let id = sessionStorage.getItem(key);
-    if (!id) { id = crypto.randomUUID().replace(/-/g, '').slice(0, 24); sessionStorage.setItem(key, id); }
-    return id;
-  } catch { return crypto.randomUUID().replace(/-/g, '').slice(0, 24); }
-})();
 
 let info = null;
-let messages = [];          // { role, content, language? }
-let language = Lang.EMPTY;  // what the chat is in, from what is heard
+let room = { rev: -1, messages: [] };
+let language = Lang.EMPTY;  // what this visitor's chat is in, from what they say
 let heard = null;           // what speech recognition returned last: { text, language }
+let own = null;             // the reply being streamed to this page: { content } while it is
 let busy = false;
 let controller = null;
 let talk = null;
@@ -31,6 +23,16 @@ let avatar = null;
 let talkState = 'off';
 
 const status = (text) => { $('status').textContent = text; };
+
+const name = () => $('share-name').value.trim() || 'Guest';
+$('share-name').value = (() => {
+  try {
+    let saved = localStorage.getItem('gufo-share-name');
+    if (!saved) { saved = `Guest-${Math.floor(1000 + Math.random() * 9000)}`; localStorage.setItem('gufo-share-name', saved); }
+    return saved;
+  } catch { return `Guest-${Math.floor(1000 + Math.random() * 9000)}`; }
+})();
+$('share-name').addEventListener('change', () => { try { localStorage.setItem('gufo-share-name', name()); } catch { /* blocked */ } render(); });
 
 async function failure(response) {
   try {
@@ -50,29 +52,31 @@ function renderLanguage() {
   $('language').hidden = !text;
 }
 
+// ------------------------------------------------------------------------ the room
+
 function fill(block, message) {
   block.replaceChildren();
-  if (message.role === 'assistant' && message.content && !message.error && !message.pending) {
+  if (message.role === 'user') {
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = message.name === name() ? 'You' : message.name;
+    block.append(who);
+  }
+  if (message.role === 'assistant' && message.content) {
     const body = document.createElement('div');
     body.className = 'md';
     body.append(window.GufoMarkdown.render(message.content));
     block.append(body);
   } else {
-    block.append(document.createTextNode(message.content || (message.pending ? '…' : '')));
+    block.append(document.createTextNode(message.content || (message.done === false ? '…' : '')));
   }
-  if (message.role === 'user' && message.language) {
-    const tag = document.createElement('div');
-    tag.className = 'tag';
-    tag.textContent = `Heard as ${message.language[0].toUpperCase()}${message.language.slice(1)}`;
-    block.append(tag);
-  }
-  if (info?.talk && message.role === 'assistant' && !message.error && !message.pending && message.content) {
+  if (info?.talk && message.role === 'assistant' && message.done !== false && message.content) {
     const speak = document.createElement('button');
     speak.type = 'button';
     speak.className = 'speak secondary';
     speak.setAttribute('aria-label', 'Read this reply aloud');
     speak.title = 'Read aloud';
-    speak.append(window.GufoIcons.svg(reading === message ? 'square' : 'volume-2'));
+    speak.append(window.GufoIcons.svg(reading === message.id ? 'square' : 'volume-2'));
     speak.addEventListener('click', () => readAloud(message, speak));
     block.append(speak);
   }
@@ -80,27 +84,48 @@ function fill(block, message) {
 
 function render() {
   const root = $('messages');
+  const scroller = root.parentElement;
+  const atEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
   root.replaceChildren();
-  for (const message of messages) {
+  room.messages.forEach((message, index) => {
+    // While this page streams its own reply, the text it has is newer than the room's copy.
+    const shown = own && index === room.messages.length - 1 && message.role === 'assistant' && message.done === false
+      ? { ...message, content: own.content } : message;
     const block = document.createElement('article');
-    block.className = `message ${message.role}${message.error ? ' error' : ''}`;
-    fill(block, message);
+    const mine = message.role === 'user' && message.name === name();
+    block.className = `message ${message.role}${message.role === 'user' && !mine ? ' other' : ''}`;
+    fill(block, shown);
     root.append(block);
-  }
-  $('empty').hidden = messages.length > 0;
-  root.parentElement.scrollTop = root.parentElement.scrollHeight;
+  });
+  $('empty').hidden = room.messages.length > 0;
+  if (atEnd) scroller.scrollTop = scroller.scrollHeight;
 }
 
-// -------------------------------------------------------------------- the model
+async function poll() {
+  if (document.hidden) return;
+  try {
+    const response = await fetch(`${API}/conversation?rev=${room.rev}`);
+    if (response.status === 404) { closed(); return; }
+    if (!response.ok) return;
+    const next = await response.json();
+    info.messages_left = next.messages_left;
+    updateLeft();
+    if (!next.unchanged) { room = next; render(); }
+  } catch { /* the next poll tries again */ }
+}
 
-async function streamReply(reply) {
+// -------------------------------------------------------------------- asking
+
+async function streamReply(reply, text, spoken) {
   controller = new AbortController();
   const note = [Lang.note(language), talk?.active ? talk.instruction : null].filter(Boolean).join(' ');
   const response = await fetch(`${API}/chat`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-    body: JSON.stringify({ messages: messages.filter((m) => !m.error && !m.pending).map(({ role, content }) => ({ role, content })), note, conversation: CONVERSATION }),
+    body: JSON.stringify({ text, name: name(), note }),
   });
   if (!response.ok) throw new Error(await failure(response));
+  own = reply;
+  await poll();  // the visitor's own message is in the room by now
   const decoder = new TextDecoder();
   const body = response.body.getReader();
   let pending = '';
@@ -116,20 +141,9 @@ async function streamReply(reply) {
       let event;
       try { event = JSON.parse(line.slice(5)); } catch { continue; }
       const piece = event.choices?.[0]?.delta?.content;
-      if (piece) {
-        reply.content += piece;
-        talk?.onReply(reply, false);
-        paint(reply);
-      }
+      if (piece) { reply.content += piece; talk?.onReply(reply, false); render(); }
     }
   }
-}
-
-function paint(reply) {
-  const blocks = $('messages').children;
-  const block = blocks[messages.indexOf(reply)];
-  if (block) fill(block, reply);
-  $('messages').parentElement.scrollTop = $('messages').parentElement.scrollHeight;
 }
 
 function setBusy(on) {
@@ -145,62 +159,41 @@ async function send(text, spoken = null) {
   if (command) { runCommand(command); return; }
   if (spoken) language = Lang.track(language, spoken, text);
   renderLanguage();
-  messages.push({ role: 'user', content: text, ...(spoken ? { language: spoken } : {}) });
-  const reply = { role: 'assistant', content: '', pending: true, ...(language.spoken ? { language: language.spoken } : {}) };
-  messages.push(reply);
   $('prompt').value = '';
   autosize();
-  render();
+  const reply = { content: '' };
   setBusy(true);
-  info.messages_left = Math.max(0, info.messages_left - 1);
-  updateLeft();
   try {
-    await streamReply(reply);
-    reply.pending = false;
-    if (!reply.content) { reply.content = 'No answer came back.'; reply.error = true; }
+    await streamReply(reply, text, spoken);
   } catch (error) {
-    reply.pending = false;
-    if (error.name === 'AbortError') {
-      if (!reply.content) messages.splice(messages.indexOf(reply), 1);
-    } else {
-      reply.error = true;
-      reply.content = reply.content || error.message;
-      await refreshInfo();
-    }
+    if (error.name !== 'AbortError') status(error.message);
   }
+  own = null;
   controller = null;
-  render();
   setBusy(false);
   talk?.onReply(reply, true);
+  await poll();
 }
 
 function runCommand(command) {
   if (command.error) { status(command.error); return; }
   if (command.show) {
     const label = Lang.label(language);
-    status(label ? `This chat is assumed to be in ${label}.` : 'No language yet: it is taken from the first spoken message.');
+    status(label ? `You are assumed to be speaking ${label}.` : 'No language yet: it is taken from the first spoken message.');
     return;
   }
   language = command.auto ? Lang.EMPTY : Lang.declare(command.declared);
   $('prompt').value = '';
   renderLanguage();
-  status(command.auto ? 'The language will be detected again.' : `This chat now uses ${Lang.label(language)}.`);
-}
-
-async function refreshInfo() {
-  try {
-    const response = await fetch(API);
-    if (response.ok) { info = { ...info, ...(await response.json()) }; updateLeft(); } else if (response.status === 404) closed();
-  } catch { /* the page keeps working with what it knows */ }
+  status(command.auto ? 'The language will be detected again.' : `You now speak ${Lang.label(language)}.`);
 }
 
 // ------------------------------------------------------------------------ speech
 
-const speakBody = (text, lang) => JSON.stringify({ text, ...(lang ? { language: lang } : {}) });
-
-async function synthesize(text, spoken) {
-  const lang = Lang.textLanguage(text) ?? spoken;
-  const response = await fetch(`${API}/speak`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: speakBody(text, lang) });
+async function synthesize(text, lang) {
+  const response = await fetch(`${API}/speak`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, ...(lang ? { language: lang } : {}) }),
+  });
   if (!response.ok) throw new Error(await failure(response));
   return response.arrayBuffer();
 }
@@ -209,17 +202,17 @@ const playThroughAvatar = (context, node) => { if (avatar) avatar.attach(context
 
 function readAloud(message, button) {
   reader ??= window.GufoTalk.createReader({
-    synthesize: (text) => synthesize(text, reading?.language),
+    synthesize: (text) => synthesize(text, language.spoken),
     speed: () => info.speed || 1,
     attach: playThroughAvatar,
     error: status,
   });
-  if (reading === message) { reader.stop(); return; }
-  reading = message;
+  if (reading === message.id) { reader.stop(); return; }
+  reading = message.id;
   button.classList.add('reading');
   button.replaceChildren(window.GufoIcons.svg('square'));
   reader.speak(message.content, () => {
-    if (reading === message) reading = null;
+    if (reading === message.id) reading = null;
     button.classList.remove('reading');
     button.replaceChildren(window.GufoIcons.svg('volume-2'));
   });
@@ -229,7 +222,6 @@ const TALK_LABEL = {
   off: 'Talk', starting: 'Starting… (tap to cancel)', listening: 'Listening… (tap to stop)', hearing: 'Hearing you…',
   transcribing: 'Understanding…', thinking: 'Thinking… (tap to interrupt)', speaking: 'Speaking… (tap to interrupt)', error: 'Talk',
 };
-
 $('talk').replaceChildren(window.GufoIcons.svg('mic'), 'Talk');
 
 function talkController() {
@@ -312,6 +304,7 @@ function autosize() {
 }
 
 function closed() {
+  clearInterval(timer);
   document.querySelector('main').replaceChildren(Object.assign(document.createElement('p'), {
     className: 'closed', textContent: 'This link is not valid any more: it was switched off, has expired or is mistyped.',
   }));
@@ -327,6 +320,7 @@ $('prompt').addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('composer').requestSubmit(); }
 });
 
+let timer = null;
 (async () => {
   let response;
   try { response = await fetch(API); } catch { status('Could not reach the server.'); return; }
@@ -334,12 +328,11 @@ $('prompt').addEventListener('keydown', (event) => {
   info = await response.json();
   document.title = info.title;
   $('share-title').textContent = info.title;
-  $('share-notice').hidden = !info.logged;
-  messages = info.seed.map((m) => ({ role: m.role, content: m.content }));
   updateLeft();
-  render();
   if (info.talk) {
     $('talk').hidden = false;
     if (localStorage.getItem('gufo-share-avatar') !== 'off') showAvatar(true);
   }
+  await poll();
+  timer = setInterval(poll, POLL_MS);
 })();

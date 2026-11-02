@@ -1,6 +1,6 @@
 'use strict';
 
-// "Share" on the chat page: makes a public link to a chat (see shares.py) and shows it to copy. The links themselves
+// "Share" on the chat page: makes the open chat a room with a public link (see shares.py) and shows it to copy. The links themselves
 // are listed and revoked on /shares. Only the admin sees the button.
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -8,7 +8,6 @@
 
   async function create() {
     const chat = host?.chat();
-    const include = $('share-include').checked;
     $('share-create').disabled = true;
     $('share-state').textContent = 'Making the link…';
     try {
@@ -19,9 +18,7 @@
           days: Number($('share-days').value),
           max_messages: Number($('share-messages').value),
           max_audio: Number($('share-audio').value),
-          include_chat: include,
-          log: $('share-log').checked,
-          ...(include && chat ? { messages: chat.messages.map(({ role, content, error }) => ({ role, content, error })) } : {}),
+          ...(chat ? { chat_id: chat.id, messages: chat.messages.map(({ role, content, error }) => ({ role, content, error })) } : {}),
         }),
       });
       const body = await response.json();
@@ -30,6 +27,7 @@
       $('share-result').hidden = false;
       $('share-state').textContent = '';
       $('share-url').select();
+      host.shared?.({ id: body.id, url: body.url });
     } catch (error) {
       $('share-state').textContent = error.message;
     }

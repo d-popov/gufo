@@ -28,7 +28,7 @@ function cell(text, className) {
 function row(share) {
   const tr = document.createElement('tr');
   if (share.status !== 'active') tr.className = 'inactive';
-  tr.append(cell(share.title + (share.has_seed ? ' (with the conversation)' : '') + (share.logged ? ' · messages kept' : '')), cell(when(share.created)),
+  tr.append(cell(share.title + (share.chat_id ? ' · your chat' : '')), cell(when(share.created)),
     cell(share.expires ? when(share.expires) : 'never'), cell(`${share.messages} / ${share.max_messages}`),
     cell(`${share.audio} / ${share.max_audio}`), cell(share.last_used ? when(share.last_used) : 'never'),
     cell(share.status, `state ${share.status}`));
@@ -45,14 +45,21 @@ function row(share) {
     });
     actions.append(copy);
   }
-  if (share.logged) {
-    const read = document.createElement('button');
-    read.type = 'button';
-    read.className = 'secondary';
-    read.textContent = 'Read';
-    read.addEventListener('click', () => readConversation(share));
-    actions.append(read);
+  if (share.status === 'active') {
+    const open = document.createElement('a');
+    open.className = 'button secondary';
+    open.textContent = 'Open room';
+    open.href = share.url;
+    open.target = '_blank';
+    open.rel = 'noopener';
+    actions.append(open);
   }
+  const read = document.createElement('button');
+  read.type = 'button';
+  read.className = 'secondary';
+  read.textContent = 'Read';
+  read.addEventListener('click', () => readConversation(share));
+  actions.append(read);
   const remove = document.createElement('button');
   remove.type = 'button';
   remove.className = share.status === 'active' ? 'secondary danger' : 'secondary';
@@ -72,31 +79,21 @@ function row(share) {
   return tr;
 }
 
-// What the visitors of a link said and were answered, for links made with "keep their messages", one block per
-// visitor conversation.
+// The whole conversation of a link: what was said in the room, by whom.
 async function readConversation(share) {
   try {
-    const { conversations } = await api('GET', `/api/chat/shares/${share.id}/messages`);
-    const total = conversations.reduce((sum, group) => sum + group.messages.length, 0);
-    $('transcript-title').textContent = `${share.title}: ${total} message${total === 1 ? '' : 's'} in ${conversations.length} conversation${conversations.length === 1 ? '' : 's'}`;
-    const blocks = conversations.map((group, index) => {
-      const block = document.createElement('div');
-      block.className = 'conversation-block';
-      const heading = document.createElement('h3');
-      heading.textContent = `Visitor ${index + 1} · started ${when(group.started)}`;
-      block.append(heading, ...group.messages.map((message) => {
-        const turn = document.createElement('p');
-        turn.className = `turn ${message.role}`;
-        const who = document.createElement('span');
-        who.className = 'who';
-        who.textContent = `${message.role === 'user' ? 'Visitor' : 'Model'} · ${when(message.at)}`;
-        turn.append(who, document.createTextNode(message.content));
-        return turn;
-      }));
-      return block;
-    });
-    $('transcript-body').replaceChildren(...blocks);
-    if (!blocks.length) $('transcript-body').textContent = 'Nothing has been said on this link yet.';
+    const { messages } = await api('GET', `/api/chat/shares/${share.id}/messages`);
+    $('transcript-title').textContent = `${share.title}: ${messages.length} message${messages.length === 1 ? '' : 's'}`;
+    $('transcript-body').replaceChildren(...messages.map((message) => {
+      const turn = document.createElement('p');
+      turn.className = `turn ${message.role}`;
+      const who = document.createElement('span');
+      who.className = 'who';
+      who.textContent = `${message.role === 'user' ? message.name || 'Visitor' : 'Model'} · ${when(message.at)}`;
+      turn.append(who, document.createTextNode(message.content));
+      return turn;
+    }));
+    if (!messages.length) $('transcript-body').textContent = 'Nothing has been said in this room yet.';
     $('transcript').hidden = false;
     $('transcript').scrollIntoView({ behavior: 'smooth' });
   } catch (error) { $('note').textContent = error.message; }

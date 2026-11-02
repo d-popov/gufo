@@ -567,8 +567,7 @@ GUEST_AUDIO_PER_MINUTE = 24
 GUEST_MISSES_PER_MINUTE = 20
 GUEST_REPLIES_AT_ONCE = 2
 GUEST_SPEECH_AT_ONCE = 2
-SHARE_PATH = re.compile(r"^/(?:s|api/share)/([A-Za-z0-9_-]{1,80})(?:/(chat|transcribe|speak))?$")
-DESIGN_VOICE = "designed"  # the voice choice that means "the voice the instructions describe" (VoiceDesign)
+SHARE_PATH = re.compile(r"^/(?:s|api/share)/([A-Za-z0-9_-]{1,80})(?:/(chat|transcribe|speak|conversation))?$")
 STYLE_MAX = 300  # characters of a style setting: a reply style for the model, a voice instruction for the voice
 LANGUAGE_NAME = re.compile(r"[a-z]{2,30}")  # a language as the speech models name it: "bulgarian"
 
@@ -583,7 +582,7 @@ CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('rev', 0);
 CREATE TABLE IF NOT EXISTS voice_prefs (
   owner TEXT PRIMARY KEY, voice TEXT, speed REAL NOT NULL, updated INTEGER NOT NULL,
-  avatar INTEGER NOT NULL DEFAULT 1, reply_style TEXT NOT NULL DEFAULT '', voice_style TEXT NOT NULL DEFAULT '');
+  avatar INTEGER NOT NULL DEFAULT 1, reply_style TEXT NOT NULL DEFAULT '');
 """
 
 
@@ -614,8 +613,7 @@ class ChatStore:
             # A store made before the avatar setting has no such column.
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(voice_prefs)")}
             for name, definition in (("avatar", "INTEGER NOT NULL DEFAULT 1"),
-                                     ("reply_style", "TEXT NOT NULL DEFAULT ''"),
-                                     ("voice_style", "TEXT NOT NULL DEFAULT ''")):
+                                     ("reply_style", "TEXT NOT NULL DEFAULT ''")):
                 if name not in columns:
                     self.conn.execute(f"ALTER TABLE voice_prefs ADD COLUMN {name} {definition}")
         self.purge()
@@ -640,32 +638,27 @@ class ChatStore:
                 "deleted": bool(deleted), "data": None if deleted else json.loads(body)}
 
     def voice_prefs(self, owner: str) -> dict:
-        """How this owner's replies are spoken and shown, the same on every device: "voice" (a name, or
-        None for the server's default), "speed" (playback rate), "avatar" (shown until the owner closes
-        it), "reply_style" (a hint to the model about how to write replies, "" for none) and "voice_style"
-        (an instruction sent to the speech model about how to speak them, "" for none)."""
+        """How this owner's replies are spoken and shown, the same on every device: "voice" (a name, or None for the
+        server's default), "speed" (playback rate), "avatar" (shown until the owner closes it) and "reply_style" (a hint to
+        the model about how to write replies, "" for none)."""
         with self.lock:
             row = self.conn.execute(
-                "SELECT voice, speed, avatar, reply_style, voice_style FROM voice_prefs WHERE owner = ?",
-                (owner,)).fetchone()
-        return ({"voice": row[0], "speed": row[1], "avatar": bool(row[2]), "reply_style": row[3],
-                 "voice_style": row[4]} if row
-                else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
+                "SELECT voice, speed, avatar, reply_style FROM voice_prefs WHERE owner = ?", (owner,)).fetchone()
+        return ({"voice": row[0], "speed": row[1], "avatar": bool(row[2]), "reply_style": row[3]} if row
+                else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
 
     def set_voice_prefs(self, owner: str, voice: str | None, speed: float, avatar: bool | None = None,
-                        reply_style: str | None = None, voice_style: str | None = None) -> dict:
+                        reply_style: str | None = None) -> dict:
         """Keep the voice and speed; a setting passed as None is left as it was."""
         with self.lock:
             self.conn.execute(
-                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar, reply_style, voice_style) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar, reply_style) VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (owner) DO UPDATE SET voice = excluded.voice, speed = excluded.speed, "
                 "updated = excluded.updated, "
                 "avatar = CASE WHEN ? THEN excluded.avatar ELSE avatar END, "
-                "reply_style = CASE WHEN ? THEN excluded.reply_style ELSE reply_style END, "
-                "voice_style = CASE WHEN ? THEN excluded.voice_style ELSE voice_style END",
+                "reply_style = CASE WHEN ? THEN excluded.reply_style ELSE reply_style END",
                 (owner, voice, speed, int(time.time() * 1000), int(avatar is not False), reply_style or "",
-                 voice_style or "", avatar is not None, reply_style is not None, voice_style is not None))
+                 avatar is not None, reply_style is not None))
         return self.voice_prefs(owner)
 
     def set_avatar(self, owner: str, enabled: bool) -> dict:
@@ -676,6 +669,13 @@ class ChatStore:
                 "ON CONFLICT (owner) DO UPDATE SET avatar = excluded.avatar, updated = excluded.updated",
                 (owner, int(time.time() * 1000), int(enabled)))
         return self.voice_prefs(owner)
+
+    def item(self, owner: str, kind: str, item_id: str) -> dict | None:
+        """The stored data of an item (a chat, say), or None if there is none or it was deleted."""
+        with self.lock:
+            row = self.conn.execute("SELECT body FROM items WHERE owner = ? AND kind = ? AND id = ? AND deleted = 0",
+                                    (owner, kind, item_id)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def put(self, owner: str, kind: str, item_id: str, updated: int, data: dict) -> dict:
         """Store an item unless the stored one is newer: {"applied": bool, "item": stored}."""
@@ -818,25 +818,19 @@ class VoiceServices:
 
     UTTERANCE_MAX = 8 << 20   # bytes of WAV the chat may send for one utterance
     TEXT_MAX = 4000           # characters of reply text synthesized per request
-    # The languages Qwen3-TTS takes by name. For any other the request carries none and the model
-    # decides from the text.
+    # The languages the speech model takes by name (Bulgarian is the fine-tune's own). For any other the request carries
+    # none and the model decides from the text.
     TTS_LANGUAGES = frozenset({"chinese", "english", "german", "italian", "portuguese", "spanish",
-                               "japanese", "korean", "french", "russian"})
+                               "japanese", "korean", "french", "russian", "bulgarian"})
 
     def __init__(self, asr_url: str, tts_url: str, voice: str | None = None,
-                 routes: dict[str, str] | None = None, design_url: str | None = None,
                  ignored_languages: frozenset[str] | set[str] = frozenset()):
-        """routes maps a language name to the TTS server that speaks it (a fine-tune for one
-        language, say); every other language goes to tts_url. design_url is a VoiceDesign server: the
-        voice choice DESIGN_VOICE speaks with it, in the voice the instructions describe."""
         self.asr = asr_url.rstrip("/")
         self.tts = tts_url.rstrip("/")
-        self.design = design_url.rstrip("/") if design_url else None
         # Languages the recognizer may name that are not wanted: noise and breath are often heard as one of them (Chinese,
         # for Qwen3-ASR). An utterance heard as one comes back with no text, so the chat goes on listening.
         self.ignored_languages = frozenset(name.lower() for name in ignored_languages)
         self.voice = voice
-        self.routes = {language: url.rstrip("/") for language, url in (routes or {}).items()}
         self._models: dict[str, str] = {}
 
     @staticmethod
@@ -887,32 +881,12 @@ class VoiceServices:
             pass
         return []
 
-    def _routed_voices(self, key: str | None) -> list[dict]:
-        """The voices of the language-specific servers, [{"voice", "language"}], for those that answer."""
-        found = []
-        for language, base in self.routes.items():
-            for name in self._voices(base, key):
-                found.append({"voice": name, "language": language})
-        return found
-
-    def _voice_server(self, name: str | None, key: str | None) -> str | None:
-        """The language-specific server that offers the voice NAME, if one does: a voice chosen by name speaks on
-        its own server, whatever language the reply is in."""
-        if not name or not self.routes:
-            return None
-        for language, base in self.routes.items():
-            if name in self._voices(base, key):
-                return base
-        return None
-
     def info(self, key: str | None) -> dict:
-        """The models behind talk mode and the voices the speech model offers: what the chat
-        page shows and lets the admin pick. A server that does not answer leaves its field empty."""
+        """The models behind talk mode and the voices the speech model offers: what the chat page shows and lets the
+        admin pick. A server that does not answer leaves its field empty."""
         voices = self._voices(self.tts, key)
         default = self.voice if self.voice in voices else (voices[0] if voices else None)
-        return {"asr": self._model(self.asr, key), "tts": self._model(self.tts, key),
-                "voices": voices, "voice": default, "routed": self._routed_voices(key),
-                "design": bool(self.design and self._model(self.design, key))}
+        return {"asr": self._model(self.asr, key), "tts": self._model(self.tts, key), "voices": voices, "voice": default}
 
     def transcribe(self, wav: bytes, key: str | None) -> tuple[int, bytes, str]:
         """POST an utterance (a WAV file) to the ASR server. The answer is {"text", "language"}:
@@ -944,49 +918,24 @@ class VoiceServices:
             return 502, b'{"error":{"message":"the speech server answered with something else than a transcript"}}', "application/json"
         return 200, json.dumps(reply, ensure_ascii=False).encode(), "application/json"
 
-    def _design(self, text: str, key: str | None, language: str | None,
-                instructions: str | None) -> tuple[int, bytes, str]:
-        """Speak in the voice a VoiceDesign server makes from the instructions' description."""
-        def refuse(message: str) -> tuple[int, bytes, str]:
-            return 400, json.dumps({"error": {"message": message}}).encode(), "application/json"
-
-        model = self._model(self.design, key) if self.design else None
-        if not model:
-            return refuse("no VoiceDesign server is answering (--tts-design-url)")
-        if not instructions:
-            return refuse("describe the voice first: the designed voice is made from the Voice instructions")
-        payload = {"model": model, "input": text, "response_format": "wav", "instructions": instructions}
+    def speak(self, text: str, key: str | None, voice: str | None = None,
+              language: str | None = None) -> tuple[int, bytes, str]:
+        """POST reply text to the TTS server; its answer is a WAV file. A voice the model does not have (one saved
+        before the voices changed, say) is replaced by its first. The language goes along where the model names it."""
+        payload = {"input": text, "response_format": "wav"}
+        model = self._model(self.tts, key)
+        if model:
+            payload["model"] = model
+        voices = self._voices(self.tts, key)
+        wanted = voice or self.voice
+        if voices and wanted not in voices:
+            wanted = voices[0]
+        if wanted:
+            payload["voice"] = wanted
         if language in self.TTS_LANGUAGES:
             payload["language"] = language
         request = urllib.request.Request(
-            self.design + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
-            headers=self._headers(key, "application/json"))
-        return self._open(request, 180.0)
-
-    def speak(self, text: str, key: str | None, voice: str | None = None,
-              language: str | None = None, instructions: str | None = None) -> tuple[int, bytes, str]:
-        """POST reply text to a TTS server; its answer is a WAV file. The language picks the
-        server (see routes) and, where the model names it, goes along in the request. A routed
-        server speaks with the chosen voice if it has it, else with its first."""
-        if (voice or self.voice) == DESIGN_VOICE:
-            return self._design(text, key, language, instructions)
-        base = self._voice_server(voice or self.voice, key) or self.routes.get(language or "", self.tts)
-        payload = {"input": text, "response_format": "wav"}
-        model = self._model(base, key)
-        if model:
-            payload["model"] = model
-        wanted = voice or self.voice
-        if base != self.tts:
-            voices = self._voices(base, key)
-            wanted = wanted if wanted in voices else (voices[0] if voices else None)
-        elif language in self.TTS_LANGUAGES:
-            payload["language"] = language
-        if wanted:
-            payload["voice"] = wanted
-        if instructions:
-            payload["instructions"] = instructions  # how to speak; whether the model follows it is its own
-        request = urllib.request.Request(
-            base + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
+            self.tts + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
             headers=self._headers(key, "application/json"))
         return self._open(request, 180.0)
 
@@ -2226,18 +2175,15 @@ def versioned_assets(html: bytes) -> bytes:
     return STATIC_REFERENCE.sub(add, html)
 
 
-def reply_text(lines: list[bytes]) -> str:
-    """The text of a streamed reply: the content pieces of its `data:` lines, joined."""
-    pieces = []
-    for line in lines:
-        if line.startswith(b"data:") and b"[DONE]" not in line:
-            try:
-                piece = json.loads(line[5:])["choices"][0]["delta"].get("content")
-            except (ValueError, LookupError, TypeError, AttributeError):
-                continue
-            if isinstance(piece, str):
-                pieces.append(piece)
-    return "".join(pieces)
+def reply_piece(line: bytes) -> str:
+    """The text of a streamed reply's `data:` line (its content delta), or "" for any other line."""
+    if not line.startswith(b"data:") or b"[DONE]" in line:
+        return ""
+    try:
+        piece = json.loads(line[5:])["choices"][0]["delta"].get("content")
+    except (ValueError, LookupError, TypeError, AttributeError):
+        return ""
+    return piece if isinstance(piece, str) else ""
 
 
 def shares_module():
@@ -2703,8 +2649,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     data = body.get("data") if body else None
                     if not isinstance(updated, int) or isinstance(updated, bool) or not isinstance(data, dict):
                         return self._error(400, "expected {updated, data}")
+                    room = self._bound_share(owner, kind, item_id)
+                    if room is not None:
+                        # A chat that is a room keeps its room: a device's copy (stale, or from before the chat was shared)
+                        # cannot remove the shared mark or overwrite what was said in the room, only bring the history in.
+                        merged = self._room_chat(room, data, True)
+                        if merged is None:
+                            return self._json(200, json.dumps(store.put(owner, kind, item_id, -1, {})).encode())
+                        data, updated = merged, merged["updated"]
                     return self._json(200, json.dumps(store.put(owner, kind, item_id, updated, data)).encode())
                 if method == "DELETE":
+                    room = self._bound_share(owner, kind, item_id)
+                    if room is not None:  # deleting a chat ends its room
+                        self.server.shares.remove(owner, room["id"])
                     at = int(query.get("at", [str(int(time.time() * 1000))])[0])
                     return self._json(200, json.dumps(store.delete(owner, kind, item_id, at)).encode())
         except ChatStoreError as error:
@@ -2712,6 +2669,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return self._error(400, "bad request")
         return self._error(404, "not_found")
+
+    def _bound_share(self, owner: str, kind: str, item_id: str) -> dict | None:
+        """The active link that makes this chat a room, if there is one."""
+        shares = self.server.shares
+        return shares.active_for_chat(owner, item_id) if shares is not None and kind == "chat" else None
 
     def _run_route(self, method: str):
         """GET /api/chat/runs/ID?from=N follows a run; POST /api/chat/runs/ID/cancel stops it."""
@@ -2789,9 +2751,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         base = self.server.public_url or f"http://{f'[{host}]' if ':' in host else host}:{port}"
         return f"{base.rstrip('/')}/s/{token}"
 
+    def _room_chat(self, share: dict, data: dict, shared: bool) -> dict | None:
+        """The owner's chat DATA as its room requires. The chat's first `base` messages are the owner's history and are never
+        rewritten (they keep their images, reasoning and every field); what was said in the room since the link was made is
+        added after them, whatever else the data held. While the link is active the chat carries a `shared` mark (the link,
+        which switches the chat's own composer off: it continues in the room). None if the data does not hold all `base`
+        messages yet (a stale or partial copy)."""
+        if not isinstance(data.get("messages"), list) or len(data["messages"]) < share["base"]:
+            return None
+        room = self.server.shares.transcript(share["owner"], share["id"]) or []
+        data["messages"] = data["messages"][:share["base"]] + [
+            {"role": m["role"], "content": m["content"], **({"name": m["name"]} if m["name"] else {})}
+            for m in room[share["seeded"]:] if m["content"]]
+        data["updated"] = int(time.time() * 1000)
+        if shared:
+            data["shared"] = {"id": share["id"], "url": self._share_url(share["token"])}
+        else:
+            data.pop("shared", None)
+        return data
+
+    def _mirror_share(self, share: dict, shared: bool) -> None:
+        """Write the room into the owner's chat (see _room_chat), where it syncs to their devices like any other change.
+        Nothing is written if the chat has not reached the server with all its `base` messages."""
+        store = self.server.chat_store
+        if store is None or not share["chat_id"]:
+            return
+        data = store.item(share["owner"], "chat", share["chat_id"])
+        merged = self._room_chat(share, data, shared) if data is not None else None
+        if merged is not None:
+            try:
+                store.put(share["owner"], "chat", share["chat_id"], merged["updated"], merged)
+            except ChatStoreError:
+                pass  # the owner's chat storage is full: the room goes on without its mirror
+
     def _shares_admin(self, method: str, path: str):
-        """GET /api/chat/shares lists the links, POST creates one, DELETE /api/chat/shares/ID revokes an active one and
-        removes a revoked or expired one. The admin's only."""
+        """GET /api/chat/shares lists the links, POST creates one for a chat, DELETE /api/chat/shares/ID revokes an active
+        one and removes a revoked or expired one, GET /api/chat/shares/ID/messages reads a conversation. The admin's only."""
         shares = self.server.shares
         if shares is None:
             return self._error(404, "shared links are not configured")
@@ -2810,25 +2805,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = self._read_json(module.SEED_BYTES + 4096)
                 if body is None:
                     return self._error(400, "expected a JSON body")
-                seed = module.clean_seed(body.get("messages")) if body.get("include_chat") else []
-                if not isinstance(body.get("log", False), bool):
-                    return self._error(400, "log is true or false")
+                chat_id = body.get("chat_id") or ""
+                if chat_id and not (isinstance(chat_id, str) and CHAT_ID.fullmatch(chat_id)):
+                    return self._error(400, "chat_id is the id of one of your chats")
                 share = shares.create("admin", body.get("title"), body.get("days", module.DEFAULT_DAYS),
                                       body.get("max_messages", module.DEFAULT_MESSAGES),
-                                      body.get("max_audio", module.DEFAULT_AUDIO), seed, body.get("log", False))
+                                      body.get("max_audio", module.DEFAULT_AUDIO), module.clean_seed(body.get("messages")),
+                                      chat_id, len(body["messages"]) if isinstance(body.get("messages"), list) else 0)
+                self._mirror_share({**share, "owner": "admin"}, True)
                 return self._json(200, json.dumps(show(share)).encode())
             if method == "GET":  # /api/chat/shares/ID/messages
                 share_id = path.split("/")[-2]
-                found = shares.conversations("admin", share_id) if module.SHARE_ID.fullmatch(share_id) else None
+                found = shares.transcript("admin", share_id) if module.SHARE_ID.fullmatch(share_id) else None
                 if found is None:
                     return self._error(404, "not_found")
-                return self._json(200, json.dumps({"conversations": found}, ensure_ascii=False).encode())
+                return self._json(200, json.dumps({"messages": found}, ensure_ascii=False).encode())
             share_id = path.rsplit("/", 1)[1]
             if not module.SHARE_ID.fullmatch(share_id):
                 return self._error(404, "not_found")
+            share = shares.get("admin", share_id)
             done = shares.remove("admin", share_id)
             if done is None:
                 return self._error(404, "not_found")
+            if done == "revoked":
+                self._mirror_share({**share, "owner": "admin", "token": ""}, False)
             return self._json(200, json.dumps({"result": done}).encode())
         except module.ShareError as error:
             return self._error(error.status, error.message)
@@ -2855,8 +2855,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(429, "too many tries")
             return self._error(404, "not_found")
         owner_prefs = (self.server.chat_store.voice_prefs(share["owner"]) if self.server.chat_store is not None
-                       else {"voice": None, "speed": 1.0, "reply_style": "", "voice_style": ""})
+                       else {"voice": None, "speed": 1.0, "reply_style": ""})
         if method == "GET":
+            if kind == "conversation":
+                known = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("rev", [""])[0]
+                room = shares.conversation(token, int(known) if known.isdigit() else None)
+                room.update(messages_left=share["max_messages"] - share["messages"], audio_left=share["max_audio"] - share["audio"])
+                return self._json(200, json.dumps(room, ensure_ascii=False).encode())
             model = self._share_model()
             return self._json(200, json.dumps(shares.view(share, model, self.server.voice is not None, owner_prefs),
                                               ensure_ascii=False).encode())
@@ -2873,52 +2878,70 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(error.status, error.message)
 
     def _share_chat(self, shares, module, share: dict, owner_prefs: dict):
-        """One message of a visitor's chat: cleaned, counted, sent to the model with the owner's key, streamed back."""
-        body = self._read_json(module.GUEST_TOTAL_CHARS * 4 + 4096)
+        """A visitor's message: it joins the shared conversation, the model answers it with the whole conversation in view, and
+        the answer is written into the conversation as it arrives, so every page shows it. The asker's connection also gets
+        the stream, which is what feeds their Talk mode; if they leave, the reply is still finished for the others."""
+        text, name, note = module.clean_post(self._read_json(module.MESSAGE_CHARS * 4 + 4096))
         model = self._share_model()
         if model is None or self.server.chat_key is None:
             raise module.ShareError(503, "the model is not available right now")
-        payload = module.clean_request(body, model, owner_prefs.get("reply_style"), body.get("note") if body else None)
-        if not shares.take_message(share["token"]):
+        token = share["token"]
+        if not shares.take_message(token):
             raise module.ShareError(403, "this link has used up its messages")
-        conversation = body.get("conversation") if body else None
-        turn = secrets.token_hex(4)
-        shares.record(share["token"], "user", payload["messages"][-1]["content"], conversation, turn)
         if not self.server.guest_replies.acquire(blocking=False):
-            shares.refund_message(share["token"])
+            shares.refund_message(token)
             raise module.ShareError(503, "busy: several replies are being written; try again in a moment")
+        reply = None
         upstream = None
-        answer: list[bytes] = []
         try:
+            try:
+                reply = shares.ask(token, name, text)
+            except module.ShareError:
+                shares.refund_message(token)
+                raise
+            self._mirror_share(share, True)
+            payload = module.build_request(shares.context(token), model, owner_prefs.get("reply_style"), note)
             status, upstream = self.server.monitor.gufo.open_post(
-                "/v1/chat/completions", json.dumps(payload, ensure_ascii=False).encode(),
-                api_key=self.server.chat_key)
+                "/v1/chat/completions", json.dumps(payload, ensure_ascii=False).encode(), api_key=self.server.chat_key)
             if status != 200:
-                shares.refund_message(share["token"])
                 raise module.ShareError(502, "the model could not answer; try again")
             self.send_response(200)
-            for name, value in SECURITY_HEADERS:
-                self.send_header(name, value)
+            for header, value in SECURITY_HEADERS:
+                self.send_header(header, value)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
+            asker_here, pending, flushed = True, [], time.monotonic()
             for line in iter(upstream.readline, b""):
-                answer.append(line)
-                self.wfile.write(line)
-                if line == b"\n":
-                    self.wfile.flush()
-            self.wfile.flush()
+                piece = reply_piece(line)
+                if piece:
+                    pending.append(piece)
+                    if time.monotonic() - flushed >= 0.3:  # the room is updated a few times a second, not per token
+                        shares.extend_reply(token, reply, "".join(pending))
+                        pending, flushed = [], time.monotonic()
+                if asker_here:
+                    try:
+                        self.wfile.write(line)
+                        if line == b"\n":
+                            self.wfile.flush()
+                    except OSError:
+                        asker_here = False  # they left; the reply is finished for everyone else
+            if pending:
+                shares.extend_reply(token, reply, "".join(pending))
+        except module.ShareError:
+            raise
         except OSError:
-            pass  # the visitor left; closing the upstream stops the reply
+            pass
         finally:
             if upstream is not None:
                 upstream.close()
+            if reply is not None:
+                shares.finish_reply(token, reply)
+                self._mirror_share(share, True)
             self.server.guest_replies.release()
-            if share["logged"]:
-                shares.record(share["token"], "assistant", reply_text(answer), conversation, turn)
 
     def _share_audio(self, shares, module, share: dict, kind: str, owner_prefs: dict):
         """A visitor's utterance to text, or a reply's text to speech in the owner's voice. At most
@@ -2935,15 +2958,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = 0
-            if not 44 < length <= module.GUEST_AUDIO_BYTES:
-                raise module.ShareError(400, f"expected a WAV of at most {module.GUEST_AUDIO_BYTES >> 20} MiB")
+            if not 44 < length <= module.AUDIO_BYTES:
+                raise module.ShareError(400, f"expected a WAV of at most {module.AUDIO_BYTES >> 20} MiB")
             wav = self.rfile.read(length)
         else:
-            body = self._read_json(module.GUEST_TEXT_CHARS * 4 + 1024)
+            body = self._read_json(module.TEXT_CHARS * 4 + 1024)
             text = body.get("text") if body else None
             language = body.get("language") if body else None
-            if not isinstance(text, str) or not text.strip() or len(text) > module.GUEST_TEXT_CHARS:
-                raise module.ShareError(400, f"expected text of 1 to {module.GUEST_TEXT_CHARS} characters")
+            if not isinstance(text, str) or not text.strip() or len(text) > module.TEXT_CHARS:
+                raise module.ShareError(400, f"expected text of 1 to {module.TEXT_CHARS} characters")
             if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
                 raise module.ShareError(400, "language is a lower-case name such as bulgarian")
         if not self.server.guest_speech.acquire(blocking=False):
@@ -2954,8 +2977,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if kind == "transcribe":
                 status, answer, content_type = voice.transcribe(wav, key)
             else:
-                status, answer, content_type = voice.speak(
-                    text, key, owner_prefs.get("voice"), language, owner_prefs.get("voice_style") or None)
+                status, answer, content_type = voice.speak(text, key, owner_prefs.get("voice"), language)
         finally:
             self.server.guest_speech.release()
         if status != 200:
@@ -2971,7 +2993,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         info = self.server.voice.info(self.server.chat_key)
         store = self.server.chat_store
         info["prefs"] = (store.voice_prefs(self._chat_owner()) if store is not None
-                         else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
+                         else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
         self._json(200, json.dumps(info).encode())
 
     def _voice_prefs_put(self):
@@ -2990,24 +3012,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 or not isinstance(speed, (int, float)) or not 0.5 <= speed <= 2.0
                 or not (name is None or (isinstance(name, str) and VOICE_NAME.fullmatch(name)))):
             return self._error(400, "expected {voice: name or null, speed: 0.5 to 2}")
-        offered = voice.info(self.server.chat_key)
-        if name == DESIGN_VOICE:
-            if not offered["design"]:
-                return self._error(400, "no VoiceDesign server is answering (--tts-design-url)")
-        elif (name is not None and offered["voices"]
-              and name not in offered["voices"] + [r["voice"] for r in offered["routed"]]):
+        offered = voice.info(self.server.chat_key)["voices"]
+        if name is not None and offered and name not in offered:
             return self._error(400, "the speech server has no such voice")
         avatar = body.get("avatar")
         if avatar is not None and not isinstance(avatar, bool):
             return self._error(400, "avatar is true or false")
-        styles = {}
-        for key in ("reply_style", "voice_style"):
-            value = body.get(key)
-            if value is not None and not (isinstance(value, str) and len(value) <= STYLE_MAX):
-                return self._error(400, f"{key} is text of at most {STYLE_MAX} characters")
-            styles[key] = value.strip() if isinstance(value, str) else None
+        style = body.get("reply_style")
+        if style is not None and not (isinstance(style, str) and len(style) <= STYLE_MAX):
+            return self._error(400, f"reply_style is text of at most {STYLE_MAX} characters")
         self._json(200, json.dumps(store.set_voice_prefs(
-            self._chat_owner(), name, float(speed), avatar, **styles)).encode())
+            self._chat_owner(), name, float(speed), avatar, style.strip() if style is not None else None)).encode())
 
     def _avatar_put(self):
         """PUT /api/chat/avatar {enabled}: show or hide the chat's avatar for the admin's account;
@@ -3024,7 +3039,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _voice_route(self, kind: str):
         """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
-        and answers {"text", "language"}; POST /api/chat/speak takes {"text", "voice"?, "language"?, "instructions"?} and answers a WAV
+        and answers {"text", "language"}; POST /api/chat/speak takes {"text", "voice"?, "language"?} and answers a WAV
         file. Both go to Gufo's speech servers with the admin's chat key."""
         voice = self.server.voice
         if voice is None:
@@ -3048,16 +3063,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             text = body.get("text") if body else None
             name = body.get("voice") if body else None
             language = body.get("language") if body else None
-            instructions = body.get("instructions") if body else None
             if not isinstance(text, str) or not text.strip() or len(text) > voice.TEXT_MAX:
                 return self._error(400, f"expected text of 1 to {voice.TEXT_MAX} characters")
             if name is not None and not isinstance(name, str):
                 return self._error(400, "voice is a string")
             if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
                 return self._error(400, "language is a lower-case name such as bulgarian")
-            if instructions is not None and not (isinstance(instructions, str) and len(instructions) <= STYLE_MAX):
-                return self._error(400, f"instructions is text of at most {STYLE_MAX} characters")
-            status, answer, content_type = voice.speak(text, key, name, language, instructions or None)
+            status, answer, content_type = voice.speak(text, key, name, language)
         self._send(status, answer, content_type if status == 200 else "application/json")
 
     # -- the private library: /api/library/* (read with the admin or the library token, change
@@ -3393,12 +3405,6 @@ def parse_args(argv=None):
                         help="a `gufo serve asr` server; with --tts-url it turns on the chat's "
                              "talk mode (the admin's, using --chat-key-file)")
     parser.add_argument("--tts-url", metavar="URL", help="a `gufo serve tts` server")
-    parser.add_argument("--tts-route", metavar="LANGUAGE=URL", action="append", default=[],
-                        help="speak this language (a lower-case name such as bulgarian) with another "
-                             "`gufo serve tts` server, for a model fine-tuned for it; repeatable")
-    parser.add_argument("--tts-design-url", metavar="URL",
-                        help="a `gufo serve tts` server running a VoiceDesign model: adds a 'designed voice' "
-                             "choice, spoken in the voice the account's Voice instructions describe")
     parser.add_argument("--asr-ignore-language", metavar="LANGUAGE", action="append", default=[],
                         help="treat an utterance the recognizer hears as this language (a lower-case name such as "
                              "chinese) as noise: no text comes back and talk mode keeps listening. Repeatable")
@@ -3549,25 +3555,10 @@ def main(argv=None) -> int:
     if bool(args.asr_url) != bool(args.tts_url):
         print("gufo-monitor: --asr-url and --tts-url go together", file=sys.stderr)
         return 2
-    routes: dict[str, str] = {}
-    for route in args.tts_route:
-        language, _, url = route.partition("=")
-        if not LANGUAGE_NAME.fullmatch(language) or not url.startswith(("http://", "https://")):
-            print(f"gufo-monitor: --tts-route {route!r}: expected LANGUAGE=URL, such as bulgarian=http://127.0.0.1:1237",
-                  file=sys.stderr)
-            return 2
-        routes[language] = url
-    if routes and not args.asr_url:
-        print("gufo-monitor: --tts-route needs --asr-url and --tts-url", file=sys.stderr)
-        return 2
-    if args.tts_design_url and not args.asr_url:
-        print("gufo-monitor: --tts-design-url needs --asr-url and --tts-url", file=sys.stderr)
-        return 2
     if not all(LANGUAGE_NAME.fullmatch(name) for name in args.asr_ignore_language):
         print("gufo-monitor: --asr-ignore-language takes a lower-case language name, such as chinese", file=sys.stderr)
         return 2
-    voice = (VoiceServices(args.asr_url, args.tts_url, args.tts_voice, routes, args.tts_design_url,
-                           set(args.asr_ignore_language))
+    voice = (VoiceServices(args.asr_url, args.tts_url, args.tts_voice, set(args.asr_ignore_language))
              if args.asr_url else None)
     server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
                     chat_key, args.chat_model, chat_store, library, voice, shares)

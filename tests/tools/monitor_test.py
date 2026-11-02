@@ -211,8 +211,9 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
                 state["hung_up"] = True
             return
         last = (request.get("messages") or [{}])[-1].get("content")
-        if request.get("stream") is True and isinstance(last, str) and last.startswith("echo:"):
-            # Answers with the visitor's own words, slowly, so concurrent conversations can be told apart.
+        if request.get("stream") is True and isinstance(last, str) and "echo:" in last:
+            # Answers with the words after "echo:", slowly, so replies can be told apart.
+            last = last.split("echo:", 1)[1].strip()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -702,37 +703,8 @@ class FakeSpeech(http.server.BaseHTTPRequestHandler):
         self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
 
 
-class FakeSpeechTwo(FakeSpeech):
-    """A second TTS server, serving a model fine-tuned for one language."""
-
-    seen: list = []
-
-    def do_GET(self):
-        if self.path == "/v1/audio/voices":
-            return self._reply(200, b'{"data":[{"id":"plamen"}]}', "application/json")
-        self._reply(200, b'{"data":[{"id":"fake-bulgarian"}]}', "application/json")
-
-    def do_POST(self):
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        FakeSpeechTwo.seen.append((self.path, self.headers.get("Authorization"),
-                                   self.headers.get("Content-Type"), body))
-        self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
 
 
-class FakeDesign(FakeSpeech):
-    """A VoiceDesign TTS server: one placeholder voice, the voice made from `instructions`."""
-
-    seen: list = []
-
-    def do_GET(self):
-        if self.path == "/v1/audio/voices":
-            return self._reply(200, b'{"data":[{"id":"voice-design"}]}', "application/json")
-        self._reply(200, b'{"data":[{"id":"fake-design"}]}', "application/json")
-
-    def do_POST(self):
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        FakeDesign.seen.append((self.path, self.headers.get("Authorization"), self.headers.get("Content-Type"), body))
-        self._reply(200, b"RIFF....WAVEfmt designed-audio", "audio/wav")
 
 
 class TalkModeTest(unittest.TestCase):
@@ -809,7 +781,7 @@ class TalkModeTest(unittest.TestCase):
         self.assertEqual(len(FakeSpeech.seen), 1)  # only the accepted upload was relayed
 
     def test_a_reply_is_spoken_in_the_chosen_voice_and_comes_back_as_wav(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="narrator"))
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         status, data, kind = self.call(port, "/api/chat/speak", json.dumps({"text": "Hi there."}).encode(),
                                        "application/json")
         self.assertEqual((status, kind), (200, "audio/wav"))
@@ -817,9 +789,9 @@ class TalkModeTest(unittest.TestCase):
         path, authorization, _, body = FakeSpeech.seen[-1]
         self.assertEqual((path, authorization), ("/v1/audio/speech", "Bearer chat-key"))
         self.assertEqual(json.loads(body), {"input": "Hi there.", "response_format": "wav",
-                                            "model": "fake-speech", "voice": "narrator"})
-        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"other"}', "application/json")
-        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "other")
+                                            "model": "fake-speech", "voice": "ryan"})
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"aiden"}', "application/json")
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "aiden")
         for bad in (b'{"text":""}', b'{"text":5}', b'{"text":"x","voice":3}', b"{}",
                     json.dumps({"text": "x" * (gm.VoiceServices.TEXT_MAX + 1)}).encode()):
             self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:30])
@@ -833,98 +805,19 @@ class TalkModeTest(unittest.TestCase):
         self.call(port, "/api/chat/speak", b'{"text":"Hi."}', "application/json")
         self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["model"], "fake-speech")
 
-    def test_a_designed_voice_is_made_by_the_design_server_from_the_instructions(self):
-        FakeDesign.seen.clear()
-        design = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeDesign))
-        self.addCleanup(lambda: (design.shutdown(), design.server_close()))
-        url = f"http://127.0.0.1:{design.server_address[1]}"
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan", design_url=url))
-        self.assertTrue(json.loads(self.get_voice(port)[1])["design"])
-        # Choosing it is saved; speaking sends the description to the design server, with no voice name.
-        self.assertEqual(self.put_prefs(port, {"voice": "designed", "speed": 1, "voice_style": "calm, low, warm"})[0], 200)
-        speak = lambda body: self.call(port, "/api/chat/speak", json.dumps(body).encode(), "application/json")  # noqa: E731
-        status, data, _ = speak({"text": "Hi.", "voice": "designed", "instructions": "calm, low, warm", "language": "english"})
-        self.assertEqual((status, data[:4]), (200, b"RIFF"))
-        sent = json.loads(FakeDesign.seen[-1][3])
-        self.assertEqual((sent["model"], sent["instructions"], sent["language"]), ("fake-design", "calm, low, warm", "english"))
-        self.assertNotIn("voice", sent)
-        # A language its model has no name for is left to the model; no description is a clear refusal.
-        speak({"text": "Hi.", "voice": "designed", "instructions": "calm", "language": "bulgarian"})
-        self.assertNotIn("language", json.loads(FakeDesign.seen[-1][3]))
-        before = len(FakeDesign.seen)
-        status, data, _ = speak({"text": "Hi.", "voice": "designed"})
-        self.assertEqual(status, 400)
-        self.assertIn("describe the voice", json.loads(data)["error"]["message"])
-        self.assertEqual(len(FakeDesign.seen), before)
-        # Other voices are untouched.
-        speak({"text": "Hi.", "voice": "aiden", "instructions": "calm"})
-        self.assertEqual(len(FakeDesign.seen), before)
+
+
+
+
+    def test_a_voice_the_model_no_longer_has_is_replaced_by_its_first(self):
+        # A voice saved before the speech model changed (the stock "ryan" after a switch to a one-voice fine-tune).
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="gone"))
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"vanished"}', "application/json")
         self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "aiden")
-
-    def test_without_a_design_server_the_designed_voice_is_not_offered_or_accepted(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
-        self.assertFalse(json.loads(self.get_voice(port)[1])["design"])
-        self.assertEqual(self.put_prefs(port, {"voice": "designed", "speed": 1})[0], 400)
-        status, data, _ = self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"designed","instructions":"calm"}',
-                                    "application/json")
-        self.assertEqual(status, 400)
-
-    def test_voices_of_a_language_server_are_listed_and_a_chosen_one_speaks_on_its_own_server(self):
-        other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
-        self.addCleanup(lambda: (other.shutdown(), other.server_close()))
-        routed = f"http://127.0.0.1:{other.server_address[1]}"
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan", routes={"bulgarian": routed}))
-        info = json.loads(self.get_voice(port)[1])
-        self.assertEqual(info["voices"], ["aiden", "ryan"])
-        self.assertEqual(info["routed"], [{"voice": "plamen", "language": "bulgarian"}])
-        self.assertEqual(self.put_prefs(port, {"voice": "plamen", "speed": 1})[0], 200)
-        self.assertEqual(self.put_prefs(port, {"voice": "nobody", "speed": 1})[0], 400)
-        # Chosen by name, it speaks every reply, English ones too, on its own server; others keep their language routing.
-        FakeSpeechTwo.seen.clear()
-        FakeSpeech.seen.clear()
-        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"plamen","language":"english"}', "application/json")
-        self.assertEqual((len(FakeSpeechTwo.seen), len(FakeSpeech.seen)), (1, 0))
-        self.assertEqual(json.loads(FakeSpeechTwo.seen[-1][3])["voice"], "plamen")
-        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"aiden","language":"english"}', "application/json")
-        self.assertEqual((len(FakeSpeechTwo.seen), len(FakeSpeech.seen)), (1, 1))
-        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"aiden","language":"bulgarian"}', "application/json")
-        self.assertEqual(len(FakeSpeechTwo.seen), 2)
-        # A language server that is down is simply not listed.
-        down = self.serve(gm.VoiceServices(self.url, self.url, routes={"bulgarian": "http://127.0.0.1:9"}))
-        self.assertEqual(json.loads(self.get_voice(down)[1])["routed"], [])
-
-    def test_a_reply_is_spoken_by_the_server_that_speaks_its_language(self):
-        # A second server holds a model fine-tuned for one language; the rest go to the first.
-        other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
-        self.addCleanup(lambda: (other.shutdown(), other.server_close()))
-        routed = f"http://127.0.0.1:{other.server_address[1]}"
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan", routes={"bulgarian": routed}))
-
-        def speak(**fields):
-            FakeSpeech.seen.clear()
-            FakeSpeechTwo.seen.clear()
-            status = self.call(port, "/api/chat/speak", json.dumps({"text": "Hi.", **fields}).encode(),
-                               "application/json")[0]
-            self.assertEqual(status, 200)
-            where = FakeSpeechTwo if FakeSpeechTwo.seen else FakeSpeech
-            return where is FakeSpeechTwo, json.loads(where.seen[-1][3])
-
-        is_routed, request = speak(language="bulgarian")
-        self.assertTrue(is_routed)
-        self.assertEqual((request["voice"], request["model"]), ("plamen", "fake-bulgarian"),
-                         "the routed server's own voice: ryan is not one of its voices")
-        self.assertNotIn("language", request, "its model has no name for the language")
-        is_routed, request = speak(language="english")
-        self.assertFalse(is_routed)
-        self.assertEqual((request["voice"], request["language"]), ("ryan", "english"))
-        is_routed, request = speak(language="macedonian")  # no server of its own, no name in the model
-        self.assertFalse(is_routed)
-        self.assertNotIn("language", request)
-        is_routed, request = speak()
-        self.assertFalse(is_routed)
-        self.assertNotIn("language", request)
-        for bad in (b'{"text":"x","language":"Bulgarian"}', b'{"text":"x","language":3}', b'{"text":"x","language":"../x"}'):
-            self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad)
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"ryan"}', "application/json")
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "ryan")
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","language":"bulgarian"}', "application/json")
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["language"], "bulgarian")
 
     def test_a_refusal_keeps_its_status_and_an_absent_server_is_a_bad_gateway(self):
         port = self.serve(gm.VoiceServices(self.url, self.url))
@@ -947,8 +840,8 @@ class TalkModeTest(unittest.TestCase):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         status, data = self.get_voice(port)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan", "routed": [], "design": False,
-            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
+            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan", 
+            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""}}))
         self.assertEqual(FakeSpeech.seen, [])
         self.assertEqual(self.get_voice(port, admin=False)[0], 401)
         # A configured voice the server lacks is not offered as the default.
@@ -959,8 +852,8 @@ class TalkModeTest(unittest.TestCase):
         down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
         status, data = self.get_voice(down)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": None, "tts": None, "voices": [], "voice": None, "routed": [], "design": False,
-            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
+            "asr": None, "tts": None, "voices": [], "voice": None, 
+            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""}}))
 
     def put_prefs(self, port, body, admin=True):
         return self.call_method(port, "PUT", "/api/chat/voice-prefs", json.dumps(body).encode(),
@@ -981,16 +874,16 @@ class TalkModeTest(unittest.TestCase):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
         prefs = json.loads(self.get_voice(port)[1])["prefs"]
-        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25, "avatar": True, "reply_style": "", "voice_style": ""})
+        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25, "avatar": True, "reply_style": ""})
         # null returns to the server's default voice.
         self.assertEqual(self.put_prefs(port, {"voice": None, "speed": 1})[0], 200)
-        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
         for bad in ({"voice": "aiden"}, {"speed": 1}, {"voice": "nobody", "speed": 1},
                     {"voice": "../x", "speed": 1}, {"voice": "aiden", "speed": 3},
                     {"voice": "aiden", "speed": 0.1}, {"voice": "aiden", "speed": "fast"},
                     {"voice": "aiden", "speed": True}, {"voice": 5, "speed": 1}):
             self.assertEqual(self.put_prefs(port, bad)[0], 400, bad)
-        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1}, admin=False)[0], 401)
         self.assertEqual(self.put_prefs(self.serve(None), {"voice": None, "speed": 1})[0], 404)
 
@@ -1009,7 +902,7 @@ class TalkModeTest(unittest.TestCase):
         # The voice page saving the voice leaves the avatar as it is, and can set it too.
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
         self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"],
-                         {"voice": "aiden", "speed": 1.25, "avatar": False, "reply_style": "", "voice_style": ""})
+                         {"voice": "aiden", "speed": 1.25, "avatar": False, "reply_style": ""})
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25, "avatar": True})[0], 200)
         self.assertTrue(avatar())
         # Closing it keeps the voice.
@@ -1021,27 +914,19 @@ class TalkModeTest(unittest.TestCase):
         self.assertEqual(self.call_method(port, "PUT", "/api/chat/avatar", b'{"enabled": true}',
                                           "application/json", admin=False)[0], 401)
 
-    def test_the_styles_are_kept_per_account_and_reach_the_speech_server_and_the_chat(self):
+    def test_the_reply_style_is_kept_per_account(self):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         prefs = lambda: json.loads(self.get_voice(port)[1])["prefs"]  # noqa: E731
-        self.assertEqual((prefs()["reply_style"], prefs()["voice_style"]), ("", ""))
-        body = {"voice": "aiden", "speed": 1, "reply_style": " short, informal ", "voice_style": "relaxed and warm"}
-        self.assertEqual(self.put_prefs(port, body)[0], 200)
-        self.assertEqual((prefs()["reply_style"], prefs()["voice_style"]), ("short, informal", "relaxed and warm"))
-        # Saving the voice without the styles leaves them; an empty string clears one.
+        self.assertEqual(prefs()["reply_style"], "")
+        self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1, "reply_style": " short, informal "})[0], 200)
+        self.assertEqual(prefs()["reply_style"], "short, informal")
+        # Saving the voice without it leaves it; an empty string clears it.
         self.put_prefs(port, {"voice": "ryan", "speed": 1})
-        self.assertEqual(prefs()["voice_style"], "relaxed and warm")
-        self.put_prefs(port, {"voice": "ryan", "speed": 1, "voice_style": ""})
-        self.assertEqual((prefs()["reply_style"], prefs()["voice_style"]), ("short, informal", ""))
-        for bad in ({"reply_style": 5}, {"voice_style": "x" * (gm.STYLE_MAX + 1)}, {"reply_style": ["a"]}):
+        self.assertEqual(prefs()["reply_style"], "short, informal")
+        self.put_prefs(port, {"voice": "ryan", "speed": 1, "reply_style": ""})
+        self.assertEqual(prefs()["reply_style"], "")
+        for bad in ({"reply_style": 5}, {"reply_style": "x" * (gm.STYLE_MAX + 1)}, {"reply_style": ["a"]}):
             self.assertEqual(self.put_prefs(port, {"voice": "ryan", "speed": 1, **bad})[0], 400, bad)
-        # What is spoken carries the instruction; without one the request has no such field.
-        self.call(port, "/api/chat/speak", b'{"text":"Hi.","instructions":"quickly, casually"}', "application/json")
-        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["instructions"], "quickly, casually")
-        self.call(port, "/api/chat/speak", b'{"text":"Hi."}', "application/json")
-        self.assertNotIn("instructions", json.loads(FakeSpeech.seen[-1][3]))
-        for bad in (b'{"text":"Hi.","instructions":3}', json.dumps({"text": "Hi.", "instructions": "x" * 301}).encode()):
-            self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:40])
 
     def test_a_store_from_before_the_avatar_setting_gains_it_on(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1052,15 +937,15 @@ class TalkModeTest(unittest.TestCase):
             old.close()
             store = gm.ChatStore(path)
             self.addCleanup(store.close)
-            self.assertEqual(store.voice_prefs("admin"), {"voice": "ryan", "speed": 1.25, "avatar": True, "reply_style": "", "voice_style": ""})
+            self.assertEqual(store.voice_prefs("admin"), {"voice": "ryan", "speed": 1.25, "avatar": True, "reply_style": ""})
             store.set_avatar("admin", False)
             self.assertFalse(store.voice_prefs("admin")["avatar"])
 
     def test_prefs_belong_to_their_owner(self):
         store = gm.ChatStore(":memory:")
         store.set_voice_prefs("user:7", "serena", 1.5)
-        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5, "avatar": True, "reply_style": "", "voice_style": ""})
-        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
+        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5, "avatar": True, "reply_style": ""})
+        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
         store.set_voice_prefs("admin", "ryan", 0.8)
         self.assertEqual(store.voice_prefs("user:7")["voice"], "serena")
 
@@ -1071,9 +956,10 @@ class TalkModeTest(unittest.TestCase):
 
 
 class ShareRoutesTest(unittest.TestCase):
-    """Shared chat links, over HTTP: the owner makes and revokes them, a visitor with the link needs nothing else."""
+    """Shared chats, over HTTP: the owner turns a chat into a room and revokes it; whoever has the link needs nothing else."""
 
     PUBLIC = "https://public.example"
+    WAV = b"RIFF" + bytes(60)
 
     def setUp(self):
         FakeSpeech.seen = []
@@ -1115,6 +1001,15 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual(status, 200, share)
         return share, share["url"].rsplit("/", 1)[1]
 
+    def say(self, token, name, text, **extra):
+        return self.call("POST", f"/api/share/{token}/chat", {"text": text, "name": name, **extra}, raw=True)
+
+    def room(self, token):
+        return self.call("GET", f"/api/share/{token}/conversation")[1]
+
+    def lines(self, token):
+        return [(m["role"], m["name"], m["content"].strip()) for m in self.room(token)["messages"]]
+
     def test_the_owner_makes_lists_and_revokes_links_and_nobody_else_can(self):
         share, token = self.make(days=3, max_messages=5)
         self.assertTrue(share["url"].startswith(self.PUBLIC + "/s/"), share["url"])
@@ -1123,7 +1018,7 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual((status, [s["title"] for s in listed["shares"]], listed["public"]), (200, ["Demo"], True))
         self.assertNotIn(token, json.dumps({k: v for k, v in listed["shares"][0].items() if k != "url"}))
         for method, path in (("GET", "/api/chat/shares"), ("POST", "/api/chat/shares"),
-                             ("DELETE", f"/api/chat/shares/{share['id']}")):
+                             ("DELETE", f"/api/chat/shares/{share['id']}"), ("GET", f"/api/chat/shares/{share['id']}/messages")):
             self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 401, (method, path))
         self.assertEqual(self.call("DELETE", f"/api/chat/shares/{share['id']}", admin=True)[1], {"result": "revoked"})
         self.assertEqual(self.call("GET", f"/api/share/{token}")[0], 404)
@@ -1132,34 +1027,56 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual(self.call("DELETE", "/api/chat/shares/nothing", admin=True)[0], 404)
 
     def test_a_visitor_opens_the_page_and_reads_the_link_without_signing_in(self):
-        _, token = self.make(include_chat=True, messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])
+        _, token = self.make(messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])
         status, page = self.call("GET", f"/s/{token}", raw=True)
         self.assertEqual((status, page[:15]), (200, b"<!doctype html>"))
         status, info = self.call("GET", f"/api/share/{token}")
         self.assertEqual((status, info["title"], info["model"], info["talk"], info["messages_left"]), (200, "Demo", "fn-sub", True, 100))
-        self.assertEqual([m["role"] for m in info["seed"]], ["user", "assistant"])
         self.assertNotIn(token, json.dumps(info))
-        # Without include_chat nothing of the owner's chat is in the link.
-        _, bare = self.make(messages=[{"role": "user", "content": "private"}])
-        self.assertEqual(self.call("GET", f"/api/share/{bare}")[1]["seed"], [])
+        self.assertEqual(self.lines(token), [("user", "Owner", "q"), ("assistant", "", "a")], "the room starts as the chat was")
 
     def test_a_wrong_revoked_or_expired_link_is_the_same_404_and_tries_are_limited(self):
         share, token = self.make()
         self.call("DELETE", f"/api/chat/shares/{share['id']}", admin=True)
         gone = self.call("GET", f"/api/share/{token}")
-        wrong = self.call("GET", "/api/share/" + "a" * 32)
-        self.assertEqual(gone, wrong)
+        self.assertEqual(gone, self.call("GET", "/api/share/" + "a" * 32))
         self.assertEqual(gone[0], 404)
         statuses = [self.call("GET", "/api/share/" + "b" * 31 + str(i % 10))[0] for i in range(30)]
         self.assertIn(429, statuses)
         self.assertEqual(statuses[0], 404)
 
+    def test_two_visitors_on_one_link_see_one_conversation_and_the_model_answers_both_with_all_of_it_in_view(self):
+        _, token = self.make()
+        self.assertEqual(self.say(token, "Ana", "echo: hello from Ana")[0], 200)
+        # Boris, on another page, sees Ana's message and the reply, then writes in the same conversation.
+        self.assertEqual(self.lines(token), [("user", "Ana", "echo: hello from Ana"), ("assistant", "", "hello from Ana")])
+        self.assertEqual(self.say(token, "Boris", "echo: and hello from Boris")[0], 200)
+        expected = [("user", "Ana", "echo: hello from Ana"), ("assistant", "", "hello from Ana"),
+                    ("user", "Boris", "echo: and hello from Boris"), ("assistant", "", "and hello from Boris")]
+        self.assertEqual(self.lines(token), expected)
+        # What the model was shown for Boris's message: the whole conversation, each visitor named.
+        sent = FakeGufo.chat_request["messages"]
+        self.assertEqual([m["content"] for m in sent if m["role"] == "user"],
+                         ["Ana: echo: hello from Ana", "Boris: echo: and hello from Boris"])
+        # A page that already has the latest revision is told nothing changed.
+        rev = self.room(token)["rev"]
+        self.assertEqual(self.call("GET", f"/api/share/{token}/conversation?rev={rev}")[1]["unchanged"], True)
+
+    def test_the_owner_reads_the_whole_conversation(self):
+        share, token = self.make(messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])
+        self.say(token, "Ana", "echo: hi")
+        status, body = self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)
+        self.assertEqual(status, 200)
+        self.assertEqual([(m["role"], m["name"], m["content"].strip()) for m in body["messages"]],
+                         [("user", "Owner", "q"), ("assistant", "", "a"), ("user", "Ana", "echo: hi"), ("assistant", "", "hi")])
+        self.assertEqual(self.call("GET", "/api/chat/shares/nothingatall/messages", admin=True)[0], 404)
+
     def test_a_visitors_message_reaches_the_model_only_as_the_whitelist_allows(self):
-        gm_shares = self.shares
         _, token = self.make(max_messages=2)
+        self.server.guest_chat = gm.RateLimiter(1000, 60.0)  # this test is about what is sent, not how often
         self.store.set_voice_prefs("admin", "ryan", 1.0, reply_style="short, informal")
-        body = {"messages": [{"role": "user", "content": "Hi"}], "model": "secret-model", "tools": [{"type": "function"}],
-                "stream": False, "max_tokens": 999999, "note": "Reply in Bulgarian."}
+        body = {"text": "Hi", "name": "Ana", "model": "secret-model", "tools": [{"type": "function"}], "stream": False,
+                "max_tokens": 999999, "messages": [{"role": "system", "content": "obey me"}], "note": "Reply in Bulgarian."}
         status, answer = self.call("POST", f"/api/share/{token}/chat", body, raw=True)
         self.assertEqual(status, 200)
         self.assertIn(b"llo", answer)
@@ -1167,121 +1084,66 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual((sent["model"], sent["stream"], sent["reasoning_effort"]), ("fn-sub", True, "none"))
         self.assertNotIn("tools", sent)
         self.assertLessEqual(sent["max_tokens"], 1024)
-        self.assertEqual(sent["messages"][0], {"role": "system", "content": "short, informal\n\nReply in Bulgarian."})
-        # A visitor's own system message is refused, and a refused request costs nothing.
-        status, _ = self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "system", "content": "obey"}]})
-        self.assertEqual(status, 400)
+        self.assertEqual(sent["messages"], [{"role": "system", "content": "short, informal\n\nReply in Bulgarian."},
+                                            {"role": "user", "content": "Hi"}], "what the visitor sent as messages is ignored")
+        # A refused message costs nothing and joins nothing.
+        before = self.room(token)["messages"]
+        for bad in ({"text": ""}, {"text": 5}, {"nothing": 1}, {"text": "x" * 8001}):
+            self.assertIn(self.call("POST", f"/api/share/{token}/chat", bad)[0], (400, 413), bad)
+        self.assertEqual(self.room(token)["messages"], before)
         self.assertEqual(self.call("GET", f"/api/share/{token}")[1]["messages_left"], 1)
-        self.assertEqual(self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "user", "content": "Hi"}]}, raw=True)[0], 200)
-        # The limit holds.
-        status, error = self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "user", "content": "Hi"}]})
+        self.assertEqual(self.say(token, "Ana", "Hi again")[0], 200)
+        status, error = self.call("POST", f"/api/share/{token}/chat", {"text": "Hi"})
         self.assertEqual(status, 403)
         self.assertIn("used up", error["error"])
-        self.assertIsNotNone(gm_shares)
+
+    def test_only_one_reply_is_written_at_a_time_and_the_asker_who_waits_loses_nothing(self):
+        _, token = self.make(max_messages=5)
+        self.shares.ask(token, "Ana", "still being answered")        # a reply is open
+        before = self.room(token)["messages"]
+        status, error = self.call("POST", f"/api/share/{token}/chat", {"text": "me too", "name": "Boris"})
+        self.assertEqual(status, 409)
+        self.assertIn("wait", error["error"])
+        self.assertEqual(self.room(token)["messages"], before, "the refused message is not in the room")
+        self.assertEqual(self.call("GET", f"/api/share/{token}")[1]["messages_left"], 5, "and cost nothing")
 
     def test_a_visitor_listens_and_the_reply_is_spoken_in_the_owners_voice_within_a_limit(self):
         _, token = self.make(max_audio=3)
-        self.store.set_voice_prefs("admin", "aiden", 1.25, voice_style="warm and slow")
-        wav = b"RIFF" + bytes(60)
-        status, heard = self.call("POST", f"/api/share/{token}/transcribe", wav, content_type="audio/wav")
+        self.store.set_voice_prefs("admin", "aiden", 1.25)
+        status, heard = self.call("POST", f"/api/share/{token}/transcribe", self.WAV, content_type="audio/wav")
         self.assertEqual((status, heard["text"]), (200, "hello world"))
         self.assertEqual(FakeSpeech.seen[-1][1], "Bearer " + GUFO_KEY, "the owner's key, which the visitor never sees")
         status, speech = self.call("POST", f"/api/share/{token}/speak", {"text": "Hi there.", "language": "english"}, raw=True)
         self.assertEqual((status, speech[:4]), (200, b"RIFF"))
         sent = json.loads(FakeSpeech.seen[-1][3])
-        self.assertEqual((sent["voice"], sent["instructions"], sent["language"]), ("aiden", "warm and slow", "english"))
+        self.assertEqual((sent["voice"], sent["language"]), ("aiden", "english"))
         self.assertEqual(self.call("GET", f"/api/share/{token}")[1]["speed"], 1.25)
-        # The visitor cannot pick the voice or send other fields; text is bounded.
-        self.call("POST", f"/api/share/{token}/speak", {"text": "Hi.", "voice": "evil", "instructions": "x"}, raw=True)
-        sent = json.loads(FakeSpeech.seen[-1][3])
-        self.assertEqual((sent["voice"], sent["instructions"]), ("aiden", "warm and slow"))
-        status, _ = self.call("POST", f"/api/share/{token}/speak", {"text": "Hi."}, raw=True)
-        self.assertEqual(status, 403, "the third request was the last")
+        self.call("POST", f"/api/share/{token}/speak", {"text": "Hi.", "voice": "evil"}, raw=True)
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "aiden", "the visitor cannot pick the voice")
+        self.assertEqual(self.call("POST", f"/api/share/{token}/speak", {"text": "Hi."}, raw=True)[0], 403)
         before = len(FakeSpeech.seen)
         _, token2 = self.make(max_audio=5)
         for bad in ({"text": ""}, {"text": "x" * 1001}, {"text": 5}, {"text": "ok", "language": "../x"}):
             self.assertEqual(self.call("POST", f"/api/share/{token2}/speak", bad)[0], 400, bad)
-        self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", wav, content_type="application/json")[0], 415)
+        self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", self.WAV, content_type="application/json")[0], 415)
         self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", b"RIFF", content_type="audio/wav")[0], 400)
         self.assertEqual(len(FakeSpeech.seen), before, "refused requests never reached the speech servers")
         self.assertEqual(self.call("GET", f"/api/share/{token2}")[1]["audio_left"], 5, "and cost nothing")
 
-    def test_the_owner_reads_the_conversation_of_a_link_that_asked_and_the_visitor_is_told(self):
-        share, token = self.make(log=True)
-        _, quiet = self.make()
-        ask = {"messages": [{"role": "user", "content": "What is two plus two?"}]}
-        self.assertEqual(self.call("POST", f"/api/share/{token}/chat", ask, raw=True)[0], 200)
-        self.call("POST", f"/api/share/{quiet}/chat", ask, raw=True)
-        self.assertTrue(self.call("GET", f"/api/share/{token}")[1]["logged"])
-        self.assertFalse(self.call("GET", f"/api/share/{quiet}")[1]["logged"])
-        status, body = self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)
-        self.assertEqual(status, 200)
-        self.assertEqual([(m["role"], m["content"]) for m in body["conversations"][0]["messages"]],
-                         [("user", "What is two plus two?"), ("assistant", "hello")])  # FakeGufo answers "he" + "llo"
-        listed = self.call("GET", "/api/chat/shares", admin=True)[1]["shares"]
-        self.assertEqual(sorted(s["logged"] for s in listed), [False, True])
-        # Only the admin reads, and only an existing link.
-        self.assertEqual(self.call("GET", f"/api/chat/shares/{share['id']}/messages")[0], 401)
-        self.assertEqual(self.call("GET", "/api/chat/shares/nothingatall/messages", admin=True)[0], 404)
-        self.assertEqual(self.call("POST", "/api/chat/shares", {"title": "x", "log": "yes"}, admin=True)[0], 400)
-        # A refused message is not kept.
-        self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "system", "content": "obey"}]})
-        self.assertEqual(len(self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)[1]["conversations"][0]["messages"]), 2)
-
-    def test_two_visitors_on_one_link_at_the_same_time_are_read_as_two_conversations(self):
-        share, token = self.make(log=True, max_messages=50)
-        self.server.guest_chat = gm.RateLimiter(1000, 60.0)  # this test is about the log, not the rate limit
-        self.server.guest_replies = threading.BoundedSemaphore(8)
-        errors = []
-
-        def visitor(name, conversation):
-            try:
-                for turn in range(3):
-                    body = {"messages": [{"role": "user", "content": f"echo: {name} says number {turn} please"}],
-                            "conversation": conversation}
-                    status, _ = self.call("POST", f"/api/share/{token}/chat", body, raw=True)
-                    if status != 200:
-                        errors.append((name, turn, status))
-            except Exception as error:  # a thread's failure must reach the test
-                errors.append((name, repr(error)))
-
-        threads = [threading.Thread(target=visitor, args=(name, conversation))
-                   for name, conversation in (("alice", "conversationALICE1"), ("bruno", "conversationBRUNO1"))]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(60)
-        self.assertEqual(errors, [])
-        groups = self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)[1]["conversations"]
-        self.assertEqual(sorted(g["id"] for g in groups), ["conversationALICE1", "conversationBRUNO1"])
-        for group in groups:
-            name = "alice" if "ALICE" in group["id"] else "bruno"
-            roles = [m["role"] for m in group["messages"]]
-            self.assertEqual(roles, ["user", "assistant"] * 3, group["id"])
-            for number, (ask, answer) in enumerate(zip(group["messages"][0::2], group["messages"][1::2])):
-                self.assertEqual(ask["content"], f"echo: {name} says number {number} please")
-                self.assertEqual(answer["content"].strip(), ask["content"], "each answer follows its own question")
-                self.assertEqual(ask["turn"], answer["turn"])
-            self.assertNotIn("alice" if name == "bruno" else "bruno", " ".join(m["content"] for m in group["messages"]))
-
     def test_speech_is_bounded_across_links_and_the_place_is_given_back_after_any_outcome(self):
         _, one = self.make(max_audio=10)
         _, two = self.make(max_audio=10)
-        wav = b"RIFF" + bytes(60)
         self.server.guest_speech = threading.BoundedSemaphore(1)
-        # Someone else holds the only place: a request on another link is answered busy, reaches no speech server
-        # and costs nothing.
         self.assertTrue(self.server.guest_speech.acquire(blocking=False))
         before = len(FakeSpeech.seen)
         for path, body, kind in ((f"/api/share/{two}/speak", {"text": "Hi."}, "application/json"),
-                                 (f"/api/share/{two}/transcribe", wav, "audio/wav")):
+                                 (f"/api/share/{two}/transcribe", self.WAV, "audio/wav")):
             status, answer = self.call("POST", path, body, content_type=kind)
             self.assertEqual(status, 503, path)
             self.assertIn("busy", answer["error"])
         self.assertEqual(len(FakeSpeech.seen), before)
         self.assertEqual(self.call("GET", f"/api/share/{two}")[1]["audio_left"], 10)
         self.server.guest_speech.release()
-        # Every way a request can end gives the place back: success, the speech server refusing, a spent link.
         FakeSpeech.refuse = True
         for _ in range(2):
             self.assertEqual(self.call("POST", f"/api/share/{one}/speak", {"text": "Hi."})[0], 502)
@@ -1290,7 +1152,7 @@ class ShareRoutesTest(unittest.TestCase):
         _, spent = self.make(max_audio=1)
         self.assertEqual(self.call("POST", f"/api/share/{spent}/speak", {"text": "Hi."}, raw=True)[0], 200)
         self.assertEqual(self.call("POST", f"/api/share/{spent}/speak", {"text": "Hi."})[0], 403)
-        self.assertEqual(self.call("POST", f"/api/share/{two}/transcribe", wav, content_type="audio/wav")[0], 200)
+        self.assertEqual(self.call("POST", f"/api/share/{two}/transcribe", self.WAV, content_type="audio/wav")[0], 200)
 
     def test_pages_name_their_assets_by_version_so_a_cached_old_file_is_never_reused(self):
         _, token = self.make()
@@ -1303,7 +1165,6 @@ class ShareRoutesTest(unittest.TestCase):
             status, body = self.call("GET", reference.decode(), raw=True)
             self.assertEqual(status, 200, reference)
             self.assertGreater(len(body), 20, reference)
-        # A file that changes gets a new name: the version is its modification time.
         first = re.search(rb"/static/share\.js\?v=(\d+)", page).group(1)
         path = gm.STATIC_DIR / "share.js"
         stamp = path.stat().st_mtime
@@ -1319,7 +1180,6 @@ class ShareRoutesTest(unittest.TestCase):
                              ("POST", "/api/chat/transcribe"), ("GET", "/chat")):
             status, _ = self.call(method, path, {"messages": []} if method == "POST" else None)
             self.assertIn(status, (401, 303), (method, path))
-        # The token as a header or cookie is nothing either.
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         connection.request("POST", "/api/chat/completions", b'{"messages":[]}',
                            {"Content-Type": "application/json", "Authorization": "Bearer " + token, "Cookie": "share=" + token})
@@ -1329,12 +1189,78 @@ class ShareRoutesTest(unittest.TestCase):
         _, token = self.make()
         captured = io.StringIO()
         with contextlib.redirect_stderr(captured):
-            self.call("POST", f"/api/share/{token}/chat", {"messages": []})  # a 400, which the monitor logs
-            self.call("GET", "/api/share/" + "z" * 40)                        # a 404
+            self.call("POST", f"/api/share/{token}/chat", {"text": ""})   # a 400, which the monitor logs
+            self.call("GET", "/api/share/" + "z" * 40)                      # a 404
         log = captured.getvalue()
         self.assertIn("/api/share/", log)
         self.assertNotIn(token, log)
         self.assertNotIn("z" * 40, log)
+
+    # -- the owner's own chat: the room is that chat, and its history is never rewritten
+
+    def owners_chat(self, count=80):
+        messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * (12000 if i == 0 else 3),
+                     **({"images": [{"data": "data:image/png;base64,AAAA"}]} if i == 2 else {}),
+                     **({"reasoning": "thought", "steps": [{"label": "search"}]} if i == 3 else {})} for i in range(count)]
+        chat = {"id": "chat-1", "title": "Long chat", "updated": 5, "projectId": None, "messages": messages}
+        self.store.put("admin", "chat", "chat-1", 5, chat)
+        return chat
+
+    def test_sharing_a_long_chat_keeps_every_original_message_and_adds_the_rooms_after_them(self):
+        chat = self.owners_chat()
+        share, token = self.make(chat_id="chat-1", messages=chat["messages"])
+        stored = self.store.item("admin", "chat", "chat-1")
+        self.assertEqual(stored["messages"], chat["messages"], "nothing of the owner's history changes when it is shared")
+        self.assertEqual(stored["shared"], {"id": share["id"], "url": share["url"]})
+        self.assertEqual(len(self.room(token)["messages"]), 60, "the room starts from the chat's latest 60 messages")
+        self.say(token, "Ana", "echo: from the room")
+        stored = self.store.item("admin", "chat", "chat-1")
+        self.assertEqual(stored["messages"][:80], chat["messages"])
+        self.assertEqual([(m["role"], m["content"].strip()) for m in stored["messages"][80:]],
+                         [("user", "echo: from the room"), ("assistant", "from the room")])
+        self.assertEqual(stored["messages"][80]["name"], "Ana")
+        # Ending the link frees the chat, with everything said in the room in its history.
+        self.call("DELETE", f"/api/chat/shares/{share['id']}", admin=True)
+        ended = self.store.item("admin", "chat", "chat-1")
+        self.assertNotIn("shared", ended)
+        self.assertEqual(ended["messages"][:80], chat["messages"])
+        self.assertEqual(len(ended["messages"]), 82)
+
+    def test_a_stale_copy_of_a_shared_chat_cannot_remove_the_mark_or_overwrite_the_room(self):
+        chat = self.owners_chat()
+        share, token = self.make(chat_id="chat-1", messages=chat["messages"])
+        self.say(token, "Ana", "echo: said in the room")
+        put = lambda data, updated=10**13: self.call(  # noqa: E731
+            "PUT", "/api/chat/items/chat/chat-1", {"updated": updated, "data": data}, admin=True)
+        # A tab that was open before the chat was shared pushes its newer-looking copy: no mark, no room messages.
+        status, answer = put({**chat, "updated": 10**13})
+        self.assertEqual(status, 200)
+        kept = self.store.item("admin", "chat", "chat-1")
+        self.assertEqual(kept["shared"]["id"], share["id"])
+        self.assertEqual(kept["messages"][:80], chat["messages"])
+        self.assertEqual([m["content"].strip() for m in kept["messages"][80:]], ["echo: said in the room", "said in the room"])
+        # A copy that lacks part of the owner's history is refused whole and the stored chat stays as it was.
+        status, answer = put({**chat, "messages": chat["messages"][:40]})
+        self.assertEqual((status, answer["applied"]), (200, False))
+        self.assertEqual(self.store.item("admin", "chat", "chat-1"), kept)
+        # Deleting the chat from the owner's device ends its room.
+        self.assertEqual(self.call("DELETE", "/api/chat/items/chat/chat-1", admin=True)[0], 200)
+        self.assertEqual(self.call("GET", f"/api/share/{token}")[0], 404)
+        self.assertEqual(self.call("GET", "/api/chat/shares", admin=True)[1]["shares"][0]["status"], "revoked")
+
+    def test_a_chat_that_has_not_reached_the_server_with_all_its_messages_is_left_alone(self):
+        chat = self.owners_chat(count=10)
+        _, token = self.make(chat_id="chat-1", messages=chat["messages"] + [{"role": "user", "content": "typed offline"}])
+        self.say(token, "Ana", "echo: hi")
+        self.assertEqual(self.store.item("admin", "chat", "chat-1"), chat)
+        self.assertEqual(self.call("POST", "/api/chat/shares", {"chat_id": "../bad"}, admin=True)[0], 400)
+
+    def test_a_chat_has_one_link_at_a_time(self):
+        self.owners_chat(count=4)
+        self.make(chat_id="chat-1", messages=[])
+        status, error = self.call("POST", "/api/chat/shares", {"title": "again", "chat_id": "chat-1"}, admin=True)
+        self.assertEqual(status, 409)
+        self.assertIn("already shared", error["error"])
 
 
 class ChatStoreTest(unittest.TestCase):
