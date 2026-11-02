@@ -210,6 +210,38 @@ class TextChannelTest(unittest.TestCase):
         self.assertTrue(torch.equal(out[0, 2], torch.zeros(narrow)), "the projection's bias must not lift masked positions")
 
 
+@unittest.skipIf(train is None, "torch and accelerate are not installed")
+class LossAlignmentTest(unittest.TestCase):
+    def test_a_position_is_scored_against_its_own_label_and_not_the_next_ones(self):
+        # Logits that put all their weight on the token each position should emit: the loss is ~0 only when
+        # the labels line up one to one. Labels shifted by a position (what transformers' own loss does to
+        # labels that were already aligned) cost a lot.
+        labels = torch.tensor([[3, 1, 4, 1, 5, -100]])
+        logits = torch.full((1, 6, 8), -10.0)
+        for p, token in enumerate(labels[0].tolist()):
+            logits[0, p, token if token >= 0 else 0] = 10.0
+        self.assertLess(train.aligned_loss(logits, labels).item(), 1e-3)
+        shifted = torch.roll(labels, 1, dims=1)
+        shifted[0, 0] = -100
+        self.assertGreater(train.aligned_loss(logits, shifted).item(), 5.0)
+
+    def test_a_frame_is_paired_with_the_state_that_predicted_it(self):
+        # Positions 0..5 of one sequence; frames sit at 3, 4 and 5 (the inputs after the BOS at 2). hidden[p]
+        # stands for "the state after consuming input p", so frame 3 belongs to hidden[2], not hidden[3].
+        hidden = torch.arange(5).float().view(1, 5, 1)          # inputs[:, :-1] has 5 positions
+        codec_mask = torch.tensor([[0, 0, 0, 1, 1, 1]], dtype=torch.bool)
+        codec_ids = torch.arange(6).view(1, 6, 1).repeat(1, 1, 16)
+        states, frames = train.frame_states(hidden, codec_ids, codec_mask)
+        self.assertEqual(states.flatten().tolist(), [2.0, 3.0, 4.0])
+        self.assertEqual(frames[:, 0].tolist(), [3, 4, 5])
+
+    def test_masked_positions_do_not_dilute_the_average(self):
+        logits = torch.zeros((1, 4, 5))
+        a = train.aligned_loss(logits, torch.tensor([[2, -100, -100, -100]]))
+        b = train.aligned_loss(logits, torch.tensor([[2, 2, 2, 2]]))
+        self.assertAlmostEqual(a.item(), b.item(), places=5)
+
+
 try:
     LAYOUT = importlib.util.spec_from_file_location(
         "tts_layout", Path(__file__).parents[2] / "tools/audio/tts_finetune/language_layout.py")

@@ -359,6 +359,36 @@ def text_input_embeddings(talker, text_ids, mask):
     return talker.text_projection(talker.model.text_embedding(text_ids)) * mask
 
 
+def aligned_loss(logits, labels):
+    """Cross-entropy of logits[..., p, :] against labels[..., p], ignoring -100, averaged over the labels that
+    count. The talker's own `labels=` argument shifts them by one more position (transformers'
+    ForCausalLMLoss), so passing labels that are already aligned, as sft_12hz.py does, trains every position
+    to predict the token after the one it should: the model then never learns to stop and speaks noise."""
+    return torch.nn.functional.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1),
+                                             ignore_index=-100)
+
+
+def frame_states(hidden, codec_ids, codec_mask):
+    """Each frame's 16 codes paired with the talker state that predicted its first code: the one at the
+    position before the frame's own input. That is what the code predictor is given at inference
+    (`past_hidden` plus the first code's embedding). `hidden` comes from the inputs without their last
+    position, so hidden[:, p] has seen inputs up to p and `codec_mask[:, p + 1]` says the next input is a
+    frame. sft_12hz.py pairs the state that has already consumed the frame with it, which hands the code
+    predictor the answer in training and not at inference. Returns ([frames, hidden size], [frames, 16])."""
+    ahead = codec_mask[:, 1:]
+    return hidden[ahead], codec_ids[:, 1:][ahead]
+
+
+def sub_talker_codec_loss(talker, codec_ids, hidden):
+    """The loss of the code predictor, which turns a frame's talker state and first code into its other 15
+    codes: forward_sub_talker_finetune's computation, scored without its extra label shift."""
+    inputs = [hidden.unsqueeze(1), talker.get_input_embeddings()(codec_ids[:, :1])]
+    for i in range(1, talker.config.num_code_groups - 1):
+        inputs.append(talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, i:i + 1]))
+    logits = talker.code_predictor.forward_finetune(inputs_embeds=torch.cat(inputs, dim=1)).logits
+    return aligned_loss(logits, codec_ids[:, 1:])
+
+
 def step(model, batch, accelerator):
     """One micro-batch: the official sft_12hz.py computation (with the text projection it omits), under bf16 autocast (the official run
     holds bf16 weights; with float32 master weights the compute still runs in bf16). Returns the
@@ -386,12 +416,12 @@ def step(model, batch, accelerator):
             input_embeddings = input_embeddings + codec_i_embedding * codec_mask.unsqueeze(-1)
 
         outputs = model.talker(inputs_embeds=input_embeddings[:, :-1, :], attention_mask=attention_mask[:, :-1],
-                               labels=codec_0_labels[:, 1:], output_hidden_states=True)
-        hidden_states = outputs.hidden_states[0][-1]
-        talker_hidden_states = hidden_states[codec_mask[:, :-1]]
-        talker_codec_ids = codec_ids[codec_mask]
-        _, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
-        loss = outputs.loss + 0.3 * sub_talker_loss
+                               output_hidden_states=True)
+        talker_hidden_states, talker_codec_ids = frame_states(outputs.hidden_states[0][-1], codec_ids, codec_mask)
+        # The inputs end one position early, so position p is scored against the label at p + 1 already.
+        talker_loss = aligned_loss(outputs.logits, codec_0_labels[:, 1:])
+        sub_talker_loss = sub_talker_codec_loss(model.talker, talker_codec_ids, talker_hidden_states)
+        loss = talker_loss + 0.3 * sub_talker_loss
     return loss, speaker_embedding
 
 

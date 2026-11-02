@@ -49,11 +49,21 @@ exports a checkpoint on demand.
 official script trains bf16 weights); compute is bf16 either way. `--attn sdpa` is the default because
 `flash_attention_2` is not built for this GPU.
 
-**Why not the upstream training step as it is.** `finetuning/sft_12hz.py` feeds the talker the raw text embedding,
-but inference (`qwen_tts`, and `gufo serve tts`) passes it through the talker's text projection first. Trained that
-way for a few thousand steps, a model answers inference with noise: runaway audio that is not speech (observed here,
-after a 4.5-hour run). `train.py` applies the projection; this is also why the upstream script fails on the 0.6B model,
-whose text embeddings are wider than its talker. Not reported upstream yet.
+**Why not the upstream training step as it is.** `finetuning/sft_12hz.py` (at the pinned commit) trains an objective that
+inference does not use, in three ways, and a model trained with it answers inference with noise (observed here:
+runaway audio that is not speech, even for English, after a 4.5-hour run and again after one epoch of a second run):
+
+1. The talker is fed the raw text embedding, while inference passes it through the talker's text projection first
+   (upstream PR #188). This is also why the script fails on the 0.6B model, whose text embeddings are wider than its talker.
+2. The labels are shifted twice: it passes labels that are already one position ahead to a loss that shifts them once more
+   (`ForCausalLMLoss`), for the talker and for the code predictor, so every position is trained to predict the token after
+   the right one (upstream PR #178). Measured on the 1.7B base model: talker loss 9.9 as upstream computes it, 2.0 aligned.
+3. The code predictor is trained on each frame's codes with the talker state that has already consumed that frame, while at
+   inference it gets the state that predicted the frame's first code. Pairing it with the predicting state cut the first
+   sub-code's cross-entropy from 10.4 to 3.95 on the base model.
+
+`train.py` computes the loss itself (`aligned_loss`, `frame_states`, `text_input_embeddings`), each covered by a test.
+None of this is reported upstream by this repository.
 
 **Language IDs.** Qwen3-TTS prompts its talker either with "language auto" or with a language's codec token, and
 `gufo serve tts` builds both. The upstream script trains every row as auto. With `--tagged-fraction F` the share `F` of
