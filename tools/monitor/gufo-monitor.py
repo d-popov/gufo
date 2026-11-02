@@ -845,15 +845,17 @@ class VoiceServices:
             return 502, b'{"error":{"message":"the speech server is unreachable"}}', "application/json"
 
     def _model(self, base: str, key: str | None) -> str | None:
-        """The model id a speech server serves; each serves one, so it is asked once."""
+        """The model id a speech server serves; each serves one, so a answer is kept. An unanswered question
+        is not: a server that was down once, or restarted, must work again without restarting the monitor."""
         if base not in self._models:
             request = urllib.request.Request(base + "/v1/models", headers=self._headers(key))
             status, body, _ = self._open(request, 5.0)
             try:
-                self._models[base] = json.loads(body)["data"][0]["id"] if status == 200 else ""
+                if status == 200:
+                    self._models[base] = json.loads(body)["data"][0]["id"]
             except (ValueError, LookupError, TypeError):
-                self._models[base] = ""
-        return self._models[base] or None
+                pass
+        return self._models.get(base)
 
     def _voices(self, base: str, key: str | None) -> list[str]:
         request = urllib.request.Request(base + "/v1/audio/voices", headers=self._headers(key))

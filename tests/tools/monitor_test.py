@@ -779,6 +779,15 @@ class TalkModeTest(unittest.TestCase):
                     json.dumps({"text": "x" * (gm.VoiceServices.TEXT_MAX + 1)}).encode()):
             self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:30])
 
+    def test_a_speech_server_that_was_down_when_first_asked_works_once_it_is_up(self):
+        voice = gm.VoiceServices(self.url, self.url, voice="ryan")
+        with mock.patch.object(gm.VoiceServices, "_open", return_value=(502, b"{}", "application/json")):
+            self.assertIsNone(voice._model(self.url, "k"))
+        self.assertEqual(voice._model(self.url, "k"), "fake-speech")
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        self.call(port, "/api/chat/speak", b'{"text":"Hi."}', "application/json")
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["model"], "fake-speech")
+
     def test_a_reply_is_spoken_by_the_server_that_speaks_its_language(self):
         # A second server holds a model fine-tuned for one language; the rest go to the first.
         other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
