@@ -45,8 +45,12 @@ CREATE TABLE IF NOT EXISTS shares (
   id TEXT PRIMARY KEY, token TEXT NOT NULL UNIQUE, owner TEXT NOT NULL, title TEXT NOT NULL,
   created INTEGER NOT NULL, expires INTEGER NOT NULL, max_messages INTEGER NOT NULL, messages INTEGER NOT NULL DEFAULT 0,
   max_audio INTEGER NOT NULL, audio INTEGER NOT NULL DEFAULT 0, seed TEXT NOT NULL DEFAULT '',
-  revoked INTEGER NOT NULL DEFAULT 0, last_used INTEGER NOT NULL DEFAULT 0);
+  revoked INTEGER NOT NULL DEFAULT 0, last_used INTEGER NOT NULL DEFAULT 0, log INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS share_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, share_id TEXT NOT NULL, at INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS share_log_share ON share_log (share_id, id);
 """
+LOG_ROWS = 2000   # messages kept per link when its owner chose to read them; later ones are not kept
 
 
 class ShareError(Exception):
@@ -123,6 +127,8 @@ class ShareStore:
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(SCHEMA)
+            if "log" not in {row[1] for row in self.conn.execute("PRAGMA table_info(shares)")}:  # a file from before logging
+                self.conn.execute("ALTER TABLE shares ADD COLUMN log INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self.lock:
@@ -132,20 +138,21 @@ class ShareStore:
         return int(self.clock())
 
     COLUMNS = ("id, token, title, created, expires, max_messages, messages, max_audio, audio, revoked, last_used, "
-               "seed != ''")
+               "seed != '', log")
 
     def _row(self, row) -> dict:
         (share_id, token, title, created, expires, max_messages, messages, max_audio, audio, revoked, last_used,
-         has_seed) = row
+         has_seed, log) = row
         now = self._now()
         status = "revoked" if revoked else "expired" if expires and expires <= now else "active"
         return {"id": share_id, "token": token, "title": title, "created": created, "expires": expires,
                 "max_messages": max_messages, "messages": messages, "max_audio": max_audio, "audio": audio,
-                "last_used": last_used, "has_seed": bool(has_seed), "status": status}
+                "last_used": last_used, "has_seed": bool(has_seed), "logged": bool(log), "status": status}
 
     def create(self, owner: str, title: str, days: int = DEFAULT_DAYS, max_messages: int = DEFAULT_MESSAGES,
-               max_audio: int = DEFAULT_AUDIO, seed: list | None = None) -> dict:
-        """A new link. days 0 means no expiry. The result holds the token, which is the secret in the URL."""
+               max_audio: int = DEFAULT_AUDIO, seed: list | None = None, log: bool = False) -> dict:
+        """A new link. days 0 means no expiry. With log, the visitor's conversation is kept for the owner to read (the
+        visitor's page says so). The result holds the token, which is the secret in the URL."""
         if not isinstance(days, int) or isinstance(days, bool) or not 0 <= days <= MAX_DAYS:
             raise ShareError(400, f"days is 0 (no expiry) to {MAX_DAYS}")
         for name, value in (("max_messages", max_messages), ("max_audio", max_audio)):
@@ -156,10 +163,10 @@ class ShareStore:
         share_id, token = secrets.token_hex(6), secrets.token_urlsafe(24)
         with self.lock:
             self.conn.execute(
-                "INSERT INTO shares (id, token, owner, title, created, expires, max_messages, max_audio, seed) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO shares (id, token, owner, title, created, expires, max_messages, max_audio, seed, log) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (share_id, token, owner, title, now, now + days * 86400 if days else 0, max_messages, max_audio,
-                 json.dumps(seed, ensure_ascii=False) if seed else ""))
+                 json.dumps(seed, ensure_ascii=False) if seed else "", int(bool(log))))
         return self.get(owner, share_id)
 
     def get(self, owner: str, share_id: str) -> dict | None:
@@ -184,6 +191,7 @@ class ShareStore:
                 self.conn.execute("UPDATE shares SET revoked = 1 WHERE id = ? AND owner = ?", (share_id, owner))
                 return "revoked"
             self.conn.execute("DELETE FROM shares WHERE id = ? AND owner = ?", (share_id, owner))
+            self.conn.execute("DELETE FROM share_log WHERE share_id = ?", (share_id,))
             return "removed"
 
     def find(self, token: str) -> dict | None:
@@ -228,9 +236,28 @@ class ShareStore:
         with self.lock:
             self.conn.execute("UPDATE shares SET messages = MAX(messages - 1, 0) WHERE token = ?", (token,))
 
+    def record(self, token: str, role: str, content: str) -> None:
+        """Keep one message of a visitor's conversation, if the link's owner chose to read them, up to LOG_ROWS."""
+        if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+            return
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO share_log (share_id, at, role, content) SELECT id, ?, ?, ? FROM shares WHERE token = ? "
+                "AND log = 1 AND (SELECT COUNT(*) FROM share_log WHERE share_id = shares.id) < ?",
+                (self._now(), role, content[:GUEST_MESSAGE_CHARS], token, LOG_ROWS))
+
+    def messages(self, owner: str, share_id: str) -> list | None:
+        """What a link's visitors said and were answered, oldest first; None if the link is not this owner's."""
+        if self.get(owner, share_id) is None:
+            return None
+        with self.lock:
+            rows = self.conn.execute("SELECT at, role, content FROM share_log WHERE share_id = ? ORDER BY id",
+                                     (share_id,)).fetchall()
+        return [{"at": at, "role": role, "content": content} for at, role, content in rows]
+
     def view(self, share: dict, model: str | None, talk: bool, voice: dict) -> dict:
         """What a visitor's page is told: nothing about the owner or the secret."""
         return {"title": share["title"], "model": model, "talk": talk, "expires": share["expires"],
                 "messages_left": share["max_messages"] - share["messages"],
-                "audio_left": share["max_audio"] - share["audio"], "seed": self.seed(share["token"]),
+                "audio_left": share["max_audio"] - share["audio"], "seed": self.seed(share["token"]), "logged": share["logged"],
                 "speed": voice.get("speed", 1.0)}

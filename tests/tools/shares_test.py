@@ -107,6 +107,64 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(len(self.store.create("admin", "y" * 500)["title"]), shares.TITLE_MAX)
 
 
+class LogTest(unittest.TestCase):
+    def setUp(self):
+        self.store = shares.ShareStore(":memory:", Clock())
+        self.addCleanup(self.store.close)
+
+    def test_a_conversation_is_kept_only_for_a_link_whose_owner_chose_to_read_it(self):
+        asked = self.store.create("admin", "Read me", log=True)
+        private = self.store.create("admin", "Private")
+        for share in (asked, private):
+            self.store.record(share["token"], "user", "hello")
+            self.store.record(share["token"], "assistant", "hi there")
+        self.assertEqual([(m["role"], m["content"]) for m in self.store.messages("admin", asked["id"])],
+                         [("user", "hello"), ("assistant", "hi there")])
+        self.assertEqual(self.store.messages("admin", private["id"]), [])
+        self.assertTrue(self.store.find(asked["token"])["logged"])
+        self.assertFalse(self.store.find(private["token"])["logged"])
+
+    def test_only_the_owner_reads_it_and_removing_the_link_removes_it(self):
+        share = self.store.create("admin", "Read me", log=True)
+        self.store.record(share["token"], "user", "secret words")
+        self.assertIsNone(self.store.messages("someone", share["id"]))
+        self.assertIsNone(self.store.messages("admin", "0" * 12))
+        self.assertEqual(self.store.remove("admin", share["id"]), "revoked")
+        self.assertEqual(len(self.store.messages("admin", share["id"])), 1, "revoking keeps what was said")
+        self.assertEqual(self.store.remove("admin", share["id"]), "removed")
+        with self.store.lock:
+            left = self.store.conn.execute("SELECT COUNT(*) FROM share_log").fetchone()[0]
+        self.assertEqual(left, 0)
+
+    def test_only_text_of_the_two_roles_is_kept_and_only_so_much_of_it(self):
+        share = self.store.create("admin", "Read me", log=True)
+        token = share["token"]
+        for role, content in (("system", "x"), ("tool", "x"), ("user", "   "), ("user", None), ("user", 5)):
+            self.store.record(token, role, content)
+        self.store.record(token, "user", "y" * 50_000)
+        self.assertEqual(len(self.store.messages("admin", share["id"])[0]["content"]), shares.GUEST_MESSAGE_CHARS)
+        for i in range(shares.LOG_ROWS + 10):
+            self.store.record(token, "user", f"m{i}")
+        self.assertEqual(len(self.store.messages("admin", share["id"])), shares.LOG_ROWS)
+
+    def test_a_store_made_before_logging_gains_it_off(self):
+        import sqlite3
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.sqlite"
+            old = sqlite3.connect(path)
+            old.executescript("CREATE TABLE shares (id TEXT PRIMARY KEY, token TEXT NOT NULL UNIQUE, owner TEXT NOT NULL, "
+                              "title TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL, "
+                              "max_messages INTEGER NOT NULL, messages INTEGER NOT NULL DEFAULT 0, max_audio INTEGER NOT NULL, "
+                              "audio INTEGER NOT NULL DEFAULT 0, seed TEXT NOT NULL DEFAULT '', revoked INTEGER NOT NULL "
+                              "DEFAULT 0, last_used INTEGER NOT NULL DEFAULT 0); "
+                              "INSERT INTO shares VALUES ('0123456789ab', 'T' || printf('%031d', 1), 'admin', 'Old', 1, 0, 5, 0, 5, 0, '', 0, 0);")
+            old.close()
+            store = shares.ShareStore(path, Clock())
+            self.addCleanup(store.close)
+            self.assertFalse(store.list("admin")[0]["logged"])
+
+
 class RequestTest(unittest.TestCase):
     def ok(self, **changes):
         body = {"messages": [{"role": "user", "content": "Hello"}], **changes}

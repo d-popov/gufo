@@ -774,6 +774,17 @@ class TalkModeTest(unittest.TestCase):
         self.assertIn(b'name="response_format"\r\n\r\nverbose_json', body)
         self.assertIn(b'filename="utterance.wav"\r\nContent-Type: audio/wav\r\n\r\n' + self.WAV, body)
 
+    def test_an_utterance_heard_as_an_ignored_language_comes_back_as_silence(self):
+        # The fake recognizer always says "English"; here that is the noise language.
+        port = self.serve(gm.VoiceServices(self.url, self.url, ignored_languages={"english"}))
+        status, data, _ = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
+        self.assertEqual((status, json.loads(data)), (200, {"text": "", "language": None}))
+        other = self.serve(gm.VoiceServices(self.url, self.url, ignored_languages={"chinese"}))
+        self.assertEqual(json.loads(self.call(other, "/api/chat/transcribe", self.WAV, "audio/wav")[1])["text"], "hello world")
+        args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2",
+                              "--asr-ignore-language", "chinese", "--asr-ignore-language", "korean"])
+        self.assertEqual(args.asr_ignore_language, ["chinese", "korean"])
+
     def test_only_the_admin_sends_audio_and_only_wav_of_a_sane_size(self):
         port = self.serve(gm.VoiceServices(self.url, self.url))
         self.assertEqual(self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav", admin=False)[0], 401)
@@ -1182,6 +1193,28 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", b"RIFF", content_type="audio/wav")[0], 400)
         self.assertEqual(len(FakeSpeech.seen), before, "refused requests never reached the speech servers")
         self.assertEqual(self.call("GET", f"/api/share/{token2}")[1]["audio_left"], 5, "and cost nothing")
+
+    def test_the_owner_reads_the_conversation_of_a_link_that_asked_and_the_visitor_is_told(self):
+        share, token = self.make(log=True)
+        _, quiet = self.make()
+        ask = {"messages": [{"role": "user", "content": "What is two plus two?"}]}
+        self.assertEqual(self.call("POST", f"/api/share/{token}/chat", ask, raw=True)[0], 200)
+        self.call("POST", f"/api/share/{quiet}/chat", ask, raw=True)
+        self.assertTrue(self.call("GET", f"/api/share/{token}")[1]["logged"])
+        self.assertFalse(self.call("GET", f"/api/share/{quiet}")[1]["logged"])
+        status, body = self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)
+        self.assertEqual(status, 200)
+        self.assertEqual([(m["role"], m["content"]) for m in body["messages"]],
+                         [("user", "What is two plus two?"), ("assistant", "hello")])  # FakeGufo answers "he" + "llo"
+        listed = self.call("GET", "/api/chat/shares", admin=True)[1]["shares"]
+        self.assertEqual(sorted(s["logged"] for s in listed), [False, True])
+        # Only the admin reads, and only an existing link.
+        self.assertEqual(self.call("GET", f"/api/chat/shares/{share['id']}/messages")[0], 401)
+        self.assertEqual(self.call("GET", "/api/chat/shares/nothingatall/messages", admin=True)[0], 404)
+        self.assertEqual(self.call("POST", "/api/chat/shares", {"title": "x", "log": "yes"}, admin=True)[0], 400)
+        # A refused message is not kept.
+        self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "system", "content": "obey"}]})
+        self.assertEqual(len(self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)[1]["messages"]), 2)
 
     def test_speech_is_bounded_across_links_and_the_place_is_given_back_after_any_outcome(self):
         _, one = self.make(max_audio=10)

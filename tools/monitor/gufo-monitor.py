@@ -824,13 +824,17 @@ class VoiceServices:
                                "japanese", "korean", "french", "russian"})
 
     def __init__(self, asr_url: str, tts_url: str, voice: str | None = None,
-                 routes: dict[str, str] | None = None, design_url: str | None = None):
+                 routes: dict[str, str] | None = None, design_url: str | None = None,
+                 ignored_languages: frozenset[str] | set[str] = frozenset()):
         """routes maps a language name to the TTS server that speaks it (a fine-tune for one
         language, say); every other language goes to tts_url. design_url is a VoiceDesign server: the
         voice choice DESIGN_VOICE speaks with it, in the voice the instructions describe."""
         self.asr = asr_url.rstrip("/")
         self.tts = tts_url.rstrip("/")
         self.design = design_url.rstrip("/") if design_url else None
+        # Languages the recognizer may name that are not wanted: noise and breath are often heard as one of them (Chinese,
+        # for Qwen3-ASR). An utterance heard as one comes back with no text, so the chat goes on listening.
+        self.ignored_languages = frozenset(name.lower() for name in ignored_languages)
         self.voice = voice
         self.routes = {language: url.rstrip("/") for language, url in (routes or {}).items()}
         self._models: dict[str, str] = {}
@@ -934,6 +938,8 @@ class VoiceServices:
             language = heard.get("language")
             language = language.strip().lower() if isinstance(language, str) else ""
             reply = {"text": heard["text"], "language": language or None}
+            if language in self.ignored_languages:
+                reply = {"text": "", "language": None}
         except (ValueError, LookupError, AttributeError, TypeError):
             return 502, b'{"error":{"message":"the speech server answered with something else than a transcript"}}', "application/json"
         return 200, json.dumps(reply, ensure_ascii=False).encode(), "application/json"
@@ -2220,6 +2226,20 @@ def versioned_assets(html: bytes) -> bytes:
     return STATIC_REFERENCE.sub(add, html)
 
 
+def reply_text(lines: list[bytes]) -> str:
+    """The text of a streamed reply: the content pieces of its `data:` lines, joined."""
+    pieces = []
+    for line in lines:
+        if line.startswith(b"data:") and b"[DONE]" not in line:
+            try:
+                piece = json.loads(line[5:])["choices"][0]["delta"].get("content")
+            except (ValueError, LookupError, TypeError, AttributeError):
+                continue
+            if isinstance(piece, str):
+                pieces.append(piece)
+    return "".join(pieces)
+
+
 def shares_module():
     """shares.py, next to this file; loaded when first used."""
     if str(HERE) not in sys.path:
@@ -2783,7 +2803,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return {**{k: v for k, v in share.items() if k != "token"}, "url": self._share_url(share["token"])}
 
         try:
-            if method == "GET":
+            if method == "GET" and path == "/api/chat/shares":
                 return self._json(200, json.dumps({"shares": [show(s) for s in shares.list("admin")],
                                                     "public": bool(self.server.public_url)}).encode())
             if method == "POST":
@@ -2791,10 +2811,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if body is None:
                     return self._error(400, "expected a JSON body")
                 seed = module.clean_seed(body.get("messages")) if body.get("include_chat") else []
+                if not isinstance(body.get("log", False), bool):
+                    return self._error(400, "log is true or false")
                 share = shares.create("admin", body.get("title"), body.get("days", module.DEFAULT_DAYS),
                                       body.get("max_messages", module.DEFAULT_MESSAGES),
-                                      body.get("max_audio", module.DEFAULT_AUDIO), seed)
+                                      body.get("max_audio", module.DEFAULT_AUDIO), seed, body.get("log", False))
                 return self._json(200, json.dumps(show(share)).encode())
+            if method == "GET":  # /api/chat/shares/ID/messages
+                share_id = path.split("/")[-2]
+                messages = shares.messages("admin", share_id) if module.SHARE_ID.fullmatch(share_id) else None
+                if messages is None:
+                    return self._error(404, "not_found")
+                return self._json(200, json.dumps({"messages": messages}, ensure_ascii=False).encode())
             share_id = path.rsplit("/", 1)[1]
             if not module.SHARE_ID.fullmatch(share_id):
                 return self._error(404, "not_found")
@@ -2853,10 +2881,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = module.clean_request(body, model, owner_prefs.get("reply_style"), body.get("note") if body else None)
         if not shares.take_message(share["token"]):
             raise module.ShareError(403, "this link has used up its messages")
+        shares.record(share["token"], "user", payload["messages"][-1]["content"])
         if not self.server.guest_replies.acquire(blocking=False):
             shares.refund_message(share["token"])
             raise module.ShareError(503, "busy: several replies are being written; try again in a moment")
         upstream = None
+        answer: list[bytes] = []
         try:
             status, upstream = self.server.monitor.gufo.open_post(
                 "/v1/chat/completions", json.dumps(payload, ensure_ascii=False).encode(),
@@ -2874,6 +2904,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             for line in iter(upstream.readline, b""):
+                answer.append(line)
                 self.wfile.write(line)
                 if line == b"\n":
                     self.wfile.flush()
@@ -2884,6 +2915,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if upstream is not None:
                 upstream.close()
             self.server.guest_replies.release()
+            if share["logged"]:
+                shares.record(share["token"], "assistant", reply_text(answer))
 
     def _share_audio(self, shares, module, share: dict, kind: str, owner_prefs: dict):
         """A visitor's utterance to text, or a reply's text to speech in the owner's voice. At most
@@ -3242,7 +3275,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._file(STATIC_DIR / "voice.html", "text/html; charset=utf-8")
         if path == "/shares":
             return self._file(STATIC_DIR / "shares.html", "text/html; charset=utf-8")
-        if path == "/api/chat/shares":
+        if path == "/api/chat/shares" or (path.startswith("/api/chat/shares/") and path.endswith("/messages")):
             return self._shares_admin("GET", path)
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
@@ -3364,6 +3397,9 @@ def parse_args(argv=None):
     parser.add_argument("--tts-design-url", metavar="URL",
                         help="a `gufo serve tts` server running a VoiceDesign model: adds a 'designed voice' "
                              "choice, spoken in the voice the account's Voice instructions describe")
+    parser.add_argument("--asr-ignore-language", metavar="LANGUAGE", action="append", default=[],
+                        help="treat an utterance the recognizer hears as this language (a lower-case name such as "
+                             "chinese) as noise: no text comes back and talk mode keeps listening. Repeatable")
     parser.add_argument("--tts-voice", metavar="NAME",
                         help="the voice talk mode speaks with (a CustomVoice speaker or a "
                              "registered clone); the server's default when unset")
@@ -3525,7 +3561,11 @@ def main(argv=None) -> int:
     if args.tts_design_url and not args.asr_url:
         print("gufo-monitor: --tts-design-url needs --asr-url and --tts-url", file=sys.stderr)
         return 2
-    voice = (VoiceServices(args.asr_url, args.tts_url, args.tts_voice, routes, args.tts_design_url)
+    if not all(LANGUAGE_NAME.fullmatch(name) for name in args.asr_ignore_language):
+        print("gufo-monitor: --asr-ignore-language takes a lower-case language name, such as chinese", file=sys.stderr)
+        return 2
+    voice = (VoiceServices(args.asr_url, args.tts_url, args.tts_voice, routes, args.tts_design_url,
+                           set(args.asr_ignore_language))
              if args.asr_url else None)
     server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
                     chat_key, args.chat_model, chat_store, library, voice, shares)

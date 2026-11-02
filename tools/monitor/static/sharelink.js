@@ -20,6 +20,7 @@
           max_messages: Number($('share-messages').value),
           max_audio: Number($('share-audio').value),
           include_chat: include,
+          log: $('share-log').checked,
           ...(include && chat ? { messages: chat.messages.map(({ role, content, error }) => ({ role, content, error })) } : {}),
         }),
       });

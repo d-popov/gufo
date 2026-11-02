@@ -322,6 +322,7 @@ $('prompt').addEventListener('keydown', (event) => {
   info = await response.json();
   document.title = info.title;
   $('share-title').textContent = info.title;
+  $('share-notice').hidden = !info.logged;
   messages = info.seed.map((m) => ({ role: m.role, content: m.content }));
   updateLeft();
   render();

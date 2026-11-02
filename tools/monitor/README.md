@@ -84,6 +84,11 @@ with this server's model, press Talk to speak to it and hear it answer, with no 
 starts from a copy of the open chat (text only, off by default). `/shares` (profile menu, *Shared chats*) lists every link
 with its use and state, copies it, **revokes** it (the link stops working at once) and removes revoked or expired ones.
 
+A visitor's conversation is kept only in their own browser, unless the link was made with **Keep their messages so I can read
+them** (on by default in the dialog): then the monitor also keeps the text of what they said and what the model answered
+(not audio; up to 2000 messages per link, removed with the link), the visitor's page says "The owner of this link can read this
+conversation", and **Read** on `/shares` shows it. A link made without it keeps nothing.
+
 What a link allows is only that: the visitor gets a fresh conversation kept in their own browser, the model, your saved
 voice, and the limits. They get no key, none of your chats, projects, memory, tools or library, and nothing of the monitor:
 every other route still answers 401 to them. The monitor builds each request to the model itself from a whitelist (the
@@ -112,6 +117,9 @@ or asset. It looks attentive while the microphone listens, leans in while it hea
 the place is remembered in the browser. It is on by default; its close button turns it off for the account, and the **Voice settings** page turns it
 back on. The setting is kept on the server with the voice (`PUT /api/chat/avatar {enabled}`, or `avatar` in
 `PUT /api/chat/voice-prefs`). `static/avatar.js`.
+
+`--asr-ignore-language chinese` (repeatable) treats an utterance the recognizer hears as that language as noise: no text comes
+back and talk mode keeps listening. Qwen3-ASR names breath and random sounds as Chinese often enough for this to matter.
 
 **Language.** Speech recognition names the language of every spoken message. A chat keeps its language: the first one
 heard is assumed to continue (or English), a message in English does not change it but is answered and spoken in
