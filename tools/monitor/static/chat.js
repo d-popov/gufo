@@ -1013,7 +1013,12 @@ function updateSendLabel() {
 function queueSteer() {
   const text = $('prompt').value.trim();
   if (!text && pendingImages.length === 0) return false;
-  steerQueue.push({ text, images: pendingImages });
+  // Steering that was spoken also tells the chat what language it is in.
+  const spoken = heard && heard.text === text ? heard.language : null;
+  heard = null;
+  const chat = active();
+  if (spoken && chat) { chat.language = Lang.track(chat.language ?? Lang.EMPTY, spoken, text); renderLanguage(); }
+  steerQueue.push({ text, images: pendingImages, language: spoken });
   $('prompt').value = '';
   autosize();
   pendingImages = [];
@@ -1140,7 +1145,8 @@ async function send() {
   const deliverSteering = () => {
     closeReply();
     for (const item of steerQueue) {
-      const message = { role: 'user', content: item.text, images: item.images, hadImages: item.images.length > 0, steering: true };
+      const message = { role: 'user', content: item.text, images: item.images, hadImages: item.images.length > 0, steering: true,
+        ...(item.language ? { language: item.language } : {}) };
       chat.messages.push(message);
       outgoing.push(toApiMessages([message])[0]);
     }

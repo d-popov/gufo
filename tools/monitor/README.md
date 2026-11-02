@@ -78,6 +78,12 @@ another TTS server holds a model for it: `--tts-route bulgarian=http://127.0.0.1
 language there, using its own voice if the chosen one is not among its voices. The page needs a secure context for the
 microphone (`localhost` or https).
 
+**Avatar.** A small animated face sits over the corner of the chat (talk mode has to exist). It blinks, sways, and its
+mouth follows the loudness of the audio being played, so it works with any voice, speed or language and needs no model
+or asset. It is on by default; its close button turns it off for the account, and the **Voice settings** page turns it
+back on. The setting is kept on the server with the voice (`PUT /api/chat/avatar {enabled}`, or `avatar` in
+`PUT /api/chat/voice-prefs`). `static/avatar.js`.
+
 **Language.** Speech recognition names the language of every spoken message. A chat keeps its language: the first one
 heard is assumed to continue (or English), a message in English does not change it but is answered and spoken in
 English, and a different language takes over only on its second message in a row or in a long one (eight words). The
