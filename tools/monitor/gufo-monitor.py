@@ -555,6 +555,7 @@ class ChatRuns:
 
 
 VOICE_NAME = re.compile(r"[\w.-]{1,64}")  # a speech server's voice name
+STYLE_MAX = 300  # characters of a style setting: a reply style for the model, a voice instruction for the voice
 LANGUAGE_NAME = re.compile(r"[a-z]{2,30}")  # a language as the speech models name it: "bulgarian"
 
 CHAT_SCHEMA = """
@@ -568,7 +569,7 @@ CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('rev', 0);
 CREATE TABLE IF NOT EXISTS voice_prefs (
   owner TEXT PRIMARY KEY, voice TEXT, speed REAL NOT NULL, updated INTEGER NOT NULL,
-  avatar INTEGER NOT NULL DEFAULT 1);
+  avatar INTEGER NOT NULL DEFAULT 1, reply_style TEXT NOT NULL DEFAULT '', voice_style TEXT NOT NULL DEFAULT '');
 """
 
 
@@ -597,8 +598,12 @@ class ChatStore:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(CHAT_SCHEMA)
             # A store made before the avatar setting has no such column.
-            if "avatar" not in {row[1] for row in self.conn.execute("PRAGMA table_info(voice_prefs)")}:
-                self.conn.execute("ALTER TABLE voice_prefs ADD COLUMN avatar INTEGER NOT NULL DEFAULT 1")
+            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(voice_prefs)")}
+            for name, definition in (("avatar", "INTEGER NOT NULL DEFAULT 1"),
+                                     ("reply_style", "TEXT NOT NULL DEFAULT ''"),
+                                     ("voice_style", "TEXT NOT NULL DEFAULT ''")):
+                if name not in columns:
+                    self.conn.execute(f"ALTER TABLE voice_prefs ADD COLUMN {name} {definition}")
         self.purge()
 
     def close(self) -> None:
@@ -621,24 +626,32 @@ class ChatStore:
                 "deleted": bool(deleted), "data": None if deleted else json.loads(body)}
 
     def voice_prefs(self, owner: str) -> dict:
-        """How this owner's replies are spoken and shown: {"voice": name or None for the server's
-        default, "speed": playback rate, "avatar": whether the chat shows the avatar (on until the
-        owner closes it)}. The same on every device."""
+        """How this owner's replies are spoken and shown, the same on every device: "voice" (a name, or
+        None for the server's default), "speed" (playback rate), "avatar" (shown until the owner closes
+        it), "reply_style" (a hint to the model about how to write replies, "" for none) and "voice_style"
+        (an instruction sent to the speech model about how to speak them, "" for none)."""
         with self.lock:
             row = self.conn.execute(
-                "SELECT voice, speed, avatar FROM voice_prefs WHERE owner = ?", (owner,)).fetchone()
-        return ({"voice": row[0], "speed": row[1], "avatar": bool(row[2])} if row
-                else {"voice": None, "speed": 1.0, "avatar": True})
+                "SELECT voice, speed, avatar, reply_style, voice_style FROM voice_prefs WHERE owner = ?",
+                (owner,)).fetchone()
+        return ({"voice": row[0], "speed": row[1], "avatar": bool(row[2]), "reply_style": row[3],
+                 "voice_style": row[4]} if row
+                else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
 
-    def set_voice_prefs(self, owner: str, voice: str | None, speed: float,
-                        avatar: bool | None = None) -> dict:
-        """Keep the voice and speed; avatar None leaves that setting as it was."""
+    def set_voice_prefs(self, owner: str, voice: str | None, speed: float, avatar: bool | None = None,
+                        reply_style: str | None = None, voice_style: str | None = None) -> dict:
+        """Keep the voice and speed; a setting passed as None is left as it was."""
         with self.lock:
             self.conn.execute(
-                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar, reply_style, voice_style) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (owner) DO UPDATE SET voice = excluded.voice, speed = excluded.speed, "
-                "updated = excluded.updated, avatar = CASE WHEN ? THEN excluded.avatar ELSE avatar END",
-                (owner, voice, speed, int(time.time() * 1000), int(avatar is not False), avatar is not None,))
+                "updated = excluded.updated, "
+                "avatar = CASE WHEN ? THEN excluded.avatar ELSE avatar END, "
+                "reply_style = CASE WHEN ? THEN excluded.reply_style ELSE reply_style END, "
+                "voice_style = CASE WHEN ? THEN excluded.voice_style ELSE voice_style END",
+                (owner, voice, speed, int(time.time() * 1000), int(avatar is not False), reply_style or "",
+                 voice_style or "", avatar is not None, reply_style is not None, voice_style is not None))
         return self.voice_prefs(owner)
 
     def set_avatar(self, owner: str, enabled: bool) -> dict:
@@ -889,7 +902,7 @@ class VoiceServices:
         return 200, json.dumps(reply, ensure_ascii=False).encode(), "application/json"
 
     def speak(self, text: str, key: str | None, voice: str | None = None,
-              language: str | None = None) -> tuple[int, bytes, str]:
+              language: str | None = None, instructions: str | None = None) -> tuple[int, bytes, str]:
         """POST reply text to a TTS server; its answer is a WAV file. The language picks the
         server (see routes) and, where the model names it, goes along in the request. A routed
         server speaks with the chosen voice if it has it, else with its first."""
@@ -906,6 +919,8 @@ class VoiceServices:
             payload["language"] = language
         if wanted:
             payload["voice"] = wanted
+        if instructions:
+            payload["instructions"] = instructions  # how to speak; whether the model follows it is its own
         request = urllib.request.Request(
             base + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
             headers=self._headers(key, "application/json"))
@@ -2660,7 +2675,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         info = self.server.voice.info(self.server.chat_key)
         store = self.server.chat_store
         info["prefs"] = (store.voice_prefs(self._chat_owner()) if store is not None
-                         else {"voice": None, "speed": 1.0, "avatar": True})
+                         else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
         self._json(200, json.dumps(info).encode())
 
     def _voice_prefs_put(self):
@@ -2685,8 +2700,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         avatar = body.get("avatar")
         if avatar is not None and not isinstance(avatar, bool):
             return self._error(400, "avatar is true or false")
+        styles = {}
+        for key in ("reply_style", "voice_style"):
+            value = body.get(key)
+            if value is not None and not (isinstance(value, str) and len(value) <= STYLE_MAX):
+                return self._error(400, f"{key} is text of at most {STYLE_MAX} characters")
+            styles[key] = value.strip() if isinstance(value, str) else None
         self._json(200, json.dumps(store.set_voice_prefs(
-            self._chat_owner(), name, float(speed), avatar)).encode())
+            self._chat_owner(), name, float(speed), avatar, **styles)).encode())
 
     def _avatar_put(self):
         """PUT /api/chat/avatar {enabled}: show or hide the chat's avatar for the admin's account;
@@ -2703,7 +2724,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _voice_route(self, kind: str):
         """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
-        and answers {"text", "language"}; POST /api/chat/speak takes {"text", "voice"?, "language"?} and answers a WAV
+        and answers {"text", "language"}; POST /api/chat/speak takes {"text", "voice"?, "language"?, "instructions"?} and answers a WAV
         file. Both go to Gufo's speech servers with the admin's chat key."""
         voice = self.server.voice
         if voice is None:
@@ -2727,13 +2748,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             text = body.get("text") if body else None
             name = body.get("voice") if body else None
             language = body.get("language") if body else None
+            instructions = body.get("instructions") if body else None
             if not isinstance(text, str) or not text.strip() or len(text) > voice.TEXT_MAX:
                 return self._error(400, f"expected text of 1 to {voice.TEXT_MAX} characters")
             if name is not None and not isinstance(name, str):
                 return self._error(400, "voice is a string")
             if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
                 return self._error(400, "language is a lower-case name such as bulgarian")
-            status, answer, content_type = voice.speak(text, key, name, language)
+            if instructions is not None and not (isinstance(instructions, str) and len(instructions) <= STYLE_MAX):
+                return self._error(400, f"instructions is text of at most {STYLE_MAX} characters")
+            status, answer, content_type = voice.speak(text, key, name, language, instructions or None)
         self._send(status, answer, content_type if status == 200 else "application/json")
 
     # -- the private library: /api/library/* (read with the admin or the library token, change

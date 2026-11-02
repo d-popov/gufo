@@ -834,7 +834,7 @@ class TalkModeTest(unittest.TestCase):
         status, data = self.get_voice(port)
         self.assertEqual((status, json.loads(data)), (200, {
             "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan",
-            "prefs": {"voice": None, "speed": 1.0, "avatar": True}}))
+            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
         self.assertEqual(FakeSpeech.seen, [])
         self.assertEqual(self.get_voice(port, admin=False)[0], 401)
         # A configured voice the server lacks is not offered as the default.
@@ -846,7 +846,7 @@ class TalkModeTest(unittest.TestCase):
         status, data = self.get_voice(down)
         self.assertEqual((status, json.loads(data)), (200, {
             "asr": None, "tts": None, "voices": [], "voice": None,
-            "prefs": {"voice": None, "speed": 1.0, "avatar": True}}))
+            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
 
     def put_prefs(self, port, body, admin=True):
         return self.call_method(port, "PUT", "/api/chat/voice-prefs", json.dumps(body).encode(),
@@ -867,16 +867,16 @@ class TalkModeTest(unittest.TestCase):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
         prefs = json.loads(self.get_voice(port)[1])["prefs"]
-        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25, "avatar": True})
+        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25, "avatar": True, "reply_style": "", "voice_style": ""})
         # null returns to the server's default voice.
         self.assertEqual(self.put_prefs(port, {"voice": None, "speed": 1})[0], 200)
-        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True})
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
         for bad in ({"voice": "aiden"}, {"speed": 1}, {"voice": "nobody", "speed": 1},
                     {"voice": "../x", "speed": 1}, {"voice": "aiden", "speed": 3},
                     {"voice": "aiden", "speed": 0.1}, {"voice": "aiden", "speed": "fast"},
                     {"voice": "aiden", "speed": True}, {"voice": 5, "speed": 1}):
             self.assertEqual(self.put_prefs(port, bad)[0], 400, bad)
-        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True})
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1}, admin=False)[0], 401)
         self.assertEqual(self.put_prefs(self.serve(None), {"voice": None, "speed": 1})[0], 404)
 
@@ -895,7 +895,7 @@ class TalkModeTest(unittest.TestCase):
         # The voice page saving the voice leaves the avatar as it is, and can set it too.
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
         self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"],
-                         {"voice": "aiden", "speed": 1.25, "avatar": False})
+                         {"voice": "aiden", "speed": 1.25, "avatar": False, "reply_style": "", "voice_style": ""})
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25, "avatar": True})[0], 200)
         self.assertTrue(avatar())
         # Closing it keeps the voice.
@@ -907,6 +907,28 @@ class TalkModeTest(unittest.TestCase):
         self.assertEqual(self.call_method(port, "PUT", "/api/chat/avatar", b'{"enabled": true}',
                                           "application/json", admin=False)[0], 401)
 
+    def test_the_styles_are_kept_per_account_and_reach_the_speech_server_and_the_chat(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        prefs = lambda: json.loads(self.get_voice(port)[1])["prefs"]  # noqa: E731
+        self.assertEqual((prefs()["reply_style"], prefs()["voice_style"]), ("", ""))
+        body = {"voice": "aiden", "speed": 1, "reply_style": " short, informal ", "voice_style": "relaxed and warm"}
+        self.assertEqual(self.put_prefs(port, body)[0], 200)
+        self.assertEqual((prefs()["reply_style"], prefs()["voice_style"]), ("short, informal", "relaxed and warm"))
+        # Saving the voice without the styles leaves them; an empty string clears one.
+        self.put_prefs(port, {"voice": "ryan", "speed": 1})
+        self.assertEqual(prefs()["voice_style"], "relaxed and warm")
+        self.put_prefs(port, {"voice": "ryan", "speed": 1, "voice_style": ""})
+        self.assertEqual((prefs()["reply_style"], prefs()["voice_style"]), ("short, informal", ""))
+        for bad in ({"reply_style": 5}, {"voice_style": "x" * (gm.STYLE_MAX + 1)}, {"reply_style": ["a"]}):
+            self.assertEqual(self.put_prefs(port, {"voice": "ryan", "speed": 1, **bad})[0], 400, bad)
+        # What is spoken carries the instruction; without one the request has no such field.
+        self.call(port, "/api/chat/speak", b'{"text":"Hi.","instructions":"quickly, casually"}', "application/json")
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["instructions"], "quickly, casually")
+        self.call(port, "/api/chat/speak", b'{"text":"Hi."}', "application/json")
+        self.assertNotIn("instructions", json.loads(FakeSpeech.seen[-1][3]))
+        for bad in (b'{"text":"Hi.","instructions":3}', json.dumps({"text": "Hi.", "instructions": "x" * 301}).encode()):
+            self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:40])
+
     def test_a_store_from_before_the_avatar_setting_gains_it_on(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "old.sqlite"
@@ -916,15 +938,15 @@ class TalkModeTest(unittest.TestCase):
             old.close()
             store = gm.ChatStore(path)
             self.addCleanup(store.close)
-            self.assertEqual(store.voice_prefs("admin"), {"voice": "ryan", "speed": 1.25, "avatar": True})
+            self.assertEqual(store.voice_prefs("admin"), {"voice": "ryan", "speed": 1.25, "avatar": True, "reply_style": "", "voice_style": ""})
             store.set_avatar("admin", False)
             self.assertFalse(store.voice_prefs("admin")["avatar"])
 
     def test_prefs_belong_to_their_owner(self):
         store = gm.ChatStore(":memory:")
         store.set_voice_prefs("user:7", "serena", 1.5)
-        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5, "avatar": True})
-        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0, "avatar": True})
+        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5, "avatar": True, "reply_style": "", "voice_style": ""})
+        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""})
         store.set_voice_prefs("admin", "ryan", 0.8)
         self.assertEqual(store.voice_prefs("user:7")["voice"], "serena")
 

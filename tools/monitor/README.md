@@ -78,6 +78,13 @@ another TTS server holds a model for it: `--tts-route bulgarian=http://127.0.0.1
 language there, using its own voice if the chosen one is not among its voices. The page needs a secure context for the
 microphone (`localhost` or https).
 
+**Style.** Two optional texts on the Voice settings page, kept per account: a *reply style* ("short, spoken, informal; no
+lists"), added to the model's system message in every chat, and *voice instructions* ("relaxed, warm, a little
+playful"), sent as `instructions` with every spoken reply. The first works with any model. The second depends on the
+speech model: VoiceDesign takes a voice description there, while whether the stock CustomVoice voices or a fine-tuned
+voice follow it has to be heard (the sample button on the page uses the text as typed). Each is at most 300 characters;
+`PUT /api/chat/voice-prefs` takes `reply_style` and `voice_style` (omitted keeps the old value, an empty string clears it).
+
 **Avatar.** A small animated face sits over the corner of the chat (talk mode has to exist). It blinks, sways, and its
 mouth follows the loudness of the audio being played, so it works with any voice, speed or language and needs no model
 or asset. It is on by default; its close button turns it off for the account, and the **Voice settings** page turns it

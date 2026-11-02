@@ -43,6 +43,8 @@ async function load() {
   const nearest = rates.reduce((best, rate) => (Math.abs(rate - info.prefs.speed) < Math.abs(best - info.prefs.speed) ? rate : best));
   $('speed').value = String(nearest);
   $('avatar').checked = info.prefs.avatar !== false;
+  $('reply-style').value = info.prefs.reply_style ?? '';
+  $('voice-style').value = info.prefs.voice_style ?? '';
   $('models').textContent = [info.asr && `Listening: ${info.asr}`, info.tts && `Speaking: ${info.tts}`]
     .filter(Boolean).join(' · ') || 'The speech servers are not answering.';
   if (!info.voices.length) say('The speech server lists no voices.', true);
@@ -51,7 +53,8 @@ async function load() {
 async function synthesize(text) {
   const response = await fetch('/api/chat/speak', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, ...($('voice').value ? { voice: $('voice').value } : {}) }),
+    body: JSON.stringify({ text, ...($('voice').value ? { voice: $('voice').value } : {}),
+      ...($('voice-style').value.trim() ? { instructions: $('voice-style').value.trim() } : {}) }),
   });
   if (!response.ok) throw new Error(await failure(response));
   return response.arrayBuffer();
@@ -78,7 +81,8 @@ $('voice-form').addEventListener('submit', async (event) => {
   try {
     const response = await fetch('/api/chat/voice-prefs', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ voice: $('voice').value || null, speed: Number($('speed').value), avatar: $('avatar').checked }),
+      body: JSON.stringify({ voice: $('voice').value || null, speed: Number($('speed').value), avatar: $('avatar').checked,
+        reply_style: $('reply-style').value, voice_style: $('voice-style').value }),
     });
     if (!response.ok) throw new Error(await failure(response));
     say('Saved.');

@@ -1079,7 +1079,8 @@ async function send() {
   // Earlier tool steps stay in the thread but not in what is sent: the answers carry them.
   const note = allowed.size ? toolkit.note(allowed, new Date().toISOString().slice(0, 10)) : null;
   const system = Projects.systemMessage(owner ? Projects.context(owner, chat.memory) : null, note?.content,
-    talk?.active ? talk.instruction : null, Lang.note(chat.language ?? Lang.EMPTY));
+    talk?.active ? talk.instruction : null, Lang.note(chat.language ?? Lang.EMPTY),
+    voicePrefs.reply_style ? `Style of your replies, as the user asked: ${voicePrefs.reply_style}` : null);
   const outgoing = [...(system ? [system] : []), ...toApiMessages(chat.messages)];
   let reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [],
     ...(chat.language?.spoken ? { language: chat.language.spoken } : {}) };
@@ -1378,7 +1379,8 @@ async function speechError(response) {
 async function synthesizeSpeech(text, language) {
   const response = await fetch('/api/chat/speak', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}) }),
+    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}),
+      ...(voicePrefs.voice_style ? { instructions: voicePrefs.voice_style } : {}) }),
   });
   if (!response.ok) throw await speechError(response);
   return response.arrayBuffer();
@@ -1468,14 +1470,14 @@ const playThroughAvatar = (context, node) => {
 
 // How replies are spoken: the voice and speed from the account's voice settings (/voice), read
 // when the chat learns that talk mode exists.
-let voicePrefs = { voice: null, speed: 1, avatar: true };
+let voicePrefs = { voice: null, speed: 1, avatar: true, reply_style: '', voice_style: '' };
 async function loadVoicePrefs() {
   try {
     const response = await fetch('/api/chat/voice');
     if (!response.ok) return;
     const info = await response.json();
     voicePrefs = { voice: info.prefs?.voice ?? info.voice ?? null, speed: Number(info.prefs?.speed) || 1,
-      avatar: info.prefs?.avatar !== false };
+      avatar: info.prefs?.avatar !== false, reply_style: info.prefs?.reply_style ?? '', voice_style: info.prefs?.voice_style ?? '' };
     showAvatar(voicePrefs.avatar);
   } catch { /* the defaults speak */ }
 }
