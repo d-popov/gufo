@@ -566,6 +566,7 @@ GUEST_CHATS_PER_MINUTE = 6
 GUEST_AUDIO_PER_MINUTE = 24
 GUEST_MISSES_PER_MINUTE = 20
 GUEST_REPLIES_AT_ONCE = 2
+GUEST_SPEECH_AT_ONCE = 2
 SHARE_PATH = re.compile(r"^/(?:s|api/share)/([A-Za-z0-9_-]{1,80})(?:/(chat|transcribe|speak))?$")
 DESIGN_VOICE = "designed"  # the voice choice that means "the voice the instructions describe" (VoiceDesign)
 STYLE_MAX = 300  # characters of a style setting: a reply style for the model, a voice instruction for the voice
@@ -2179,6 +2180,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.guest_audio = RateLimiter(GUEST_AUDIO_PER_MINUTE, 60.0)
         self.guest_misses = RateLimiter(GUEST_MISSES_PER_MINUTE, 60.0)
         self.guest_replies = threading.BoundedSemaphore(GUEST_REPLIES_AT_ONCE)
+        self.guest_speech = threading.BoundedSemaphore(GUEST_SPEECH_AT_ONCE)  # listening and speaking, all links
         self.stop = threading.Event()
 
 
@@ -2848,7 +2850,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.guest_replies.release()
 
     def _share_audio(self, shares, module, share: dict, kind: str, owner_prefs: dict):
-        """A visitor's utterance to text, or a reply's text to speech in the owner's voice."""
+        """A visitor's utterance to text, or a reply's text to speech in the owner's voice. At most
+        GUEST_SPEECH_AT_ONCE of these run for all links together; another is answered busy at once, and costs
+        its link nothing."""
         voice = self.server.voice
         if voice is None:
             raise module.ShareError(404, "talk mode is not available")
@@ -2863,9 +2867,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 44 < length <= module.GUEST_AUDIO_BYTES:
                 raise module.ShareError(400, f"expected a WAV of at most {module.GUEST_AUDIO_BYTES >> 20} MiB")
             wav = self.rfile.read(length)
-            if not shares.take_audio(share["token"]):
-                raise module.ShareError(403, "this link has used up its speech requests")
-            status, answer, content_type = voice.transcribe(wav, key)
         else:
             body = self._read_json(module.GUEST_TEXT_CHARS * 4 + 1024)
             text = body.get("text") if body else None
@@ -2874,10 +2875,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise module.ShareError(400, f"expected text of 1 to {module.GUEST_TEXT_CHARS} characters")
             if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
                 raise module.ShareError(400, "language is a lower-case name such as bulgarian")
+        if not self.server.guest_speech.acquire(blocking=False):
+            raise module.ShareError(503, "busy: other visitors are being heard or spoken to; try again in a moment")
+        try:
             if not shares.take_audio(share["token"]):
                 raise module.ShareError(403, "this link has used up its speech requests")
-            status, answer, content_type = voice.speak(
-                text, key, owner_prefs.get("voice"), language, owner_prefs.get("voice_style") or None)
+            if kind == "transcribe":
+                status, answer, content_type = voice.transcribe(wav, key)
+            else:
+                status, answer, content_type = voice.speak(
+                    text, key, owner_prefs.get("voice"), language, owner_prefs.get("voice_style") or None)
+        finally:
+            self.server.guest_speech.release()
         if status != 200:
             raise module.ShareError(502, "the speech server could not answer; try again")
         self._send(200, answer, content_type)

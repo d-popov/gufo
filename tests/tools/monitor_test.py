@@ -1039,6 +1039,7 @@ class ShareRoutesTest(unittest.TestCase):
                                  chat_model="fn-sub", chat_store=self.store,
                                  voice=gm.VoiceServices(speech_url, speech_url, voice="ryan"), shares=self.shares))
         server.public_url = self.PUBLIC
+        self.server = server
         self.addCleanup(lambda: (server.shutdown(), server.server_close(), self.shares.close()))
         self.port = server.server_address[1]
 
@@ -1151,6 +1152,34 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", b"RIFF", content_type="audio/wav")[0], 400)
         self.assertEqual(len(FakeSpeech.seen), before, "refused requests never reached the speech servers")
         self.assertEqual(self.call("GET", f"/api/share/{token2}")[1]["audio_left"], 5, "and cost nothing")
+
+    def test_speech_is_bounded_across_links_and_the_place_is_given_back_after_any_outcome(self):
+        _, one = self.make(max_audio=10)
+        _, two = self.make(max_audio=10)
+        wav = b"RIFF" + bytes(60)
+        self.server.guest_speech = threading.BoundedSemaphore(1)
+        # Someone else holds the only place: a request on another link is answered busy, reaches no speech server
+        # and costs nothing.
+        self.assertTrue(self.server.guest_speech.acquire(blocking=False))
+        before = len(FakeSpeech.seen)
+        for path, body, kind in ((f"/api/share/{two}/speak", {"text": "Hi."}, "application/json"),
+                                 (f"/api/share/{two}/transcribe", wav, "audio/wav")):
+            status, answer = self.call("POST", path, body, content_type=kind)
+            self.assertEqual(status, 503, path)
+            self.assertIn("busy", answer["error"])
+        self.assertEqual(len(FakeSpeech.seen), before)
+        self.assertEqual(self.call("GET", f"/api/share/{two}")[1]["audio_left"], 10)
+        self.server.guest_speech.release()
+        # Every way a request can end gives the place back: success, the speech server refusing, a spent link.
+        FakeSpeech.refuse = True
+        for _ in range(2):
+            self.assertEqual(self.call("POST", f"/api/share/{one}/speak", {"text": "Hi."})[0], 502)
+        FakeSpeech.refuse = False
+        self.assertEqual(self.call("POST", f"/api/share/{one}/speak", {"text": "Hi."}, raw=True)[0], 200)
+        _, spent = self.make(max_audio=1)
+        self.assertEqual(self.call("POST", f"/api/share/{spent}/speak", {"text": "Hi."}, raw=True)[0], 200)
+        self.assertEqual(self.call("POST", f"/api/share/{spent}/speak", {"text": "Hi."})[0], 403)
+        self.assertEqual(self.call("POST", f"/api/share/{two}/transcribe", wav, content_type="audio/wav")[0], 200)
 
     def test_a_link_opens_nothing_but_its_own_routes(self):
         _, token = self.make()

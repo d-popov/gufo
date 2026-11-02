@@ -89,7 +89,7 @@ voice, and the limits. They get no key, none of your chats, projects, memory, to
 every other route still answers 401 to them. The monitor builds each request to the model itself from a whitelist (the
 visitor's plain text only; no system messages, tools, images, model choice or long answers; thinking off, answers capped at
 1024 tokens), speaks with your voice and voice instructions, and caps reply length, message count, and size. A link is
-rate-limited (6 chats and 24 speech requests a minute), at most 2 replies are written for all links at once, and an address
+rate-limited (6 chats and 24 speech requests a minute), at most 2 replies are written and at most 2 speech requests run for all links at once (another gets "busy" at once and costs its link nothing), and an address
 that tries many wrong links is slowed down. Wrong, revoked and expired links answer the same 404, and the log shows only the
 first four characters of a token. The costs are yours: guests use your inference key and the GPU, and nothing is billed to
 the credits portal. Treat a link like a password: whoever has it can use it until it ends. `--shares-file` holds them
