@@ -350,8 +350,17 @@ def main() -> int:
     return 0
 
 
+def text_input_embeddings(talker, text_ids, mask):
+    """What the talker is fed for the text channel: the text embedding through the talker's text projection
+    (an MLP: text_hidden_size -> hidden_size), under the mask. Inference does exactly this
+    (qwen_tts modeling_qwen3_tts.py, and `gufo serve tts` in talker_runtime.cpp ProjectText); the upstream
+    sft_12hz.py feeds the raw embedding instead, so a model trained with it answers inference with noise.
+    The mask goes after the projection, which has a bias that would otherwise lift the masked positions."""
+    return talker.text_projection(talker.model.text_embedding(text_ids)) * mask
+
+
 def step(model, batch, accelerator):
-    """One micro-batch: the official sft_12hz.py computation, under bf16 autocast (the official run
+    """One micro-batch: the official sft_12hz.py computation (with the text projection it omits), under bf16 autocast (the official run
     holds bf16 weights; with float32 master weights the compute still runs in bf16). Returns the
     loss and the speaker embedding of this batch's reference audio."""
     input_ids = batch["input_ids"]
@@ -367,9 +376,10 @@ def step(model, batch, accelerator):
         speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
         input_text_ids = input_ids[:, :, 0]
         input_codec_ids = input_ids[:, :, 1]
-        input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+        input_text_embedding = text_input_embeddings(model.talker, input_text_ids, text_embedding_mask)
         input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-        input_codec_embedding[torch.arange(input_ids.shape[0]), batch["speaker_index"], :] = speaker_embedding
+        input_codec_embedding[torch.arange(input_ids.shape[0]), batch["speaker_index"], :] = speaker_embedding.to(
+            input_codec_embedding.dtype)
         input_embeddings = input_text_embedding + input_codec_embedding
         for i in range(1, 16):
             codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])

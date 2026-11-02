@@ -192,6 +192,24 @@ class DatasetFilterTest(unittest.TestCase):
         self.assertEqual(len(dataset.to_rate(samples, 44100)), dataset.RATE)
 
 
+@unittest.skipIf(train is None, "torch and accelerate are not installed")
+class TextChannelTest(unittest.TestCase):
+    def test_the_text_goes_through_the_talkers_projection_as_it_does_at_inference(self):
+        # Upstream sft_12hz.py feeds the raw embedding; a model trained so answers inference with noise.
+        torch.manual_seed(0)
+        wide, narrow = 6, 4  # the 0.6B talker: text embeddings wider than its hidden size
+        talker = argparse.Namespace(
+            model=argparse.Namespace(text_embedding=torch.nn.Embedding(10, wide)),
+            text_projection=torch.nn.Sequential(torch.nn.Linear(wide, wide), torch.nn.SiLU(), torch.nn.Linear(wide, narrow)))
+        ids = torch.tensor([[1, 2, 3]])
+        mask = torch.tensor([[[True], [True], [False]]])
+        out = train.text_input_embeddings(talker, ids, mask)
+        expected = talker.text_projection(talker.model.text_embedding(ids))
+        self.assertEqual(out.shape, (1, 3, narrow))
+        self.assertTrue(torch.equal(out[0, :2], expected[0, :2]))
+        self.assertTrue(torch.equal(out[0, 2], torch.zeros(narrow)), "the projection's bias must not lift masked positions")
+
+
 try:
     LAYOUT = importlib.util.spec_from_file_location(
         "tts_layout", Path(__file__).parents[2] / "tools/audio/tts_finetune/language_layout.py")

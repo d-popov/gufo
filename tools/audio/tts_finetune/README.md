@@ -6,7 +6,7 @@ progress files and a progress viewer. Nothing here is part of Gufo's runtime.
 
 ```sh
 # once: upstream scripts, qwen-tts and its pinned dependencies beside Unsloth Studio's ROCm PyTorch,
-# and the 1.7B Base model (the upstream step fails on 0.6B: its text embedding is wider than its talker)
+# and a Base model (1.7B, or 0.6B for trials)
 tools/audio/tts_finetune/setup.sh ~/qwen3-tts-train 1.7B
 T=~/qwen3-tts-train
 
@@ -48,6 +48,12 @@ exports a checkpoint on demand.
 `--weights fp32` keeps small updates that a learning rate of 2e-6 would lose in bf16 weights (the
 official script trains bf16 weights); compute is bf16 either way. `--attn sdpa` is the default because
 `flash_attention_2` is not built for this GPU.
+
+**Why not the upstream training step as it is.** `finetuning/sft_12hz.py` feeds the talker the raw text embedding,
+but inference (`qwen_tts`, and `gufo serve tts`) passes it through the talker's text projection first. Trained that
+way for a few thousand steps, a model answers inference with noise: runaway audio that is not speech (observed here,
+after a 4.5-hour run). `train.py` applies the projection; this is also why the upstream script fails on the 0.6B model,
+whose text embeddings are wider than its talker. Not reported upstream yet.
 
 **Language IDs.** Qwen3-TTS prompts its talker either with "language auto" or with a language's codec token, and
 `gufo serve tts` builds both. The upstream script trains every row as auto. With `--tagged-fraction F` the share `F` of
