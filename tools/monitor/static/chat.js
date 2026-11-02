@@ -967,8 +967,13 @@ function toApiMessages(messages) {
   });
 }
 
+// What the avatar's face shows follows talk mode's state and whether a reply is being written.
+let talkState = 'off';
+const refreshAvatarMood = () => avatar?.setMood(window.GufoAvatar.moodFor(talkState, busy));
+
 function setBusy(on) {
   busy = on;
+  refreshAvatarMood();
   updateSendLabel();
   $('delete-chat').disabled = on;  // not while a reply is being written into it
   for (const id of ['update-memory', 'draft-guidelines']) $(id).disabled = on;  // the model is busy with the reply
@@ -1426,6 +1431,8 @@ function talkController() {
     synthesize: (text) => synthesizeSpeech(text, active()?.language?.spoken),
     attach: playThroughAvatar,
     setState: (state, detail) => {
+      talkState = state;
+      refreshAvatarMood();
       const button = $('talk');
       button.textContent = TALK_LABEL[state] ?? 'Talk';
       button.setAttribute('aria-pressed', String(state !== 'off'));
@@ -1445,7 +1452,7 @@ function showAvatar(on) {
   const pip = $('avatar');
   if (!window.GufoAvatar) return;
   pip.hidden = !on;
-  if (on && !avatar) avatar = window.GufoAvatar.create($('avatar-face'));
+  if (on && !avatar) { avatar = window.GufoAvatar.create($('avatar-face')); refreshAvatarMood(); }
   if (!on && avatar) { avatar.destroy(); avatar = null; }
 }
 $('avatar-close').append(window.GufoIcons.svg('x'));
@@ -1463,6 +1470,50 @@ $('avatar-close').addEventListener('click', async () => {
     $('status').textContent = `The avatar setting was not saved (${error.message}).`;
   }
 });
+// The avatar window can be dragged anywhere on the page; where it was left is remembered in this browser.
+(() => {
+  const pip = $('avatar');
+  const KEY = 'gufo-avatar-position';
+  const place = (x, y) => {
+    const box = pip.getBoundingClientRect();
+    const at = window.GufoAvatar.clampPosition(x, y, box.width, box.height, window.innerWidth, window.innerHeight);
+    pip.style.left = `${at.x}px`;
+    pip.style.top = `${at.y}px`;
+    pip.style.right = 'auto';
+    pip.style.bottom = 'auto';
+    return at;
+  };
+  const restore = () => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(KEY) ?? 'null');
+      if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) place(saved.x, saved.y);
+    } catch { /* no saved place */ }
+  };
+  let drag = null;
+  pip.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.target.closest('button')) return;
+    const box = pip.getBoundingClientRect();
+    drag = { dx: event.clientX - box.left, dy: event.clientY - box.top };
+    pip.setPointerCapture(event.pointerId);
+    pip.classList.add('dragging');
+    event.preventDefault();
+  });
+  pip.addEventListener('pointermove', (event) => {
+    if (drag) place(event.clientX - drag.dx, event.clientY - drag.dy);
+  });
+  const finish = () => {
+    if (!drag) return;
+    drag = null;
+    pip.classList.remove('dragging');
+    const box = pip.getBoundingClientRect();
+    try { localStorage.setItem(KEY, JSON.stringify({ x: box.left, y: box.top })); } catch { /* storage blocked */ }
+  };
+  pip.addEventListener('pointerup', finish);
+  pip.addEventListener('pointercancel', finish);
+  window.addEventListener('resize', () => { if (pip.style.left) { const box = pip.getBoundingClientRect(); place(box.left, box.top); } });
+  restore();
+})();
+
 // Spoken audio goes through the avatar, which listens on the way to the speakers.
 const playThroughAvatar = (context, node) => {
   if (avatar) avatar.attach(context, node); else node.connect(context.destination);

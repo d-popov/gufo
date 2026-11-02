@@ -203,7 +203,9 @@ input[type="text"]:focus-visible { outline: 2px solid var(--focus); outline-offs
 
 /* The avatar: a small window over the corner of the conversation. */
 .avatar-pip { position: fixed; right: 1rem; bottom: 9rem; z-index: 5; width: 8.5rem; height: 8.5rem; border: 1px solid var(--line);
-  border-radius: 12px; background: var(--surface); box-shadow: 0 4px 16px rgb(0 0 0 / 0.25); overflow: hidden; }
+  border-radius: 12px; background: var(--surface); box-shadow: 0 4px 16px rgb(0 0 0 / 0.25); overflow: hidden;
+  cursor: grab; touch-action: none; user-select: none; }
+.avatar-pip.dragging { cursor: grabbing; }
 .avatar-pip[hidden] { display: none; }
 .avatar-close { position: absolute; top: 0.2rem; right: 0.2rem; width: 1.5rem; height: 1.5rem; padding: 0; display: grid; place-items: center;
   border-radius: 999px; border: none; background: transparent; color: var(--muted); cursor: pointer; }
@@ -218,3 +220,15 @@ input[type="text"]:focus-visible { outline: 2px solid var(--focus); outline-offs
 @keyframes avatar-sway { 0%, 100% { transform: rotate(-1.8deg); } 50% { transform: rotate(1.8deg); } }
 @media (prefers-reduced-motion: reduce) { .avatar-head { animation: none; } }
 @media (max-width: 640px) { .avatar-pip { width: 6rem; height: 6rem; bottom: 11rem; } }
+
+/* Moods: thinking shows three dots above the head; listening and hearing lean in a little. */
+.avatar-dots { opacity: 0; transition: opacity 0.2s; }
+.mood-thinking .avatar-dots { opacity: 1; }
+.avatar-dot { fill: var(--muted); animation: avatar-dot 1.2s ease-in-out infinite; }
+.avatar-dot-1 { animation-delay: 0.2s; }
+.avatar-dot-2 { animation-delay: 0.4s; }
+@keyframes avatar-dot { 0%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+.mood-listening .avatar-head { animation: none; transform: translateY(1px) rotate(-3deg); transition: transform 0.3s; }
+.mood-hearing .avatar-head { animation: avatar-nod 0.9s ease-in-out infinite; }
+@keyframes avatar-nod { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
+@media (prefers-reduced-motion: reduce) { .avatar-dot, .mood-hearing .avatar-head { animation: none; } }

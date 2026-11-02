@@ -36,8 +36,15 @@ async function load() {
     option.textContent = name;
     return option;
   }));
+  // With a VoiceDesign server there is one more choice: the voice the Voice instructions describe.
+  if (info.design) {
+    const option = document.createElement('option');
+    option.value = 'designed';
+    option.textContent = 'Designed voice (made from the voice instructions)';
+    $('voice').append(option);
+  }
   const wanted = info.prefs.voice ?? info.voice;
-  if (info.voices.includes(wanted)) $('voice').value = wanted;
+  if (info.voices.includes(wanted) || (info.design && wanted === 'designed')) $('voice').value = wanted;
   // The option nearest the saved rate.
   const rates = [...$('speed').options].map((option) => Number(option.value));
   const nearest = rates.reduce((best, rate) => (Math.abs(rate - info.prefs.speed) < Math.abs(best - info.prefs.speed) ? rate : best));

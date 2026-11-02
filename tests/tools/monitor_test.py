@@ -701,6 +701,22 @@ class FakeSpeechTwo(FakeSpeech):
         self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
 
 
+class FakeDesign(FakeSpeech):
+    """A VoiceDesign TTS server: one placeholder voice, the voice made from `instructions`."""
+
+    seen: list = []
+
+    def do_GET(self):
+        if self.path == "/v1/audio/voices":
+            return self._reply(200, b'{"data":[{"id":"voice-design"}]}', "application/json")
+        self._reply(200, b'{"data":[{"id":"fake-design"}]}', "application/json")
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        FakeDesign.seen.append((self.path, self.headers.get("Authorization"), self.headers.get("Content-Type"), body))
+        self._reply(200, b"RIFF....WAVEfmt designed-audio", "audio/wav")
+
+
 class TalkModeTest(unittest.TestCase):
     """The chat's talk mode: the admin's utterances and replies go to Gufo's speech servers
     with the chat key, and to nobody else."""
@@ -788,6 +804,42 @@ class TalkModeTest(unittest.TestCase):
         self.call(port, "/api/chat/speak", b'{"text":"Hi."}', "application/json")
         self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["model"], "fake-speech")
 
+    def test_a_designed_voice_is_made_by_the_design_server_from_the_instructions(self):
+        FakeDesign.seen.clear()
+        design = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeDesign))
+        self.addCleanup(lambda: (design.shutdown(), design.server_close()))
+        url = f"http://127.0.0.1:{design.server_address[1]}"
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan", design_url=url))
+        self.assertTrue(json.loads(self.get_voice(port)[1])["design"])
+        # Choosing it is saved; speaking sends the description to the design server, with no voice name.
+        self.assertEqual(self.put_prefs(port, {"voice": "designed", "speed": 1, "voice_style": "calm, low, warm"})[0], 200)
+        speak = lambda body: self.call(port, "/api/chat/speak", json.dumps(body).encode(), "application/json")  # noqa: E731
+        status, data, _ = speak({"text": "Hi.", "voice": "designed", "instructions": "calm, low, warm", "language": "english"})
+        self.assertEqual((status, data[:4]), (200, b"RIFF"))
+        sent = json.loads(FakeDesign.seen[-1][3])
+        self.assertEqual((sent["model"], sent["instructions"], sent["language"]), ("fake-design", "calm, low, warm", "english"))
+        self.assertNotIn("voice", sent)
+        # A language its model has no name for is left to the model; no description is a clear refusal.
+        speak({"text": "Hi.", "voice": "designed", "instructions": "calm", "language": "bulgarian"})
+        self.assertNotIn("language", json.loads(FakeDesign.seen[-1][3]))
+        before = len(FakeDesign.seen)
+        status, data, _ = speak({"text": "Hi.", "voice": "designed"})
+        self.assertEqual(status, 400)
+        self.assertIn("describe the voice", json.loads(data)["error"]["message"])
+        self.assertEqual(len(FakeDesign.seen), before)
+        # Other voices are untouched.
+        speak({"text": "Hi.", "voice": "aiden", "instructions": "calm"})
+        self.assertEqual(len(FakeDesign.seen), before)
+        self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "aiden")
+
+    def test_without_a_design_server_the_designed_voice_is_not_offered_or_accepted(self):
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        self.assertFalse(json.loads(self.get_voice(port)[1])["design"])
+        self.assertEqual(self.put_prefs(port, {"voice": "designed", "speed": 1})[0], 400)
+        status, data, _ = self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"designed","instructions":"calm"}',
+                                    "application/json")
+        self.assertEqual(status, 400)
+
     def test_a_reply_is_spoken_by_the_server_that_speaks_its_language(self):
         # A second server holds a model fine-tuned for one language; the rest go to the first.
         other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
@@ -842,7 +894,7 @@ class TalkModeTest(unittest.TestCase):
         port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
         status, data = self.get_voice(port)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan",
+            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan", "design": False,
             "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
         self.assertEqual(FakeSpeech.seen, [])
         self.assertEqual(self.get_voice(port, admin=False)[0], 401)
@@ -854,7 +906,7 @@ class TalkModeTest(unittest.TestCase):
         down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
         status, data = self.get_voice(down)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": None, "tts": None, "voices": [], "voice": None,
+            "asr": None, "tts": None, "voices": [], "voice": None, "design": False,
             "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "voice_style": ""}}))
 
     def put_prefs(self, port, body, admin=True):

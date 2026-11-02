@@ -84,10 +84,15 @@ playful"), sent as `instructions` with every spoken reply. The first works with 
 speech model: VoiceDesign takes a voice description there, while whether the stock CustomVoice voices or a fine-tuned
 voice follow it has to be heard (the sample button on the page uses the text as typed). Each is at most 300 characters;
 `PUT /api/chat/voice-prefs` takes `reply_style` and `voice_style` (omitted keeps the old value, an empty string clears it).
+`--tts-design-url URL` names a `gufo serve tts` running a **VoiceDesign** model; the voice list then gains *Designed voice*,
+spoken by that server from the voice instructions as the description ("calm, low, warm"), with no voice name. Without a
+description it refuses. Not every speech model follows instructions, which is why this one is a separate server.
 
 **Avatar.** A small animated face sits over the corner of the chat (talk mode has to exist). It blinks, sways, and its
 mouth follows the loudness of the audio being played, so it works with any voice, speed or language and needs no model
-or asset. It is on by default; its close button turns it off for the account, and the **Voice settings** page turns it
+or asset. It looks attentive while the microphone listens, leans in while it hears you, and shows a thinking pose
+(gaze up, three dots) while your words are understood and while a reply is written, typed or spoken. Drag it anywhere;
+the place is remembered in the browser. It is on by default; its close button turns it off for the account, and the **Voice settings** page turns it
 back on. The setting is kept on the server with the voice (`PUT /api/chat/avatar {enabled}`, or `avatar` in
 `PUT /api/chat/voice-prefs`). `static/avatar.js`.
 
