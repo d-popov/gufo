@@ -19,6 +19,7 @@
   <script src="/static/chatstore.js" defer></script>
   <script src="/static/chatsync.js" defer></script>
   <script src="/static/language.js" defer></script>
+  <script src="/static/sharelink.js" defer></script>
   <script src="/static/avatar.js" defer></script>
   <script src="/static/talk.js" defer></script>
   <script src="/static/chat.js" defer></script>
@@ -33,8 +34,39 @@
       <button id="new-chat" type="button" class="secondary">New chat</button>
       <select id="history" aria-label="Chats in this project"></select>
       <button id="delete-chat" type="button" class="secondary" title="Delete this chat from this browser">Delete</button>
+      <button id="share-chat" type="button" class="secondary" aria-expanded="false" aria-controls="share-panel"
+              title="Make a public link to chat, talk and listen without signing in" hidden>Share</button>
       <div id="chat-total" class="chat-total" title="Total for this chat"></div>
     </div>
+    <section id="share-panel" class="project-panel" aria-label="Share this chat" hidden>
+      <p class="hint">Anyone with the link can chat with this server's model, speak to it and hear it answer, without signing in,
+        until the link expires, runs out of messages, or you revoke it on <a href="/shares">Shared chats</a>. They use your
+        model and your voice; they get nothing else of yours.</p>
+      <label class="field">Name
+        <input id="share-title" type="text" maxlength="80" autocomplete="off">
+      </label>
+      <div class="row">
+        <label class="field">Expires
+          <select id="share-days"><option value="1">in 1 day</option><option value="7" selected>in 7 days</option><option value="30">in 30 days</option><option value="0">never</option></select>
+        </label>
+        <label class="field">Messages
+          <input id="share-messages" type="number" min="1" max="10000" value="100">
+        </label>
+        <label class="field">Speech requests
+          <input id="share-audio" type="number" min="1" max="10000" value="400">
+        </label>
+      </div>
+      <label class="check"><input id="share-include" type="checkbox"> Start from this conversation (their copy; text only)</label>
+      <div class="row">
+        <button id="share-create" type="button">Make link</button>
+        <button id="share-close" type="button" class="secondary">Close</button>
+        <span id="share-state" role="status"></span>
+      </div>
+      <div id="share-result" class="row" hidden>
+        <input id="share-url" type="text" readonly aria-label="The link">
+        <button id="share-copy" type="button" class="secondary">Copy</button>
+      </div>
+    </section>
     <section id="project-panel" class="project-panel" aria-label="Project settings" hidden>
       <label class="field">Name
         <input id="project-name" type="text" maxlength="60" autocomplete="off">

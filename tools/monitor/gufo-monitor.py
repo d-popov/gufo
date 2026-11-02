@@ -79,6 +79,11 @@ STATIC_FILES = {
     "language.js": (STATIC_DIR, _JS),
     "avatar.js": (STATIC_DIR, _JS),
     "voice.js": (STATIC_DIR, _JS),
+    "sharelink.js": (STATIC_DIR, _JS),
+    "share.js": (STATIC_DIR, _JS),
+    "share.css": (STATIC_DIR, _CSS),
+    "shares.js": (STATIC_DIR, _JS),
+    "shares.css": (STATIC_DIR, _CSS),
     "voice.css": (STATIC_DIR, _CSS),
     "markdown.js": (STATIC_DIR, _JS),
     "portal.css": (PORTAL_STATIC_DIR, _CSS),
@@ -555,6 +560,13 @@ class ChatRuns:
 
 
 VOICE_NAME = re.compile(r"[\w.-]{1,64}")  # a speech server's voice name
+# Shared links (shares.py): what a link's visitors may do per minute, and how many replies may be written for all of
+# them at once, so a link cannot take the model from the owner.
+GUEST_CHATS_PER_MINUTE = 6
+GUEST_AUDIO_PER_MINUTE = 24
+GUEST_MISSES_PER_MINUTE = 20
+GUEST_REPLIES_AT_ONCE = 2
+SHARE_PATH = re.compile(r"^/(?:s|api/share)/([A-Za-z0-9_-]{1,80})(?:/(chat|transcribe|speak))?$")
 DESIGN_VOICE = "designed"  # the voice choice that means "the voice the instructions describe" (VoiceDesign)
 STYLE_MAX = 300  # characters of a style setting: a reply style for the model, a voice instruction for the voice
 LANGUAGE_NAME = re.compile(r"[a-z]{2,30}")  # a language as the speech models name it: "bulgarian"
@@ -2132,7 +2144,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     def __init__(self, address, monitor: Monitor, admin: AdminAuth, secure_cookie: bool,
                  keys: KeyStore | None = None, billing=None, chat_key: str | None = None,
                  chat_model: str | None = None, chat_store: ChatStore | None = None,
-                 library=None, voice: VoiceServices | None = None):
+                 library=None, voice: VoiceServices | None = None, shares=None):
         super().__init__(address, Handler)
         self.monitor = monitor
         self.admin = admin
@@ -2159,7 +2171,23 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
             from billing.portal import Portal  # the package load_billing put on sys.path
             self.portal = Portal(billing, secure_cookie, self.limiter)
         self.streams = threading.BoundedSemaphore(MAX_STREAMS)
+        # Shared chat links (shares.ShareStore); None: /s/*, /api/share/* and /api/chat/shares answer 404.
+        self.shares = shares
+        self.public_url: str | None = None  # GUFO_PUBLIC_URL, which a link's URL starts with
+        # What a link's visitors may ask for, per link, and how many wrong tokens one address may try.
+        self.guest_chat = RateLimiter(GUEST_CHATS_PER_MINUTE, 60.0)
+        self.guest_audio = RateLimiter(GUEST_AUDIO_PER_MINUTE, 60.0)
+        self.guest_misses = RateLimiter(GUEST_MISSES_PER_MINUTE, 60.0)
+        self.guest_replies = threading.BoundedSemaphore(GUEST_REPLIES_AT_ONCE)
         self.stop = threading.Event()
+
+
+def shares_module():
+    """shares.py, next to this file; loaded when first used."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import shares
+    return shares
 
 
 def library_modules():
@@ -2213,6 +2241,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_request(self, code="-", size="-"):
         if isinstance(code, int) and code >= 400 and code != 401:
             path = self.path.split("?", 1)[0]
+            path = re.sub(r"^(/(?:s|api/share)/)([^/]{0,4})[^/]*", r"\1\2...", path)  # a link's secret stays out of logs
             print(f"gufo-monitor: {self.command} {path} -> {code}", file=sys.stderr)
 
     def _send(self, status: int, body: bytes, content_type: str,
@@ -2543,6 +2572,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "sync": self.server.chat_store is not None,
             "library": self.server.library is not None and self._admin(),
             "talk": self.server.voice is not None and self._admin(),
+            "share": self.server.shares is not None and self._admin(),
         }).encode())
 
     def _chat_owner(self) -> str | None:
@@ -2692,6 +2722,165 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             if upstream is not None:
                 upstream.close()
+
+    # -- shared chat links: the owner's side (/api/chat/shares) and the visitors' (/s/TOKEN, /api/share/TOKEN/*)
+
+    def _share_url(self, token: str) -> str:
+        """A link's public URL: GUFO_PUBLIC_URL when set (never a request's Host header), else this listener."""
+        host, port = self.server.server_address[:2]
+        base = self.server.public_url or f"http://{f'[{host}]' if ':' in host else host}:{port}"
+        return f"{base.rstrip('/')}/s/{token}"
+
+    def _shares_admin(self, method: str, path: str):
+        """GET /api/chat/shares lists the links, POST creates one, DELETE /api/chat/shares/ID revokes an active one and
+        removes a revoked or expired one. The admin's only."""
+        shares = self.server.shares
+        if shares is None:
+            return self._error(404, "shared links are not configured")
+        if not self._admin():
+            return self._error(401, "unauthorized")
+        module = shares_module()
+
+        def show(share: dict) -> dict:
+            return {**{k: v for k, v in share.items() if k != "token"}, "url": self._share_url(share["token"])}
+
+        try:
+            if method == "GET":
+                return self._json(200, json.dumps({"shares": [show(s) for s in shares.list("admin")],
+                                                    "public": bool(self.server.public_url)}).encode())
+            if method == "POST":
+                body = self._read_json(module.SEED_BYTES + 4096)
+                if body is None:
+                    return self._error(400, "expected a JSON body")
+                seed = module.clean_seed(body.get("messages")) if body.get("include_chat") else []
+                share = shares.create("admin", body.get("title"), body.get("days", module.DEFAULT_DAYS),
+                                      body.get("max_messages", module.DEFAULT_MESSAGES),
+                                      body.get("max_audio", module.DEFAULT_AUDIO), seed)
+                return self._json(200, json.dumps(show(share)).encode())
+            share_id = path.rsplit("/", 1)[1]
+            if not module.SHARE_ID.fullmatch(share_id):
+                return self._error(404, "not_found")
+            done = shares.remove("admin", share_id)
+            if done is None:
+                return self._error(404, "not_found")
+            return self._json(200, json.dumps({"result": done}).encode())
+        except module.ShareError as error:
+            return self._error(error.status, error.message)
+
+    def _share_model(self) -> str | None:
+        models = [m["id"] for m in self.server.monitor.models]
+        chat_model = self.server.chat_model
+        return chat_model if chat_model in models else (models[0] if models else None)
+
+    def _share_route(self, method: str, path: str):
+        """A visitor's side. The token in the URL is the only credential: nothing is read from cookies, so there is
+        nothing for another site to ride on, and no CORS header is sent. A token that is wrong, revoked or expired
+        gets the same 404, and an address that tries many wrong ones is slowed down."""
+        shares = self.server.shares
+        token, kind = SHARE_PATH.match(path).groups()
+        if shares is None:
+            return self._error(404, "not_found")
+        module = shares_module()
+        if method == "GET" and kind is None and path.startswith("/s/"):
+            return self._file(STATIC_DIR / "share.html", "text/html; charset=utf-8")  # the page asks for itself below
+        share = shares.find(token)
+        if share is None:
+            if not self.server.guest_misses.allow("share:" + self.client_ip()):
+                return self._error(429, "too many tries")
+            return self._error(404, "not_found")
+        owner_prefs = (self.server.chat_store.voice_prefs(share["owner"]) if self.server.chat_store is not None
+                       else {"voice": None, "speed": 1.0, "reply_style": "", "voice_style": ""})
+        if method == "GET":
+            model = self._share_model()
+            return self._json(200, json.dumps(shares.view(share, model, self.server.voice is not None, owner_prefs),
+                                              ensure_ascii=False).encode())
+        if kind not in ("chat", "transcribe", "speak"):
+            return self._error(404, "not_found")
+        limiter = self.server.guest_chat if kind == "chat" else self.server.guest_audio
+        if not limiter.allow(f"{kind}:{token}"):
+            return self._error(429, "slow down a little")
+        try:
+            if kind == "chat":
+                return self._share_chat(shares, module, share, owner_prefs)
+            return self._share_audio(shares, module, share, kind, owner_prefs)
+        except module.ShareError as error:
+            return self._error(error.status, error.message)
+
+    def _share_chat(self, shares, module, share: dict, owner_prefs: dict):
+        """One message of a visitor's chat: cleaned, counted, sent to the model with the owner's key, streamed back."""
+        body = self._read_json(module.GUEST_TOTAL_CHARS * 4 + 4096)
+        model = self._share_model()
+        if model is None or self.server.chat_key is None:
+            raise module.ShareError(503, "the model is not available right now")
+        payload = module.clean_request(body, model, owner_prefs.get("reply_style"), body.get("note") if body else None)
+        if not shares.take_message(share["token"]):
+            raise module.ShareError(403, "this link has used up its messages")
+        if not self.server.guest_replies.acquire(blocking=False):
+            shares.refund_message(share["token"])
+            raise module.ShareError(503, "busy: several replies are being written; try again in a moment")
+        upstream = None
+        try:
+            status, upstream = self.server.monitor.gufo.open_post(
+                "/v1/chat/completions", json.dumps(payload, ensure_ascii=False).encode(),
+                api_key=self.server.chat_key)
+            if status != 200:
+                shares.refund_message(share["token"])
+                raise module.ShareError(502, "the model could not answer; try again")
+            self.send_response(200)
+            for name, value in SECURITY_HEADERS:
+                self.send_header(name, value)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            for line in iter(upstream.readline, b""):
+                self.wfile.write(line)
+                if line == b"\n":
+                    self.wfile.flush()
+            self.wfile.flush()
+        except OSError:
+            pass  # the visitor left; closing the upstream stops the reply
+        finally:
+            if upstream is not None:
+                upstream.close()
+            self.server.guest_replies.release()
+
+    def _share_audio(self, shares, module, share: dict, kind: str, owner_prefs: dict):
+        """A visitor's utterance to text, or a reply's text to speech in the owner's voice."""
+        voice = self.server.voice
+        if voice is None:
+            raise module.ShareError(404, "talk mode is not available")
+        key = self.server.chat_key
+        if kind == "transcribe":
+            if self.headers.get("Content-Type", "").split(";")[0].strip() != "audio/wav":
+                raise module.ShareError(415, "expected an audio/wav body")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if not 44 < length <= module.GUEST_AUDIO_BYTES:
+                raise module.ShareError(400, f"expected a WAV of at most {module.GUEST_AUDIO_BYTES >> 20} MiB")
+            wav = self.rfile.read(length)
+            if not shares.take_audio(share["token"]):
+                raise module.ShareError(403, "this link has used up its speech requests")
+            status, answer, content_type = voice.transcribe(wav, key)
+        else:
+            body = self._read_json(module.GUEST_TEXT_CHARS * 4 + 1024)
+            text = body.get("text") if body else None
+            language = body.get("language") if body else None
+            if not isinstance(text, str) or not text.strip() or len(text) > module.GUEST_TEXT_CHARS:
+                raise module.ShareError(400, f"expected text of 1 to {module.GUEST_TEXT_CHARS} characters")
+            if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
+                raise module.ShareError(400, "language is a lower-case name such as bulgarian")
+            if not shares.take_audio(share["token"]):
+                raise module.ShareError(403, "this link has used up its speech requests")
+            status, answer, content_type = voice.speak(
+                text, key, owner_prefs.get("voice"), language, owner_prefs.get("voice_style") or None)
+        if status != 200:
+            raise module.ShareError(502, "the speech server could not answer; try again")
+        self._send(200, answer, content_type)
 
     def _voice_info(self):
         """GET /api/chat/voice: the speech models and voices of talk mode, for the admin's chat."""
@@ -2940,6 +3129,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._library("DELETE")
         if urllib.parse.urlsplit(self.path).path.startswith("/api/chat/items/"):
             return self._sync_route("DELETE")
+        if urllib.parse.urlsplit(self.path).path.startswith("/api/chat/shares/"):
+            return self._shares_admin("DELETE", urllib.parse.urlsplit(self.path).path)
         self._mutation("DELETE")
 
     def do_POST(self):
@@ -2950,6 +3141,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._library("POST")
         if path == "/api/chat/completions":
             return self._chat_completion()
+        if SHARE_PATH.match(path):
+            return self._share_route("POST", path)
+        if path == "/api/chat/shares":
+            return self._shares_admin("POST", path)
         if path in ("/api/chat/transcribe", "/api/chat/speak"):
             return self._voice_route(path.rsplit("/", 1)[1])
         if path.startswith("/api/chat/runs/"):
@@ -2982,11 +3177,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._sync_route("GET")
         if path == "/api/chat/voice":
             return self._voice_info()
+        if SHARE_PATH.match(path):
+            return self._share_route("GET", path)
         until = self._admin_until()
         if until is None:
             if path in ("/chat", "/api/chat/models") and self._chat_user() is not None:
                 return (self._chat_page() if path == "/chat" else self._chat_models())
-            if path in ("/monitor", "/chat", "/voice"):
+            if path in ("/monitor", "/chat", "/voice", "/shares"):
                 return self._redirect("/")  # sign in through the profile menu
             if path.startswith("/api/"):
                 return self._json(401, b'{"error":"unauthorized"}')
@@ -2997,6 +3194,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._chat_page()
         if path == "/voice":
             return self._file(STATIC_DIR / "voice.html", "text/html; charset=utf-8")
+        if path == "/shares":
+            return self._file(STATIC_DIR / "shares.html", "text/html; charset=utf-8")
+        if path == "/api/chat/shares":
+            return self._shares_admin("GET", path)
         if path == "/api/state":
             return self._json(200, self.server.monitor.snapshot())
         if path == "/api/stream":
@@ -3123,6 +3324,10 @@ def parse_args(argv=None):
                         help="the chats and projects of every signed-in user, so one account sees "
                              "the same ones on every device; created (mode 0600) if missing. "
                              "The admin can read it: it holds the conversations")
+    parser.add_argument("--shares-file", type=Path,
+                        default=config / "gufo-monitor" / "shares.sqlite",
+                        help="the shared chat links (/shares): secret URLs that let a visitor chat and use the "
+                             "speech models without signing in, within limits; created (mode 0600) if missing")
     parser.add_argument("--library-dir", type=Path,
                         default=config / "gufo-monitor" / "library",
                         help="the private Markdown library: pages/, the original sources/ and "
@@ -3246,6 +3451,11 @@ def main(argv=None) -> int:
         print(f"gufo-monitor: --chat-store: {error}", file=sys.stderr)
         return 2
     try:
+        shares = shares_module().ShareStore(args.shares_file)
+    except (OSError, sqlite3.Error) as error:
+        print(f"gufo-monitor: --shares-file: {error}", file=sys.stderr)
+        return 2
+    try:
         library = library_modules()[0].Library(args.library_dir)
     except (OSError, sqlite3.Error) as error:
         print(f"gufo-monitor: --library-dir: {error}", file=sys.stderr)
@@ -3270,7 +3480,8 @@ def main(argv=None) -> int:
     voice = (VoiceServices(args.asr_url, args.tts_url, args.tts_voice, routes, args.tts_design_url)
              if args.asr_url else None)
     server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
-                    chat_key, args.chat_model, chat_store, library, voice)
+                    chat_key, args.chat_model, chat_store, library, voice, shares)
+    server.public_url = settings.get("GUFO_PUBLIC_URL")
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
                                 name="poll")]
     if args.log_source != "none":

@@ -493,7 +493,7 @@ class MonitorHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(data), {"models": ["fn", "fn-sub"], "pricing": None,
                                             "billed": False, "python": False, "default": None,
                                             "owner": "admin", "sync": False, "library": False,
-                                            "talk": False})
+                                            "talk": False, "share": False})
 
     def test_chat_default_model_is_offered_only_when_served(self):
         try:
@@ -1015,6 +1015,166 @@ class TalkModeTest(unittest.TestCase):
         args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2", "--tts-voice", "ryan"])
         self.assertEqual((args.asr_url, args.tts_url, args.tts_voice), ("http://a:1", "http://t:2", "ryan"))
         self.assertIsNone(gm.parse_args([]).asr_url)
+
+
+class ShareRoutesTest(unittest.TestCase):
+    """Shared chat links, over HTTP: the owner makes and revokes them, a visitor with the link needs nothing else."""
+
+    PUBLIC = "https://public.example"
+
+    def setUp(self):
+        FakeSpeech.seen = []
+        FakeSpeech.refuse = False
+        FakeGufo.chat_request = None
+        self.gufo = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeGufo))
+        self.speech = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeech))
+        for server in (self.gufo, self.speech):
+            self.addCleanup(lambda s=server: (s.shutdown(), s.server_close()))
+        speech_url = f"http://127.0.0.1:{self.speech.server_address[1]}"
+        monitor = gm.Monitor(gm.GufoClient(f"http://127.0.0.1:{self.gufo.server_address[1]}", GUFO_KEY), NoTelemetry())
+        monitor.models = [{"id": "fn"}, {"id": "fn-sub"}]
+        self.store = gm.ChatStore(":memory:")
+        self.shares = gm.shares_module().ShareStore(":memory:")
+        server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False, chat_key=GUFO_KEY,
+                                 chat_model="fn-sub", chat_store=self.store,
+                                 voice=gm.VoiceServices(speech_url, speech_url, voice="ryan"), shares=self.shares))
+        server.public_url = self.PUBLIC
+        self.addCleanup(lambda: (server.shutdown(), server.server_close(), self.shares.close()))
+        self.port = server.server_address[1]
+
+    def call(self, method, path, body=None, admin=False, content_type="application/json", raw=False):
+        headers = {"Content-Type": content_type}
+        data = body if isinstance(body, bytes) else (json.dumps(body).encode() if body is not None else None)
+        if data is not None:
+            headers["Content-Length"] = str(len(data))
+        if admin:
+            headers["X-Admin-Token"] = ADMIN_TOKEN
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        connection.request(method, path, data, headers)
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
+        return response.status, (payload if raw else (json.loads(payload) if payload[:1] in (b"{", b"[") else payload))
+
+    def make(self, **options):
+        status, share = self.call("POST", "/api/chat/shares", {"title": "Demo", **options}, admin=True)
+        self.assertEqual(status, 200, share)
+        return share, share["url"].rsplit("/", 1)[1]
+
+    def test_the_owner_makes_lists_and_revokes_links_and_nobody_else_can(self):
+        share, token = self.make(days=3, max_messages=5)
+        self.assertTrue(share["url"].startswith(self.PUBLIC + "/s/"), share["url"])
+        self.assertNotIn("token", share)
+        status, listed = self.call("GET", "/api/chat/shares", admin=True)
+        self.assertEqual((status, [s["title"] for s in listed["shares"]], listed["public"]), (200, ["Demo"], True))
+        self.assertNotIn(token, json.dumps({k: v for k, v in listed["shares"][0].items() if k != "url"}))
+        for method, path in (("GET", "/api/chat/shares"), ("POST", "/api/chat/shares"),
+                             ("DELETE", f"/api/chat/shares/{share['id']}")):
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 401, (method, path))
+        self.assertEqual(self.call("DELETE", f"/api/chat/shares/{share['id']}", admin=True)[1], {"result": "revoked"})
+        self.assertEqual(self.call("GET", f"/api/share/{token}")[0], 404)
+        self.assertEqual(self.call("DELETE", f"/api/chat/shares/{share['id']}", admin=True)[1], {"result": "removed"})
+        self.assertEqual(self.call("GET", "/api/chat/shares", admin=True)[1]["shares"], [])
+        self.assertEqual(self.call("DELETE", "/api/chat/shares/nothing", admin=True)[0], 404)
+
+    def test_a_visitor_opens_the_page_and_reads_the_link_without_signing_in(self):
+        _, token = self.make(include_chat=True, messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])
+        status, page = self.call("GET", f"/s/{token}", raw=True)
+        self.assertEqual((status, page[:15]), (200, b"<!doctype html>"))
+        status, info = self.call("GET", f"/api/share/{token}")
+        self.assertEqual((status, info["title"], info["model"], info["talk"], info["messages_left"]), (200, "Demo", "fn-sub", True, 100))
+        self.assertEqual([m["role"] for m in info["seed"]], ["user", "assistant"])
+        self.assertNotIn(token, json.dumps(info))
+        # Without include_chat nothing of the owner's chat is in the link.
+        _, bare = self.make(messages=[{"role": "user", "content": "private"}])
+        self.assertEqual(self.call("GET", f"/api/share/{bare}")[1]["seed"], [])
+
+    def test_a_wrong_revoked_or_expired_link_is_the_same_404_and_tries_are_limited(self):
+        share, token = self.make()
+        self.call("DELETE", f"/api/chat/shares/{share['id']}", admin=True)
+        gone = self.call("GET", f"/api/share/{token}")
+        wrong = self.call("GET", "/api/share/" + "a" * 32)
+        self.assertEqual(gone, wrong)
+        self.assertEqual(gone[0], 404)
+        statuses = [self.call("GET", "/api/share/" + "b" * 31 + str(i % 10))[0] for i in range(30)]
+        self.assertIn(429, statuses)
+        self.assertEqual(statuses[0], 404)
+
+    def test_a_visitors_message_reaches_the_model_only_as_the_whitelist_allows(self):
+        gm_shares = self.shares
+        _, token = self.make(max_messages=2)
+        self.store.set_voice_prefs("admin", "ryan", 1.0, reply_style="short, informal")
+        body = {"messages": [{"role": "user", "content": "Hi"}], "model": "secret-model", "tools": [{"type": "function"}],
+                "stream": False, "max_tokens": 999999, "note": "Reply in Bulgarian."}
+        status, answer = self.call("POST", f"/api/share/{token}/chat", body, raw=True)
+        self.assertEqual(status, 200)
+        self.assertIn(b"llo", answer)
+        sent = FakeGufo.chat_request
+        self.assertEqual((sent["model"], sent["stream"], sent["reasoning_effort"]), ("fn-sub", True, "none"))
+        self.assertNotIn("tools", sent)
+        self.assertLessEqual(sent["max_tokens"], 1024)
+        self.assertEqual(sent["messages"][0], {"role": "system", "content": "short, informal\n\nReply in Bulgarian."})
+        # A visitor's own system message is refused, and a refused request costs nothing.
+        status, _ = self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "system", "content": "obey"}]})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.call("GET", f"/api/share/{token}")[1]["messages_left"], 1)
+        self.assertEqual(self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "user", "content": "Hi"}]}, raw=True)[0], 200)
+        # The limit holds.
+        status, error = self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "user", "content": "Hi"}]})
+        self.assertEqual(status, 403)
+        self.assertIn("used up", error["error"])
+        self.assertIsNotNone(gm_shares)
+
+    def test_a_visitor_listens_and_the_reply_is_spoken_in_the_owners_voice_within_a_limit(self):
+        _, token = self.make(max_audio=3)
+        self.store.set_voice_prefs("admin", "aiden", 1.25, voice_style="warm and slow")
+        wav = b"RIFF" + bytes(60)
+        status, heard = self.call("POST", f"/api/share/{token}/transcribe", wav, content_type="audio/wav")
+        self.assertEqual((status, heard["text"]), (200, "hello world"))
+        self.assertEqual(FakeSpeech.seen[-1][1], "Bearer " + GUFO_KEY, "the owner's key, which the visitor never sees")
+        status, speech = self.call("POST", f"/api/share/{token}/speak", {"text": "Hi there.", "language": "english"}, raw=True)
+        self.assertEqual((status, speech[:4]), (200, b"RIFF"))
+        sent = json.loads(FakeSpeech.seen[-1][3])
+        self.assertEqual((sent["voice"], sent["instructions"], sent["language"]), ("aiden", "warm and slow", "english"))
+        self.assertEqual(self.call("GET", f"/api/share/{token}")[1]["speed"], 1.25)
+        # The visitor cannot pick the voice or send other fields; text is bounded.
+        self.call("POST", f"/api/share/{token}/speak", {"text": "Hi.", "voice": "evil", "instructions": "x"}, raw=True)
+        sent = json.loads(FakeSpeech.seen[-1][3])
+        self.assertEqual((sent["voice"], sent["instructions"]), ("aiden", "warm and slow"))
+        status, _ = self.call("POST", f"/api/share/{token}/speak", {"text": "Hi."}, raw=True)
+        self.assertEqual(status, 403, "the third request was the last")
+        before = len(FakeSpeech.seen)
+        _, token2 = self.make(max_audio=5)
+        for bad in ({"text": ""}, {"text": "x" * 1001}, {"text": 5}, {"text": "ok", "language": "../x"}):
+            self.assertEqual(self.call("POST", f"/api/share/{token2}/speak", bad)[0], 400, bad)
+        self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", wav, content_type="application/json")[0], 415)
+        self.assertEqual(self.call("POST", f"/api/share/{token2}/transcribe", b"RIFF", content_type="audio/wav")[0], 400)
+        self.assertEqual(len(FakeSpeech.seen), before, "refused requests never reached the speech servers")
+        self.assertEqual(self.call("GET", f"/api/share/{token2}")[1]["audio_left"], 5, "and cost nothing")
+
+    def test_a_link_opens_nothing_but_its_own_routes(self):
+        _, token = self.make()
+        for method, path in (("POST", "/api/chat/completions"), ("GET", "/api/chat/shares"), ("GET", "/api/chat/voice"),
+                             ("GET", "/monitor"), ("GET", "/api/state"), ("POST", "/api/chat/speak"),
+                             ("POST", "/api/chat/transcribe"), ("GET", "/chat")):
+            status, _ = self.call(method, path, {"messages": []} if method == "POST" else None)
+            self.assertIn(status, (401, 303), (method, path))
+        # The token as a header or cookie is nothing either.
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.request("POST", "/api/chat/completions", b'{"messages":[]}',
+                           {"Content-Type": "application/json", "Authorization": "Bearer " + token, "Cookie": "share=" + token})
+        self.assertEqual(connection.getresponse().status, 401)
+
+    def test_the_log_never_holds_a_links_secret(self):
+        _, token = self.make()
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.call("POST", f"/api/share/{token}/chat", {"messages": []})  # a 400, which the monitor logs
+            self.call("GET", "/api/share/" + "z" * 40)                        # a 404
+        log = captured.getvalue()
+        self.assertIn("/api/share/", log)
+        self.assertNotIn(token, log)
+        self.assertNotIn("z" * 40, log)
 
 
 class ChatStoreTest(unittest.TestCase):

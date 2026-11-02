@@ -1,0 +1,5 @@
+/* The page a shared link opens: the chat's look without the site header, projects or tools. */
+main.chat.share { height: 100dvh; min-height: 0; padding: var(--space-3); box-sizing: border-box; }
+.share .toolbar { display: flex; align-items: baseline; gap: var(--space-3); }
+.share .muted { color: var(--muted); font-size: var(--text-sm); }
+.share .closed { padding: var(--space-5); text-align: center; color: var(--muted); }

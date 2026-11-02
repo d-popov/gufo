@@ -78,6 +78,23 @@ another TTS server holds a model for it: `--tts-route bulgarian=http://127.0.0.1
 language there, using its own voice if the chosen one is not among its voices. The page needs a secure context for the
 microphone (`localhost` or https).
 
+**Shared chats.** *Share* on the chat page (the admin's) makes a public link, `GUFO_PUBLIC_URL/s/TOKEN`, that lets a friend chat
+with this server's model, press Talk to speak to it and hear it answer, with no account and no sign-in. You choose an expiry
+(1, 7 or 30 days, or never), a number of messages (default 100) and of speech requests (default 400), and whether the visitor
+starts from a copy of the open chat (text only, off by default). `/shares` (profile menu, *Shared chats*) lists every link
+with its use and state, copies it, **revokes** it (the link stops working at once) and removes revoked or expired ones.
+
+What a link allows is only that: the visitor gets a fresh conversation kept in their own browser, the model, your saved
+voice, and the limits. They get no key, none of your chats, projects, memory, tools or library, and nothing of the monitor:
+every other route still answers 401 to them. The monitor builds each request to the model itself from a whitelist (the
+visitor's plain text only; no system messages, tools, images, model choice or long answers; thinking off, answers capped at
+1024 tokens), speaks with your voice and voice instructions, and caps reply length, message count, and size. A link is
+rate-limited (6 chats and 24 speech requests a minute), at most 2 replies are written for all links at once, and an address
+that tries many wrong links is slowed down. Wrong, revoked and expired links answer the same 404, and the log shows only the
+first four characters of a token. The costs are yours: guests use your inference key and the GPU, and nothing is billed to
+the credits portal. Treat a link like a password: whoever has it can use it until it ends. `--shares-file` holds them
+(mode 0600); without `GUFO_PUBLIC_URL` the links point at this machine's own address.
+
 **Style.** Two optional texts on the Voice settings page, kept per account: a *reply style* ("short, spoken, informal; no
 lists"), added to the model's system message in every chat, and *voice instructions* ("relaxed, warm, a little
 playful"), sent as `instructions` with every spoken reply. The first works with any model. The second depends on the

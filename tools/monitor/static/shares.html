@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>AI Inference – Shared chats</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/header.css">
+  <link rel="stylesheet" href="/static/shares.css">
+  <script src="/static/icons.js" defer></script>
+  <script src="/static/header.js" defer></script>
+  <script src="/static/shares.js" defer></script>
+</head>
+<body>
+  <header id="site-header" class="site-header"></header>
+  <main class="shares">
+    <h1>Shared chats</h1>
+    <p>Anyone with a link can chat, talk and listen with this server's models without signing in, until the link expires,
+      runs out of messages, or you revoke it here. Make a link with <strong>Share</strong> on the chat page.</p>
+    <p id="note" class="muted" role="status"></p>
+    <table id="table" class="shares-table" hidden>
+      <thead><tr><th>Chat</th><th>Created</th><th>Expires</th><th>Messages</th><th>Speech</th><th>Last used</th><th>State</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p id="empty" class="muted" hidden>No shared links yet.</p>
+  </main>
+</body>
+</html>

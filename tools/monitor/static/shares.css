@@ -1,0 +1,13 @@
+main.shares { max-width: 1000px; margin: 0 auto; padding: var(--space-4); }
+.shares .muted { color: var(--muted); }
+.shares-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.shares-table th, .shares-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+.shares-table th { color: var(--muted); font-weight: 600; }
+.shares-table tr.inactive td { color: var(--muted); }
+.shares-table .state { font-weight: 600; }
+.shares-table .state.active { color: var(--good, #1a7f37); }
+.shares-table .state.revoked, .shares-table .state.expired { color: var(--muted); }
+.shares-table .actions { display: flex; gap: var(--space-2); justify-content: flex-end; white-space: nowrap; }
+.shares-table button { padding: 4px 10px; }
+.shares-table button.danger { border-color: var(--bad); color: var(--bad); }
+@media (max-width: 720px) { .shares-table thead { display: none; } .shares-table td { display: block; border: 0; padding: 2px 10px; } .shares-table tr { display: block; border-bottom: 1px solid var(--line); padding: 8px 0; } }

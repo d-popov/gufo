@@ -51,6 +51,7 @@ let allowedTools = loadAllowedTools();  // what the user ticked in the Tools men
 let pythonInstalled = false;            // set by loadModels: is the Python runtime on the monitor?
 let talk = null;                      // the spoken conversation (talk.js), once the Talk button is first used
 let talkAvailable = false;            // set by loadModels: has the monitor speech servers, and is this the admin?
+let sharing = false;                  // set by loadModels: the share button has been wired (the admin, with shared links on)
 let libraryAvailable = false;           // set by loadModels: does this account have a library (the admin, on a monitor that keeps one)?
 
 // ---------------------------------------------------------------- history (this browser, kept in step with the monitor)
@@ -1651,6 +1652,7 @@ async function loadModels() {
     if (talkAvailable !== couldSpeak && active()) renderMessages();
     $('talk').hidden = !talkAvailable;
     if (talkAvailable) loadVoicePrefs();
+    if (data.share === true && window.GufoShare && !sharing) { sharing = true; window.GufoShare.init({ chat: active }); }
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');

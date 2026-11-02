@@ -87,6 +87,7 @@ window.GufoHeader = (() => {
       menuItem('menu-signup', 'user-plus', 'Sign up'),
       menuItem('menu-admin-signin', 'shield-check', 'Admin sign-in'),
       menuItem('menu-voice', 'volume-2', 'Voice settings'),
+      menuItem('menu-shares', 'link', 'Shared chats'),
       menuItem('menu-admin-accounts', 'users', 'Admin: accounts'),
       menuItem('menu-admin-keys', 'key-round', 'Admin: API keys'),
       menuItem('menu-admin-pricing', 'tag', 'Admin: pricing'),
@@ -127,6 +128,7 @@ window.GufoHeader = (() => {
       $(id).hidden = !session.admin || !portalEnabled;  // need the credits portal
     }
     $('menu-voice').hidden = !session.admin;  // talk mode is the admin's for now
+    $('menu-shares').hidden = !session.admin;
     $('menu-admin-signout').hidden = !session.admin;
     $('site-link-monitor').hidden = !session.admin;
     $('site-link-chat').hidden = !(session.admin ||
@@ -241,6 +243,7 @@ window.GufoHeader = (() => {
       });
     }
     $('menu-voice').addEventListener('click', () => { window.location.href = '/voice'; });
+    $('menu-shares').addEventListener('click', () => { window.location.href = '/shares'; });
     $('menu-admin-signout').addEventListener('click', adminSignOut);
   }
 
