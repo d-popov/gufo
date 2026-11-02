@@ -40,6 +40,7 @@
     init(options) {
       host = options;
       $('share-chat').hidden = false;
+      $('share-chat').replaceChildren(window.GufoIcons.svg('link'), 'Share');
       $('share-chat').addEventListener('click', () => {
         const panel = $('share-panel');
         panel.hidden = !panel.hidden;

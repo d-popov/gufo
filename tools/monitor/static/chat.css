@@ -232,3 +232,8 @@ input[type="text"]:focus-visible { outline: 2px solid var(--focus); outline-offs
 .mood-hearing .avatar-head { animation: avatar-nod 0.9s ease-in-out infinite; }
 @keyframes avatar-nod { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
 @media (prefers-reduced-motion: reduce) { .avatar-dot, .mood-hearing .avatar-head { animation: none; } }
+
+/* Buttons with an icon before their label. The hidden attribute still wins over the flex display. */
+#talk, #share-chat { display: inline-flex; align-items: center; gap: 6px; }
+#talk[hidden], #share-chat[hidden] { display: none; }
+#talk svg, #share-chat svg { width: 16px; height: 16px; flex: none; }

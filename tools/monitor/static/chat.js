@@ -1423,6 +1423,8 @@ function readAloud(message, button) {
   });
 }
 
+$('talk').replaceChildren(window.GufoIcons.svg('mic'), 'Talk');
+
 function talkController() {
   return window.GufoTalk.create({
     ask: (text) => { $('prompt').value = text; if (busy) queueSteer(); else send(); },
@@ -1441,7 +1443,7 @@ function talkController() {
       talkState = state;
       refreshAvatarMood();
       const button = $('talk');
-      button.textContent = TALK_LABEL[state] ?? 'Talk';
+      button.replaceChildren(window.GufoIcons.svg(state === 'speaking' ? 'volume-2' : 'mic'), TALK_LABEL[state] ?? 'Talk');
       button.setAttribute('aria-pressed', String(state !== 'off'));
       button.classList.toggle('talking', state !== 'off');
       button.classList.toggle('secondary', state === 'off');

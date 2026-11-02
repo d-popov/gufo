@@ -230,6 +230,8 @@ const TALK_LABEL = {
   transcribing: 'Understanding…', thinking: 'Thinking… (tap to interrupt)', speaking: 'Speaking… (tap to interrupt)', error: 'Talk',
 };
 
+$('talk').replaceChildren(window.GufoIcons.svg('mic'), 'Talk');
+
 function talkController() {
   return window.GufoTalk.create({
     ask: (text) => { const spoken = heard && heard.text === text ? heard.language : null; heard = null; send(text, spoken); },
@@ -248,7 +250,7 @@ function talkController() {
       talkState = state;
       refreshMood();
       const button = $('talk');
-      button.textContent = TALK_LABEL[state] ?? 'Talk';
+      button.replaceChildren(window.GufoIcons.svg(state === 'speaking' ? 'volume-2' : 'mic'), TALK_LABEL[state] ?? 'Talk');
       button.setAttribute('aria-pressed', String(state !== 'off'));
       button.classList.toggle('talking', state !== 'off');
       button.classList.toggle('secondary', state === 'off');
