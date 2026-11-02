@@ -118,19 +118,19 @@ class LogTest(unittest.TestCase):
         for share in (asked, private):
             self.store.record(share["token"], "user", "hello")
             self.store.record(share["token"], "assistant", "hi there")
-        self.assertEqual([(m["role"], m["content"]) for m in self.store.messages("admin", asked["id"])],
-                         [("user", "hello"), ("assistant", "hi there")])
-        self.assertEqual(self.store.messages("admin", private["id"]), [])
+        group = self.store.conversations("admin", asked["id"])
+        self.assertEqual([(m["role"], m["content"]) for m in group[0]["messages"]], [("user", "hello"), ("assistant", "hi there")])
+        self.assertEqual(self.store.conversations("admin", private["id"]), [])
         self.assertTrue(self.store.find(asked["token"])["logged"])
         self.assertFalse(self.store.find(private["token"])["logged"])
 
     def test_only_the_owner_reads_it_and_removing_the_link_removes_it(self):
         share = self.store.create("admin", "Read me", log=True)
         self.store.record(share["token"], "user", "secret words")
-        self.assertIsNone(self.store.messages("someone", share["id"]))
-        self.assertIsNone(self.store.messages("admin", "0" * 12))
+        self.assertIsNone(self.store.conversations("someone", share["id"]))
+        self.assertIsNone(self.store.conversations("admin", "0" * 12))
         self.assertEqual(self.store.remove("admin", share["id"]), "revoked")
-        self.assertEqual(len(self.store.messages("admin", share["id"])), 1, "revoking keeps what was said")
+        self.assertEqual(len(self.store.conversations("admin", share["id"])[0]["messages"]), 1, "revoking keeps what was said")
         self.assertEqual(self.store.remove("admin", share["id"]), "removed")
         with self.store.lock:
             left = self.store.conn.execute("SELECT COUNT(*) FROM share_log").fetchone()[0]
@@ -142,10 +142,35 @@ class LogTest(unittest.TestCase):
         for role, content in (("system", "x"), ("tool", "x"), ("user", "   "), ("user", None), ("user", 5)):
             self.store.record(token, role, content)
         self.store.record(token, "user", "y" * 50_000)
-        self.assertEqual(len(self.store.messages("admin", share["id"])[0]["content"]), shares.GUEST_MESSAGE_CHARS)
+        self.assertEqual(len(self.store.conversations("admin", share["id"])[0]["messages"][0]["content"]), shares.GUEST_MESSAGE_CHARS)
         for i in range(shares.LOG_ROWS + 10):
             self.store.record(token, "user", f"m{i}")
-        self.assertEqual(len(self.store.messages("admin", share["id"])), shares.LOG_ROWS)
+        self.assertEqual(sum(len(g["messages"]) for g in self.store.conversations("admin", share["id"])), shares.LOG_ROWS)
+
+    def test_visitors_sharing_a_link_are_kept_apart_even_when_their_messages_interleave(self):
+        share = self.store.create("admin", "Read me", log=True)
+        token = share["token"]
+        a, b = "conversationAAAA", "conversationBBBB"
+        # The order on the wire: A asks, B asks, B is answered, A is answered.
+        self.store.record(token, "user", "A: hello", a, "t1")
+        self.store.record(token, "user", "B: bonjour", b, "t2")
+        self.store.record(token, "assistant", "to B: salut", b, "t2")
+        self.store.record(token, "assistant", "to A: hi", a, "t1")
+        self.store.record(token, "user", "A: again", a, "t3")
+        groups = self.store.conversations("admin", share["id"])
+        self.assertEqual([g["id"] for g in groups], [a, b])
+        self.assertEqual([(m["role"], m["content"], m["turn"]) for m in groups[0]["messages"]],
+                         [("user", "A: hello", "t1"), ("assistant", "to A: hi", "t1"), ("user", "A: again", "t3")])
+        self.assertEqual([(m["role"], m["content"]) for m in groups[1]["messages"]], [("user", "B: bonjour"), ("assistant", "to B: salut")])
+
+    def test_a_visitor_without_a_well_formed_conversation_id_is_one_group_and_cannot_name_another_visitors(self):
+        share = self.store.create("admin", "Read me", log=True)
+        token = share["token"]
+        for conversation in ("", None, "short", "has spaces in it!", "x" * 100, 5):
+            self.store.record(token, "user", "hi", conversation, "t")
+        self.store.record(token, "user", "real", "conversationCCCC", "t")
+        groups = self.store.conversations("admin", share["id"])
+        self.assertEqual({g["id"]: len(g["messages"]) for g in groups}, {"": 6, "conversationCCCC": 1})
 
     def test_a_store_made_before_logging_gains_it_off(self):
         import sqlite3

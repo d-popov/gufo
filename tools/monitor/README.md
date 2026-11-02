@@ -87,7 +87,7 @@ with its use and state, copies it, **revokes** it (the link stops working at onc
 A visitor's conversation is kept only in their own browser, unless the link was made with **Keep their messages so I can read
 them** (on by default in the dialog): then the monitor also keeps the text of what they said and what the model answered
 (not audio; up to 2000 messages per link, removed with the link), the visitor's page says "The owner of this link can read this
-conversation", and **Read** on `/shares` shows it. A link made without it keeps nothing.
+conversation", and **Read** on `/shares` shows it, one block per visitor (each browser tab names its conversation, so two people on one link are not mixed). A link made without it keeps nothing.
 
 What a link allows is only that: the visitor gets a fresh conversation kept in their own browser, the model, your saved
 voice, and the limits. They get no key, none of your chats, projects, memory, tools or library, and nothing of the monitor:

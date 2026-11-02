@@ -72,21 +72,31 @@ function row(share) {
   return tr;
 }
 
-// What the visitors of a link said and were answered, for links made with "keep their messages".
+// What the visitors of a link said and were answered, for links made with "keep their messages", one block per
+// visitor conversation.
 async function readConversation(share) {
   try {
-    const { messages } = await api('GET', `/api/chat/shares/${share.id}/messages`);
-    $('transcript-title').textContent = `${share.title}: ${messages.length} message${messages.length === 1 ? '' : 's'}`;
-    $('transcript-body').replaceChildren(...messages.map((message) => {
-      const turn = document.createElement('p');
-      turn.className = `turn ${message.role}`;
-      const who = document.createElement('span');
-      who.className = 'who';
-      who.textContent = `${message.role === 'user' ? 'Visitor' : 'Model'} · ${when(message.at)}`;
-      turn.append(who, document.createTextNode(message.content));
-      return turn;
-    }));
-    if (!messages.length) $('transcript-body').textContent = 'Nothing has been said on this link yet.';
+    const { conversations } = await api('GET', `/api/chat/shares/${share.id}/messages`);
+    const total = conversations.reduce((sum, group) => sum + group.messages.length, 0);
+    $('transcript-title').textContent = `${share.title}: ${total} message${total === 1 ? '' : 's'} in ${conversations.length} conversation${conversations.length === 1 ? '' : 's'}`;
+    const blocks = conversations.map((group, index) => {
+      const block = document.createElement('div');
+      block.className = 'conversation-block';
+      const heading = document.createElement('h3');
+      heading.textContent = `Visitor ${index + 1} · started ${when(group.started)}`;
+      block.append(heading, ...group.messages.map((message) => {
+        const turn = document.createElement('p');
+        turn.className = `turn ${message.role}`;
+        const who = document.createElement('span');
+        who.className = 'who';
+        who.textContent = `${message.role === 'user' ? 'Visitor' : 'Model'} · ${when(message.at)}`;
+        turn.append(who, document.createTextNode(message.content));
+        return turn;
+      }));
+      return block;
+    });
+    $('transcript-body').replaceChildren(...blocks);
+    if (!blocks.length) $('transcript-body').textContent = 'Nothing has been said on this link yet.';
     $('transcript').hidden = false;
     $('transcript').scrollIntoView({ behavior: 'smooth' });
   } catch (error) { $('note').textContent = error.message; }

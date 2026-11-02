@@ -210,6 +210,18 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
             except OSError:
                 state["hung_up"] = True
             return
+        last = (request.get("messages") or [{}])[-1].get("content")
+        if request.get("stream") is True and isinstance(last, str) and last.startswith("echo:"):
+            # Answers with the visitor's own words, slowly, so concurrent conversations can be told apart.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for word in last.split(" "):
+                self.wfile.write(("data: " + json.dumps({"choices": [{"delta": {"content": word + " "}}]}) + "\n\n").encode())
+                self.wfile.flush()
+                time.sleep(0.02)
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
         if request.get("stream") is True:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1204,7 +1216,7 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertFalse(self.call("GET", f"/api/share/{quiet}")[1]["logged"])
         status, body = self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)
         self.assertEqual(status, 200)
-        self.assertEqual([(m["role"], m["content"]) for m in body["messages"]],
+        self.assertEqual([(m["role"], m["content"]) for m in body["conversations"][0]["messages"]],
                          [("user", "What is two plus two?"), ("assistant", "hello")])  # FakeGufo answers "he" + "llo"
         listed = self.call("GET", "/api/chat/shares", admin=True)[1]["shares"]
         self.assertEqual(sorted(s["logged"] for s in listed), [False, True])
@@ -1214,7 +1226,43 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual(self.call("POST", "/api/chat/shares", {"title": "x", "log": "yes"}, admin=True)[0], 400)
         # A refused message is not kept.
         self.call("POST", f"/api/share/{token}/chat", {"messages": [{"role": "system", "content": "obey"}]})
-        self.assertEqual(len(self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)[1]["messages"]), 2)
+        self.assertEqual(len(self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)[1]["conversations"][0]["messages"]), 2)
+
+    def test_two_visitors_on_one_link_at_the_same_time_are_read_as_two_conversations(self):
+        share, token = self.make(log=True, max_messages=50)
+        self.server.guest_chat = gm.RateLimiter(1000, 60.0)  # this test is about the log, not the rate limit
+        self.server.guest_replies = threading.BoundedSemaphore(8)
+        errors = []
+
+        def visitor(name, conversation):
+            try:
+                for turn in range(3):
+                    body = {"messages": [{"role": "user", "content": f"echo: {name} says number {turn} please"}],
+                            "conversation": conversation}
+                    status, _ = self.call("POST", f"/api/share/{token}/chat", body, raw=True)
+                    if status != 200:
+                        errors.append((name, turn, status))
+            except Exception as error:  # a thread's failure must reach the test
+                errors.append((name, repr(error)))
+
+        threads = [threading.Thread(target=visitor, args=(name, conversation))
+                   for name, conversation in (("alice", "conversationALICE1"), ("bruno", "conversationBRUNO1"))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        self.assertEqual(errors, [])
+        groups = self.call("GET", f"/api/chat/shares/{share['id']}/messages", admin=True)[1]["conversations"]
+        self.assertEqual(sorted(g["id"] for g in groups), ["conversationALICE1", "conversationBRUNO1"])
+        for group in groups:
+            name = "alice" if "ALICE" in group["id"] else "bruno"
+            roles = [m["role"] for m in group["messages"]]
+            self.assertEqual(roles, ["user", "assistant"] * 3, group["id"])
+            for number, (ask, answer) in enumerate(zip(group["messages"][0::2], group["messages"][1::2])):
+                self.assertEqual(ask["content"], f"echo: {name} says number {number} please")
+                self.assertEqual(answer["content"].strip(), ask["content"], "each answer follows its own question")
+                self.assertEqual(ask["turn"], answer["turn"])
+            self.assertNotIn("alice" if name == "bruno" else "bruno", " ".join(m["content"] for m in group["messages"]))
 
     def test_speech_is_bounded_across_links_and_the_place_is_given_back_after_any_outcome(self):
         _, one = self.make(max_audio=10)

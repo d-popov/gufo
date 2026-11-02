@@ -19,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 
+CONVERSATION = re.compile(r"[A-Za-z0-9_-]{8,40}")   # a visitor's browser names its conversation; the owner's list groups by it
 TOKEN = re.compile(r"[A-Za-z0-9_-]{32,64}")      # the secret in a link: secrets.token_urlsafe(24) is 32 of these
 SHARE_ID = re.compile(r"[0-9a-f]{12}")            # the owner's handle for a link, never the secret
 
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS shares (
   max_audio INTEGER NOT NULL, audio INTEGER NOT NULL DEFAULT 0, seed TEXT NOT NULL DEFAULT '',
   revoked INTEGER NOT NULL DEFAULT 0, last_used INTEGER NOT NULL DEFAULT 0, log INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS share_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, share_id TEXT NOT NULL, at INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+  id INTEGER PRIMARY KEY AUTOINCREMENT, share_id TEXT NOT NULL, at INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+  conversation TEXT NOT NULL DEFAULT '', turn TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS share_log_share ON share_log (share_id, id);
 """
 LOG_ROWS = 2000   # messages kept per link when its owner chose to read them; later ones are not kept
@@ -129,6 +131,10 @@ class ShareStore:
             self.conn.executescript(SCHEMA)
             if "log" not in {row[1] for row in self.conn.execute("PRAGMA table_info(shares)")}:  # a file from before logging
                 self.conn.execute("ALTER TABLE shares ADD COLUMN log INTEGER NOT NULL DEFAULT 0")
+            log_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(share_log)")}
+            for name in ("conversation", "turn"):
+                if name not in log_columns:
+                    self.conn.execute(f"ALTER TABLE share_log ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
     def close(self) -> None:
         with self.lock:
@@ -236,24 +242,35 @@ class ShareStore:
         with self.lock:
             self.conn.execute("UPDATE shares SET messages = MAX(messages - 1, 0) WHERE token = ?", (token,))
 
-    def record(self, token: str, role: str, content: str) -> None:
-        """Keep one message of a visitor's conversation, if the link's owner chose to read them, up to LOG_ROWS."""
+    def record(self, token: str, role: str, content: str, conversation: str = "", turn: str = "") -> None:
+        """Keep one message of a visitor's conversation, if the link's owner chose to read them, up to LOG_ROWS.
+        `conversation` is the id the visitor's browser gave its conversation (several visitors may use one link at the
+        same time) and `turn` ties a question to its answer; a conversation id that is not well formed counts as none."""
         if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
             return
+        if not (isinstance(conversation, str) and CONVERSATION.fullmatch(conversation)):
+            conversation = ""
         with self.lock:
             self.conn.execute(
-                "INSERT INTO share_log (share_id, at, role, content) SELECT id, ?, ?, ? FROM shares WHERE token = ? "
-                "AND log = 1 AND (SELECT COUNT(*) FROM share_log WHERE share_id = shares.id) < ?",
-                (self._now(), role, content[:GUEST_MESSAGE_CHARS], token, LOG_ROWS))
+                "INSERT INTO share_log (share_id, at, role, content, conversation, turn) SELECT id, ?, ?, ?, ?, ? "
+                "FROM shares WHERE token = ? AND log = 1 "
+                "AND (SELECT COUNT(*) FROM share_log WHERE share_id = shares.id) < ?",
+                (self._now(), role, content[:GUEST_MESSAGE_CHARS], conversation, str(turn)[:16], token, LOG_ROWS))
 
-    def messages(self, owner: str, share_id: str) -> list | None:
-        """What a link's visitors said and were answered, oldest first; None if the link is not this owner's."""
+    def conversations(self, owner: str, share_id: str) -> list | None:
+        """What a link's visitors said and were answered, grouped by conversation (oldest first, each in order);
+        None if the link is not this owner's. Messages of a visitor that sent no conversation id are one group."""
         if self.get(owner, share_id) is None:
             return None
         with self.lock:
-            rows = self.conn.execute("SELECT at, role, content FROM share_log WHERE share_id = ? ORDER BY id",
-                                     (share_id,)).fetchall()
-        return [{"at": at, "role": role, "content": content} for at, role, content in rows]
+            rows = self.conn.execute(
+                "SELECT at, role, content, conversation, turn FROM share_log WHERE share_id = ? ORDER BY id",
+                (share_id,)).fetchall()
+        groups: dict = {}
+        for at, role, content, conversation, turn in rows:
+            group = groups.setdefault(conversation, {"id": conversation, "started": at, "messages": []})
+            group["messages"].append({"at": at, "role": role, "content": content, "turn": turn})
+        return sorted(groups.values(), key=lambda group: group["started"])
 
     def view(self, share: dict, model: str | None, talk: bool, voice: dict) -> dict:
         """What a visitor's page is told: nothing about the owner or the secret."""

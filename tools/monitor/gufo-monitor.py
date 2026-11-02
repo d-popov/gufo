@@ -2819,10 +2819,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, json.dumps(show(share)).encode())
             if method == "GET":  # /api/chat/shares/ID/messages
                 share_id = path.split("/")[-2]
-                messages = shares.messages("admin", share_id) if module.SHARE_ID.fullmatch(share_id) else None
-                if messages is None:
+                found = shares.conversations("admin", share_id) if module.SHARE_ID.fullmatch(share_id) else None
+                if found is None:
                     return self._error(404, "not_found")
-                return self._json(200, json.dumps({"messages": messages}, ensure_ascii=False).encode())
+                return self._json(200, json.dumps({"conversations": found}, ensure_ascii=False).encode())
             share_id = path.rsplit("/", 1)[1]
             if not module.SHARE_ID.fullmatch(share_id):
                 return self._error(404, "not_found")
@@ -2881,7 +2881,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = module.clean_request(body, model, owner_prefs.get("reply_style"), body.get("note") if body else None)
         if not shares.take_message(share["token"]):
             raise module.ShareError(403, "this link has used up its messages")
-        shares.record(share["token"], "user", payload["messages"][-1]["content"])
+        conversation = body.get("conversation") if body else None
+        turn = secrets.token_hex(4)
+        shares.record(share["token"], "user", payload["messages"][-1]["content"], conversation, turn)
         if not self.server.guest_replies.acquire(blocking=False):
             shares.refund_message(share["token"])
             raise module.ShareError(503, "busy: several replies are being written; try again in a moment")
@@ -2916,7 +2918,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 upstream.close()
             self.server.guest_replies.release()
             if share["logged"]:
-                shares.record(share["token"], "assistant", reply_text(answer))
+                shares.record(share["token"], "assistant", reply_text(answer), conversation, turn)
 
     def _share_audio(self, shares, module, share: dict, kind: str, owner_prefs: dict):
         """A visitor's utterance to text, or a reply's text to speech in the owner's voice. At most

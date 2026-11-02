@@ -7,6 +7,16 @@ const $ = (id) => document.getElementById(id);
 const TOKEN = location.pathname.split('/')[2] ?? '';
 const API = `/api/share/${encodeURIComponent(TOKEN)}`;
 const Lang = window.GufoLanguage;
+// This page's conversation has a name of its own, so the owner (if they chose to read what is said) sees one visitor's
+// conversation apart from another's on the same link. It lasts as long as the tab.
+const CONVERSATION = (() => {
+  const key = `gufo-share-conversation-${TOKEN.slice(0, 8)}`;
+  try {
+    let id = sessionStorage.getItem(key);
+    if (!id) { id = crypto.randomUUID().replace(/-/g, '').slice(0, 24); sessionStorage.setItem(key, id); }
+    return id;
+  } catch { return crypto.randomUUID().replace(/-/g, '').slice(0, 24); }
+})();
 
 let info = null;
 let messages = [];          // { role, content, language? }
@@ -88,7 +98,7 @@ async function streamReply(reply) {
   const note = [Lang.note(language), talk?.active ? talk.instruction : null].filter(Boolean).join(' ');
   const response = await fetch(`${API}/chat`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-    body: JSON.stringify({ messages: messages.filter((m) => !m.error && !m.pending).map(({ role, content }) => ({ role, content })), note }),
+    body: JSON.stringify({ messages: messages.filter((m) => !m.error && !m.pending).map(({ role, content }) => ({ role, content })), note, conversation: CONVERSATION }),
   });
   if (!response.ok) throw new Error(await failure(response));
   const decoder = new TextDecoder();
