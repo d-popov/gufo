@@ -9,6 +9,7 @@ import http.server
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import sqlite3
@@ -1180,6 +1181,26 @@ class ShareRoutesTest(unittest.TestCase):
         self.assertEqual(self.call("POST", f"/api/share/{spent}/speak", {"text": "Hi."}, raw=True)[0], 200)
         self.assertEqual(self.call("POST", f"/api/share/{spent}/speak", {"text": "Hi."})[0], 403)
         self.assertEqual(self.call("POST", f"/api/share/{two}/transcribe", wav, content_type="audio/wav")[0], 200)
+
+    def test_pages_name_their_assets_by_version_so_a_cached_old_file_is_never_reused(self):
+        _, token = self.make()
+        status, page = self.call("GET", f"/s/{token}", raw=True)
+        self.assertEqual(status, 200)
+        references = re.findall(rb'(?:src|href)="(/static/[^"]+)"', page)
+        self.assertGreater(len(references), 5)
+        for reference in references:
+            self.assertRegex(reference, rb"^/static/[\w.-]+\?v=\d+$")
+            status, body = self.call("GET", reference.decode(), raw=True)
+            self.assertEqual(status, 200, reference)
+            self.assertGreater(len(body), 20, reference)
+        # A file that changes gets a new name: the version is its modification time.
+        first = re.search(rb"/static/share\.js\?v=(\d+)", page).group(1)
+        path = gm.STATIC_DIR / "share.js"
+        stamp = path.stat().st_mtime
+        self.addCleanup(lambda: os.utime(path, (stamp, stamp)))
+        os.utime(path, (stamp + 100, stamp + 100))
+        again = re.search(rb"/static/share\.js\?v=(\d+)", self.call("GET", f"/s/{token}", raw=True)[1]).group(1)
+        self.assertEqual(int(again), int(first) + 100)
 
     def test_a_link_opens_nothing_but_its_own_routes(self):
         _, token = self.make()

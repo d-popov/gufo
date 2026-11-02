@@ -2184,6 +2184,24 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.stop = threading.Event()
 
 
+STATIC_REFERENCE = re.compile(rb'((?:src|href)=")/static/([\w.-]+)(")')
+
+
+def versioned_assets(html: bytes) -> bytes:
+    """Pages name their scripts and styles as /static/NAME?v=MTIME. A proxy or browser that keeps a file for hours
+    (Cloudflare adds max-age=14400 to /static/*) then fetches the new one as soon as the file changes, because the
+    page, which is never cached, names a new URL."""
+    def add(match):
+        name = match.group(2).decode()
+        entry = STATIC_FILES.get(name)
+        try:
+            stamp = int((entry[0] / name).stat().st_mtime) if entry else 0
+        except OSError:
+            stamp = 0
+        return match.group(0) if not stamp else b"%s/static/%s?v=%d%s" % (match.group(1), match.group(2), stamp, match.group(3))
+    return STATIC_REFERENCE.sub(add, html)
+
+
 def shares_module():
     """shares.py, next to this file; loaded when first used."""
     if str(HERE) not in sys.path:
@@ -3238,6 +3256,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = path.read_bytes()
         except OSError:
             return self._json(404, b'{"error":"not_found"}')
+        if content_type.startswith("text/html"):
+            body = versioned_assets(body)
         self._send(200, body, content_type, cache=cache, security=security)
 
     def _chat_page(self):
