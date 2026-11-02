@@ -203,7 +203,8 @@
   const PRE_ROLL_MS = 400;
 
   // host: { ask(text), stopReply(), transcribe(wav: ArrayBuffer) -> text, synthesize(text) ->
-  // ArrayBuffer (a WAV file), setState(state, detail), speed?() -> playback rate }. States: off, starting, listening, hearing,
+  // ArrayBuffer (a WAV file), setState(state, detail), speed?() -> playback rate, attach?(context, node) -> connects the playing node to the speakers
+  // (the avatar listens on the way) }. States: off, starting, listening, hearing,
   // transcribing, thinking, speaking, error.
   function create(host) {
     let state = 'off';
@@ -257,7 +258,7 @@
         const node = context.createBufferSource();
         node.buffer = buffer;
         node.playbackRate.value = host.speed?.() ?? 1;
-        node.connect(context.destination);
+        if (host.attach) host.attach(context, node); else node.connect(context.destination);
         node.onended = resolve;
         player = node;
         set('speaking', sentence);
@@ -435,7 +436,7 @@
       const node = context.createBufferSource();
       node.buffer = buffer;
       node.playbackRate.value = host.speed?.() ?? 1;
-      node.connect(context.destination);
+      if (host.attach) host.attach(context, node); else node.connect(context.destination);
       node.onended = resolve;
       player = node;
       node.start();

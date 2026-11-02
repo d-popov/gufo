@@ -19,6 +19,7 @@
   <script src="/static/chatstore.js" defer></script>
   <script src="/static/chatsync.js" defer></script>
   <script src="/static/language.js" defer></script>
+  <script src="/static/avatar.js" defer></script>
   <script src="/static/talk.js" defer></script>
   <script src="/static/chat.js" defer></script>
 </head>
@@ -68,6 +69,11 @@
       <div id="messages"></div>
       <p id="empty" class="empty"><span id="empty-text"></span></p>
     </section>
+    <aside id="avatar" class="avatar-pip" aria-label="Avatar" hidden>
+      <button id="avatar-close" type="button" class="avatar-close" aria-label="Hide the avatar"
+              title="Hide the avatar (turn it back on in Voice settings)"></button>
+      <div id="avatar-face"></div>
+    </aside>
     <form id="composer">
       <div id="steer-queue" class="steer-queue" aria-live="polite" hidden></div>
       <div id="preview" class="preview" aria-live="polite"></div>

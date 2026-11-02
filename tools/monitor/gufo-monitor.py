@@ -77,6 +77,7 @@ STATIC_FILES = {
     "chatsync.js": (STATIC_DIR, _JS),
     "talk.js": (STATIC_DIR, _JS),
     "language.js": (STATIC_DIR, _JS),
+    "avatar.js": (STATIC_DIR, _JS),
     "voice.js": (STATIC_DIR, _JS),
     "voice.css": (STATIC_DIR, _CSS),
     "markdown.js": (STATIC_DIR, _JS),
@@ -566,7 +567,8 @@ CREATE INDEX IF NOT EXISTS items_rev ON items (owner, rev);
 CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('rev', 0);
 CREATE TABLE IF NOT EXISTS voice_prefs (
-  owner TEXT PRIMARY KEY, voice TEXT, speed REAL NOT NULL, updated INTEGER NOT NULL);
+  owner TEXT PRIMARY KEY, voice TEXT, speed REAL NOT NULL, updated INTEGER NOT NULL,
+  avatar INTEGER NOT NULL DEFAULT 1);
 """
 
 
@@ -594,6 +596,9 @@ class ChatStore:
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(CHAT_SCHEMA)
+            # A store made before the avatar setting has no such column.
+            if "avatar" not in {row[1] for row in self.conn.execute("PRAGMA table_info(voice_prefs)")}:
+                self.conn.execute("ALTER TABLE voice_prefs ADD COLUMN avatar INTEGER NOT NULL DEFAULT 1")
         self.purge()
 
     def close(self) -> None:
@@ -616,20 +621,34 @@ class ChatStore:
                 "deleted": bool(deleted), "data": None if deleted else json.loads(body)}
 
     def voice_prefs(self, owner: str) -> dict:
-        """How this owner's replies are spoken: {"voice": name or None for the server's default,
-        "speed": playback rate}. The same on every device."""
+        """How this owner's replies are spoken and shown: {"voice": name or None for the server's
+        default, "speed": playback rate, "avatar": whether the chat shows the avatar (on until the
+        owner closes it)}. The same on every device."""
         with self.lock:
             row = self.conn.execute(
-                "SELECT voice, speed FROM voice_prefs WHERE owner = ?", (owner,)).fetchone()
-        return {"voice": row[0], "speed": row[1]} if row else {"voice": None, "speed": 1.0}
+                "SELECT voice, speed, avatar FROM voice_prefs WHERE owner = ?", (owner,)).fetchone()
+        return ({"voice": row[0], "speed": row[1], "avatar": bool(row[2])} if row
+                else {"voice": None, "speed": 1.0, "avatar": True})
 
-    def set_voice_prefs(self, owner: str, voice: str | None, speed: float) -> dict:
+    def set_voice_prefs(self, owner: str, voice: str | None, speed: float,
+                        avatar: bool | None = None) -> dict:
+        """Keep the voice and speed; avatar None leaves that setting as it was."""
         with self.lock:
             self.conn.execute(
-                "INSERT INTO voice_prefs (owner, voice, speed, updated) VALUES (?, ?, ?, ?) "
+                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT (owner) DO UPDATE SET voice = excluded.voice, speed = excluded.speed, "
-                "updated = excluded.updated", (owner, voice, speed, int(time.time() * 1000)))
-        return {"voice": voice, "speed": speed}
+                "updated = excluded.updated, avatar = CASE WHEN ? THEN excluded.avatar ELSE avatar END",
+                (owner, voice, speed, int(time.time() * 1000), int(avatar is not False), avatar is not None,))
+        return self.voice_prefs(owner)
+
+    def set_avatar(self, owner: str, enabled: bool) -> dict:
+        """Show or hide the avatar, leaving the voice and speed as they were."""
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar) VALUES (?, NULL, 1.0, ?, ?) "
+                "ON CONFLICT (owner) DO UPDATE SET avatar = excluded.avatar, updated = excluded.updated",
+                (owner, int(time.time() * 1000), int(enabled)))
+        return self.voice_prefs(owner)
 
     def put(self, owner: str, kind: str, item_id: str, updated: int, data: dict) -> dict:
         """Store an item unless the stored one is newer: {"applied": bool, "item": stored}."""
@@ -2641,11 +2660,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         info = self.server.voice.info(self.server.chat_key)
         store = self.server.chat_store
         info["prefs"] = (store.voice_prefs(self._chat_owner()) if store is not None
-                         else {"voice": None, "speed": 1.0})
+                         else {"voice": None, "speed": 1.0, "avatar": True})
         self._json(200, json.dumps(info).encode())
 
     def _voice_prefs_put(self):
-        """PUT /api/chat/voice-prefs {voice, speed}: how the admin's replies are spoken, kept
+        """PUT /api/chat/voice-prefs {voice, speed, avatar?}: how the admin's replies are spoken, kept
         server-side so every device speaks the same. voice null is the server's default."""
         voice = self.server.voice
         store = self.server.chat_store
@@ -2663,8 +2682,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         offered = voice.info(self.server.chat_key)["voices"]
         if name is not None and offered and name not in offered:
             return self._error(400, "the speech server has no such voice")
+        avatar = body.get("avatar")
+        if avatar is not None and not isinstance(avatar, bool):
+            return self._error(400, "avatar is true or false")
         self._json(200, json.dumps(store.set_voice_prefs(
-            self._chat_owner(), name, float(speed))).encode())
+            self._chat_owner(), name, float(speed), avatar)).encode())
+
+    def _avatar_put(self):
+        """PUT /api/chat/avatar {enabled}: show or hide the chat's avatar for the admin's account;
+        its close button calls this, and the voice settings page sets it with the rest."""
+        store = self.server.chat_store
+        if self.server.voice is None or store is None:
+            return self._error(404, "talk mode or the chat store is not configured")
+        if not self._admin():
+            return self._error(401, "unauthorized")
+        body = self._read_json(1 << 10)
+        if not body or not isinstance(body.get("enabled"), bool):
+            return self._error(400, "expected {enabled: true or false}")
+        self._json(200, json.dumps(store.set_avatar(self._chat_owner(), body["enabled"])).encode())
 
     def _voice_route(self, kind: str):
         """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
@@ -2838,6 +2873,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         if urllib.parse.urlsplit(self.path).path == "/api/chat/voice-prefs":
             return self._voice_prefs_put()
+        if urllib.parse.urlsplit(self.path).path == "/api/chat/avatar":
+            return self._avatar_put()
         if urllib.parse.urlsplit(self.path).path.startswith("/api/library/"):
             return self._library("PUT")
         if urllib.parse.urlsplit(self.path).path.startswith("/api/chat/items/"):

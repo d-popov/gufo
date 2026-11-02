@@ -42,6 +42,7 @@ async function load() {
   const rates = [...$('speed').options].map((option) => Number(option.value));
   const nearest = rates.reduce((best, rate) => (Math.abs(rate - info.prefs.speed) < Math.abs(best - info.prefs.speed) ? rate : best));
   $('speed').value = String(nearest);
+  $('avatar').checked = info.prefs.avatar !== false;
   $('models').textContent = [info.asr && `Listening: ${info.asr}`, info.tts && `Speaking: ${info.tts}`]
     .filter(Boolean).join(' · ') || 'The speech servers are not answering.';
   if (!info.voices.length) say('The speech server lists no voices.', true);
@@ -77,7 +78,7 @@ $('voice-form').addEventListener('submit', async (event) => {
   try {
     const response = await fetch('/api/chat/voice-prefs', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ voice: $('voice').value || null, speed: Number($('speed').value) }),
+      body: JSON.stringify({ voice: $('voice').value || null, speed: Number($('speed').value), avatar: $('avatar').checked }),
     });
     if (!response.ok) throw new Error(await failure(response));
     say('Saved.');

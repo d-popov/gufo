@@ -1384,6 +1384,7 @@ let reading = null;  // the message being read
 function readAloud(message, button) {
   reader ??= window.GufoTalk.createReader({
     synthesize: (text) => synthesizeSpeech(text, reading?.language),
+    attach: playThroughAvatar,
     speed: () => voicePrefs.speed,
     error: (text) => { $('status').textContent = text; },
   });
@@ -1415,6 +1416,7 @@ function talkController() {
       return answer.text ?? '';
     },
     synthesize: (text) => synthesizeSpeech(text, active()?.language?.spoken),
+    attach: playThroughAvatar,
     setState: (state, detail) => {
       const button = $('talk');
       button.textContent = TALK_LABEL[state] ?? 'Talk';
@@ -1428,15 +1430,47 @@ function talkController() {
   });
 }
 
+// The avatar: a small face that mouths the spoken replies. It is there while the account has it on (Voice
+// settings; on by default) and talk mode exists, and its close button turns it off for the account.
+let avatar = null;
+function showAvatar(on) {
+  const pip = $('avatar');
+  if (!window.GufoAvatar) return;
+  pip.hidden = !on;
+  if (on && !avatar) avatar = window.GufoAvatar.create($('avatar-face'));
+  if (!on && avatar) { avatar.destroy(); avatar = null; }
+}
+$('avatar-close').append(window.GufoIcons.svg('x'));
+$('avatar-close').addEventListener('click', async () => {
+  showAvatar(false);
+  voicePrefs.avatar = false;
+  try {
+    const response = await fetch('/api/chat/avatar', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }),
+    });
+    if (!response.ok) throw new Error(`${response.status}`);
+  } catch (error) {
+    voicePrefs.avatar = true;
+    showAvatar(true);
+    $('status').textContent = `The avatar setting was not saved (${error.message}).`;
+  }
+});
+// Spoken audio goes through the avatar, which listens on the way to the speakers.
+const playThroughAvatar = (context, node) => {
+  if (avatar) avatar.attach(context, node); else node.connect(context.destination);
+};
+
 // How replies are spoken: the voice and speed from the account's voice settings (/voice), read
 // when the chat learns that talk mode exists.
-let voicePrefs = { voice: null, speed: 1 };
+let voicePrefs = { voice: null, speed: 1, avatar: true };
 async function loadVoicePrefs() {
   try {
     const response = await fetch('/api/chat/voice');
     if (!response.ok) return;
     const info = await response.json();
-    voicePrefs = { voice: info.prefs?.voice ?? info.voice ?? null, speed: Number(info.prefs?.speed) || 1 };
+    voicePrefs = { voice: info.prefs?.voice ?? info.voice ?? null, speed: Number(info.prefs?.speed) || 1,
+      avatar: info.prefs?.avatar !== false };
+    showAvatar(voicePrefs.avatar);
   } catch { /* the defaults speak */ }
 }
 
