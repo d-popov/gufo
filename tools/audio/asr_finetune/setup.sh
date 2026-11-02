@@ -15,8 +15,15 @@ if [ ! -d "$DIR/Qwen3-ASR" ]; then
 fi
 git -C "$DIR/Qwen3-ASR" checkout -q "$PIN"
 "$PY" -m pip install -q --target "$DIR/deps" --no-deps "$DIR/Qwen3-ASR" transformers==4.57.6 accelerate==1.12.0 \
-  "tokenizers>=0.22.0,<=0.23.0" "huggingface_hub>=0.34.0,<1.0" datasets librosa nagisa==0.2.11 soynlp==0.0.493 \
-  qwen-omni-utils sox pytz
+  "tokenizers>=0.22.0,<=0.23.0" "huggingface_hub>=0.34.0,<1.0" "datasets>=3.0,<4.1" librosa soynlp==0.0.493 \
+  qwen-omni-utils sox pytz six dill multiprocess xxhash
+# qwen-asr imports nagisa (a Japanese tokenizer needing the DyNet library) only for its forced aligner, which fine-tuning
+# does not use; a stub lets the import succeed and fails loudly if the aligner is ever used.
+mkdir -p "$DIR/deps"
+cat > "$DIR/deps/nagisa.py" <<'STUB'
+def __getattr__(name):
+    raise RuntimeError("nagisa is stubbed out by setup.sh; the forced aligner needs the real package")
+STUB
 case "$SIZE" in
   "") ;;
   0.6B|1.7B) hf download "Qwen/Qwen3-ASR-$SIZE" --local-dir "$DIR/Qwen3-ASR-$SIZE" ;;
