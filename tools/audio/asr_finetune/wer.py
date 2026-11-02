@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Word and character error rates of a speech-recognition server on a JSONL test set.
 
-    wer.py --jsonl test.jsonl --url http://127.0.0.1:1235 [--api-key-file F] [--model NAME] [--limit N]
+    wer.py --jsonl test.jsonl --url http://127.0.0.1:1235 [--api-key-file F] [--model NAME] [--limit N] [--out run.jsonl]
+    wer.py --rescore run.jsonl [--limit N]    # the same scores again from a saved run, without the server
 
 Each row is {"audio": wav path, "text": reference}; a leading `language X<asr_text>` prefix on the reference is
 ignored. The server is any OpenAI-style /v1/audio/transcriptions endpoint (`gufo serve asr` is one). Both sides
 are lower-cased and stripped of punctuation before they are compared, so casing and commas do not count.
-Prints the corpus WER and CER, the languages the server said it heard, and a few worst rows.
+Prints the corpus WER and CER, the languages the server said it heard, and a few worst rows. `--out FILE` saves every
+clip (reference, hypothesis, language) as it is done and a summary beside it, continues an interrupted run, and lets
+`--rescore FILE` compute the scores of any subset later without the model.
 """
 
 import argparse
@@ -63,29 +66,77 @@ def transcribe(url: str, wav: bytes, key, model) -> dict:
     return json.loads(urllib.request.urlopen(request, timeout=300).read())
 
 
+def read_results(path: Path) -> list:
+    """The clips a run saved, one JSON object per line."""
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def summarize(results: list, worst: int = 0) -> dict:
+    """The corpus scores of saved results, the languages heard, and the worst clips."""
+    rates = error_rates([(r["reference"], r["hypothesis"]) for r in results])
+    heard = collections.Counter(r.get("language") or "?" for r in results)
+    ranked = sorted(results, key=lambda r: error_rates([(r["reference"], r["hypothesis"])])["wer"], reverse=True)
+    return {**rates, "clips": len(results), "languages_heard": dict(heard), "worst": ranked[:worst]}
+
+
+def score(rows: list, transcribe_clip, out: Path | None = None, progress=lambda done, total: None) -> list:
+    """Transcribe each row and return the results. With `out`, every clip is appended to that file as soon as it is
+    done, and clips already in it are not transcribed again, so an interrupted run continues and a finished one can
+    be scored again (see --rescore) without the model."""
+    saved = read_results(out) if out else []
+    done = {r["audio"] for r in saved}
+    results = [r for r in saved if r["audio"] in {row["audio"] for row in rows}]
+    handle = open(out, "a", encoding="utf-8") if out else None
+    try:
+        for i, row in enumerate(rows, 1):
+            if row["audio"] in done:
+                continue
+            answer = transcribe_clip(row["audio"])
+            result = {"audio": row["audio"], "reference": row["text"], "hypothesis": answer["text"],
+                      "language": answer.get("language")}
+            results.append(result)
+            if handle:
+                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                handle.flush()
+            if i % 100 == 0:
+                progress(i, len(rows))
+    finally:
+        if handle:
+            handle.close()
+    return results
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--jsonl", type=Path, required=True)
-    p.add_argument("--url", required=True)
+    p.add_argument("--jsonl", type=Path, help="the test set: {audio, text} per line")
+    p.add_argument("--url", help="the speech-recognition server")
     p.add_argument("--api-key-file", type=Path)
     p.add_argument("--model")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--worst", type=int, default=5)
+    p.add_argument("--out", type=Path, help="save every clip here as it is done (and continue from it if it exists)")
+    p.add_argument("--rescore", type=Path, help="score a file saved with --out again, without the server")
     args = p.parse_args()
-    key = args.api_key_file.read_text().strip() if args.api_key_file else None
-    rows = [json.loads(line) for line in args.jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
-    rows = rows[: args.limit] if args.limit else rows
-    pairs, heard, scored = [], collections.Counter(), []
-    for i, row in enumerate(rows, 1):
-        answer = transcribe(args.url, Path(row["audio"]).read_bytes(), key, args.model)
-        pairs.append((row["text"], answer["text"]))
-        heard[answer.get("language") or "?"] += 1
-        scored.append((error_rates([pairs[-1]])["wer"], row["text"], answer["text"]))
-        if i % 100 == 0:
-            print(f"{i}/{len(rows)}", flush=True)
-    print(json.dumps({**error_rates(pairs), "clips": len(rows), "languages_heard": dict(heard)}, ensure_ascii=False))
-    for wer, reference, hypothesis in sorted(scored, reverse=True)[: args.worst]:
-        print(f"\nWER {wer:.2f}\n  ref: {normalize(reference)}\n  hyp: {normalize(hypothesis)}")
+
+    if args.rescore:
+        results = read_results(args.rescore)[: args.limit or None]
+    else:
+        if not (args.jsonl and args.url):
+            p.error("--jsonl and --url are needed unless --rescore is given")
+        key = args.api_key_file.read_text().strip() if args.api_key_file else None
+        rows = [json.loads(line) for line in args.jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+        rows = rows[: args.limit] if args.limit else rows
+        results = score(rows, lambda audio: transcribe(args.url, Path(audio).read_bytes(), key, args.model), args.out,
+                        lambda done, total: print(f"{done}/{total}", flush=True))
+    summary = summarize(results, args.worst)
+    worst = summary.pop("worst")
+    print(json.dumps(summary, ensure_ascii=False))
+    if args.out and not args.rescore:
+        args.out.with_suffix(".summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
+    for r in worst:
+        print(f"\nWER {error_rates([(r['reference'], r['hypothesis'])])['wer']:.2f}\n  ref: {normalize(r['reference'])}\n  hyp: {normalize(r['hypothesis'])}")
 
 
 if __name__ == "__main__":

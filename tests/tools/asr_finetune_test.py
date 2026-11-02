@@ -52,6 +52,56 @@ class ErrorRateTest(unittest.TestCase):
         self.assertEqual(wer.error_rates([("a b", "")])["wer"], 1.0)
 
 
+class SavedRunTest(unittest.TestCase):
+    ROWS = [{"audio": f"/clips/{i}.wav", "text": ref} for i, ref in enumerate(["a b c d", "e f", "g h i j k l"])]
+    HEARD = {"/clips/0.wav": "a b x d", "/clips/1.wav": "e f", "/clips/2.wav": "g h i"}
+
+    def fake(self, calls):
+        def transcribe(audio):
+            calls.append(audio)
+            return {"text": self.HEARD[audio], "language": "bulgarian"}
+        return transcribe
+
+    def test_every_clip_is_saved_and_scores_come_back_from_the_file_without_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "run.jsonl"
+            calls = []
+            results = wer.score(self.ROWS, self.fake(calls), out)
+            live = wer.summarize(results)
+            self.assertEqual(len(wer.read_results(out)), 3)
+            self.assertEqual(wer.read_results(out)[0], {"audio": "/clips/0.wav", "reference": "a b c d",
+                                                        "hypothesis": "a b x d", "language": "bulgarian"})
+            again = wer.summarize(wer.read_results(out))
+            self.assertEqual((again["wer"], again["cer"], again["clips"]), (live["wer"], live["cer"], 3))
+            self.assertAlmostEqual(live["wer"], (1 + 0 + 3) / 12)  # corpus-wide: 4 word errors of 12 words
+            subset = wer.summarize(wer.read_results(out)[:2])
+            self.assertAlmostEqual(subset["wer"], 1 / 6)
+
+    def test_a_run_that_was_interrupted_continues_without_asking_the_model_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "run.jsonl"
+            first = []
+            wer.score(self.ROWS[:2], self.fake(first), out)
+            second = []
+            results = wer.score(self.ROWS, self.fake(second), out)
+            self.assertEqual((first, second), (["/clips/0.wav", "/clips/1.wav"], ["/clips/2.wav"]))
+            self.assertEqual(len(results), 3)
+            self.assertEqual(len(wer.read_results(out)), 3, "no clip is saved twice")
+
+    def test_a_clip_is_saved_as_soon_as_it_is_done_even_if_a_later_one_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "run.jsonl"
+
+            def flaky(audio):
+                if audio.endswith("2.wav"):
+                    raise OSError("server went away")
+                return {"text": "x", "language": None}
+
+            with self.assertRaises(OSError):
+                wer.score(self.ROWS, flaky, out)
+            self.assertEqual([r["audio"] for r in wer.read_results(out)], ["/clips/0.wav", "/clips/1.wav"])
+
+
 class ExportTest(unittest.TestCase):
     INDEX = {"thinker.model.embed_tokens.weight": "model-00001-of-00002.safetensors",
              "thinker.model.layers.0.w": "model-00001-of-00002.safetensors",
