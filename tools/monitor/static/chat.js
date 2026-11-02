@@ -695,21 +695,35 @@ function fillMessage(block, message) {
     tag.textContent = `Heard as ${message.language[0].toUpperCase()}${message.language.slice(1)}`;
     block.append(tag);
   }
-  if (talkAvailable && message.role === 'assistant' && !message.error && !message.pending && message.content) {
-    const speak = document.createElement('button');
-    speak.type = 'button';
-    speak.className = 'speak secondary';
-    speak.setAttribute('aria-label', 'Read this reply aloud');
-    speak.setAttribute('aria-pressed', 'false');
-    speak.title = 'Read aloud';
-    speak.append(window.GufoIcons.svg('volume-2'));
-    if (reading === message) {
-      speak.classList.add('reading');
-      speak.setAttribute('aria-pressed', 'true');
-      speak.replaceChildren(window.GufoIcons.svg('square'));
+  // Small icons under a finished message: read aloud (replies), edit and resend (what you wrote), delete. Edit and
+  // delete are hidden while a reply is written or the chat is shared (see lockMessages).
+  if (!message.pending) {
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const add = (className, label, icon, onClick) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `${className} secondary`;
+      button.setAttribute('aria-label', label);
+      button.title = label;
+      button.append(window.GufoIcons.svg(icon));
+      button.addEventListener('click', onClick);
+      actions.append(button);
+      return button;
+    };
+    if (talkAvailable && message.role === 'assistant' && !message.error && message.content) {
+      const speak = add('speak', 'Read aloud', 'volume-2', () => readAloud(message, speak));
+      speak.setAttribute('aria-pressed', 'false');
+      if (reading === message) {
+        speak.classList.add('reading');
+        speak.setAttribute('aria-pressed', 'true');
+        speak.title = 'Stop reading';
+        speak.replaceChildren(window.GufoIcons.svg('square'));
+      }
     }
-    speak.addEventListener('click', () => readAloud(message, speak));
-    block.append(speak);
+    if (message.role === 'user') add('edit', 'Edit and resend: removes everything below', 'pencil', () => editMessage(message, block));
+    add('remove', 'Delete this message', 'trash', () => removeMessage(message));
+    block.append(actions);
   }
   if (message.stats) {
     const meta = document.createElement('div');
@@ -726,6 +740,7 @@ function renderShared() {
   if (shared) $('shared-open').href = shared.url;
   for (const id of ['prompt', 'send', 'talk']) $(id).disabled = Boolean(shared);
   $('prompt').placeholder = shared ? 'This chat is shared: write in the room' : 'Message Gufo…';
+  lockMessages();
 }
 
 function markShared(shared) {
@@ -744,9 +759,70 @@ function renderLanguage() {
   chip.hidden = !text;
 }
 
+// Editing and deleting change the history, so they wait for the reply being written and are off in a shared chat.
+function lockMessages() {
+  $('messages').classList.toggle('locked', busy || Boolean(active()?.shared));
+}
+
+// Delete one message and keep all the others.
+function removeMessage(message) {
+  const chat = active();
+  const at = chat?.messages.indexOf(message) ?? -1;
+  if (at < 0 || busy || chat.shared) return;
+  if (reading === message) reader?.stop();
+  chat.messages.splice(at, 1);
+  saveChat(chat);
+  updateHistory(chat);
+  renderMessages();
+}
+
+// Replace a message of yours with an editable box; sending it removes this message and everything below it, then asks
+// again with the new text (and the images it had).
+function editMessage(message, block) {
+  const chat = active();
+  if (!chat || busy || chat.shared) return;
+  const input = document.createElement('textarea');
+  input.className = 'edit-input';
+  input.value = message.content;
+  input.rows = Math.min(12, Math.max(2, message.content.split('\n').length + 1));
+  const row = document.createElement('div');
+  row.className = 'edit-row';
+  const resend = document.createElement('button');
+  resend.type = 'button';
+  resend.textContent = 'Resend';
+  resend.title = 'Removes everything below this message, then asks again';
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'secondary';
+  cancel.textContent = 'Cancel';
+  row.append(resend, cancel);
+  block.replaceChildren(input, row);
+  input.focus();
+  const submit = () => {
+    const text = input.value.trim();
+    const images = message.images ?? [];
+    if (busy || chat.shared || (!text && !images.length)) return;
+    if (!$('model').value) { $('status').textContent = 'No served model yet; try again in a moment.'; return; }
+    const at = chat.messages.indexOf(message);
+    if (at < 0) return;
+    chat.messages.length = at;
+    $('prompt').value = text;
+    pendingImages = images;
+    renderPreview();
+    send();
+  };
+  resend.addEventListener('click', submit);
+  cancel.addEventListener('click', renderMessages);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') renderMessages();
+    else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); submit(); }
+  });
+}
+
 function renderMessages() {
   renderLanguage();
   renderShared();
+  lockMessages();
   const root = $('messages');
   root.replaceChildren();
   const messages = active()?.messages ?? [];
@@ -996,6 +1072,7 @@ const refreshAvatarMood = () => avatar?.setMood(window.GufoAvatar.moodFor(talkSt
 
 function setBusy(on) {
   busy = on;
+  lockMessages();
   refreshAvatarMood();
   updateSendLabel();
   $('delete-chat').disabled = on;  // not while a reply is being written into it

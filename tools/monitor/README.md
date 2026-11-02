@@ -78,6 +78,11 @@ Japanese and Korean; any voice speaks the model's other languages, best in its o
 a server that does not know it (the stock one has no Bulgarian) is asked again without it. The page needs a secure context for the
 microphone (`localhost` or https).
 
+**Editing and deleting messages.** Each finished message has small icons under it. The pencil on a message of yours opens it for
+editing; *Resend* (or Ctrl+Enter) removes that message and everything below it and asks again with the new text and the images it
+had. The bin deletes that one message and keeps all the others. Both wait while a reply is being written and are hidden in a shared
+chat, whose history belongs to its room.
+
 **Shared chats.** *Share* on the chat page (the admin's) turns the open chat into a room with a public link,
 `GUFO_PUBLIC_URL/s/TOKEN`. Everyone with the link sees the same conversation, which the monitor keeps, and can write in it, press
 Talk to speak to it and have replies read aloud, with no account and no sign-in. Pages poll it about every 1.5 s; a reply appears
