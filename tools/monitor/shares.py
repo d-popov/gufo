@@ -31,8 +31,7 @@ DEFAULT_MESSAGES = 100
 DEFAULT_AUDIO = 400
 MAX_LIMIT = 10_000
 TITLE_MAX = 80
-SEED_MESSAGES = 60
-SEED_BYTES = 200_000
+SEED_BYTES = 4 << 20          # the text of a chat that can be shared: a chat is stored up to this size
 
 # What a visitor may send, and what the model is shown.
 MESSAGE_CHARS = 8000
@@ -68,8 +67,9 @@ class ShareError(Exception):
 
 
 def clean_seed(messages) -> list:
-    """The part of the owner's chat a link starts from: plain user and assistant text, nothing else (no images,
-    reasoning or tool steps), limited in count and size. Raises ShareError."""
+    """The text of the owner's chat that a room starts with: every user and assistant message, whole, in order (no images,
+    reasoning or tool steps; the owner's own chat keeps those). Visitors see all of it; only what the model reads is capped
+    (see context). Raises ShareError when it cannot be held: more than MAX_ROWS messages, or more than SEED_BYTES of text."""
     if messages is None:
         return []
     if not isinstance(messages, list):
@@ -80,12 +80,11 @@ def clean_seed(messages) -> list:
             continue
         content = message.get("content")
         if isinstance(content, str) and content.strip() and not message.get("error"):
-            kept.append({"role": message["role"], "content": content[:MESSAGE_CHARS]})
-    kept = kept[-SEED_MESSAGES:]
+            kept.append({"role": message["role"], "content": content})
     while kept and kept[0]["role"] != "user":
         kept.pop(0)
-    if len(json.dumps(kept, ensure_ascii=False).encode()) > SEED_BYTES:
-        raise ShareError(413, "that conversation is too long to share; start a link without it")
+    if len(kept) > MAX_ROWS // 2 or len(json.dumps(kept, ensure_ascii=False).encode()) > SEED_BYTES:
+        raise ShareError(413, "that chat is too long to share as a room")
     return kept
 
 
@@ -318,19 +317,23 @@ class ShareStore:
             self._change(token, "UPDATE share_messages SET done = 1 WHERE id = ?", (row_id,))
             self.conn.execute("DELETE FROM share_messages WHERE id = ? AND content = ''", (row_id,))
 
-    def conversation(self, token: str, known: int | None = None) -> dict | None:
-        """What a visitor's page shows: {"rev", "messages"} (the latest SHOWN), or {"rev", "unchanged": True} when the page
-        already has revision `known`."""
+    def conversation(self, token: str, known: int | None = None, before: int | None = None) -> dict | None:
+        """What a visitor's page shows: {"rev", "messages", "more"}, the latest SHOWN messages and whether there are earlier
+        ones, or {"rev", "unchanged": True} when the page already has revision `known`. With `before` (a message id) it
+        is the SHOWN messages before that one instead, for a page that scrolls back through the history."""
         with self.lock:
             share = self.conn.execute("SELECT id, rev FROM shares WHERE token = ?", (token,)).fetchone()
             if share is None:
                 return None
-            if known == share[1]:
+            if before is None and known == share[1]:
                 return {"rev": share[1], "unchanged": True}
-            rows = self.conn.execute("SELECT id, at, role, name, content, done FROM share_messages WHERE share_id = ? "
-                                     "ORDER BY id DESC LIMIT ?", (share[0], SHOWN)).fetchall()
-        return {"rev": share[1], "messages": [{"id": i, "at": at, "role": role, "name": name, "content": content,
-                                               "done": bool(done)} for i, at, role, name, content, done in reversed(rows)]}
+            rows = self.conn.execute(
+                "SELECT id, at, role, name, content, done FROM share_messages WHERE share_id = ? AND id < ? "
+                "ORDER BY id DESC LIMIT ?", (share[0], before if before is not None else 1 << 62, SHOWN + 1)).fetchall()
+        more = len(rows) > SHOWN
+        return {"rev": share[1], "more": more,
+                "messages": [{"id": i, "at": at, "role": role, "name": name, "content": content, "done": bool(done)}
+                             for i, at, role, name, content, done in reversed(rows[:SHOWN])]}
 
     def transcript(self, owner: str, share_id: str) -> list | None:
         """The whole conversation for its owner, oldest first; None if the link is not theirs."""

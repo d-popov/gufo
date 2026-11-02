@@ -208,6 +208,24 @@ class RoomTest(unittest.TestCase):
             small.ask(link["token"], "Ana", "x")
         self.assertEqual(full.exception.status, 403)
 
+    def test_a_page_scrolls_back_through_the_history_a_page_at_a_time(self):
+        link = self.store.create("admin", "Long", seed=[{"role": "user" if i % 2 == 0 else "assistant", "content": f"seed {i}"}
+                                                       for i in range(500)])
+        token = link["token"]
+        latest = self.store.conversation(token)
+        self.assertEqual((len(latest["messages"]), latest["more"], latest["messages"][-1]["content"]), (shares.SHOWN, True, "seed 499"))
+        seen = [m["content"] for m in latest["messages"]]
+        before = latest["messages"][0]["id"]
+        while True:
+            page = self.store.conversation(token, before=before)
+            seen = [m["content"] for m in page["messages"]] + seen
+            if not page["more"]:
+                break
+            before = page["messages"][0]["id"]
+        self.assertEqual(seen, [f"seed {i}" for i in range(500)], "all of it, once, in order")
+        small = self.store.conversation(self.token)
+        self.assertFalse(small["more"])
+
     def test_removing_a_link_removes_its_conversation_but_revoking_keeps_it_for_the_owner(self):
         self.answer("Ana", "hello", "hi")
         self.assertEqual(self.store.remove("admin", self.share["id"]), "revoked")
@@ -271,7 +289,7 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(shares.build_request([{"role": "user", "content": "Hi"}], "m", None)["messages"][0]["role"], "user",
                          "no system text, no system message")
 
-    def test_the_seed_keeps_plain_text_and_starts_with_the_user(self):
+    def test_the_seed_keeps_all_the_text_whole_and_starts_with_the_user(self):
         seed = shares.clean_seed([
             {"role": "assistant", "content": "orphan"}, {"role": "user", "content": "q", "images": ["x"]},
             {"role": "assistant", "content": "a", "reasoning": "secret thoughts", "steps": [{"x": 1}]},
@@ -281,9 +299,19 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(shares.clean_seed(None), [])
         with self.assertRaises(shares.ShareError):
             shares.clean_seed("text")
-        huge = [{"role": "user", "content": "x" * shares.MESSAGE_CHARS}] * shares.SEED_MESSAGES
+        long = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i} " + "x" * 20_000} for i in range(150)]
+        kept = shares.clean_seed(long)
+        self.assertEqual((len(kept), kept[0]["content"], len(kept[149]["content"])), (150, long[0]["content"], len(long[149]["content"])),
+                         "no message is dropped or cut: the room shows the whole chat")
+
+    def test_a_chat_that_cannot_be_held_is_refused_and_not_cut(self):
+        too_many = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x"} for i in range(shares.MAX_ROWS)]
+        with self.assertRaises(shares.ShareError) as refused:
+            shares.clean_seed(too_many)
+        self.assertEqual(refused.exception.status, 413)
+        too_big = [{"role": "user", "content": "x" * (1 << 20)}] * 5
         with self.assertRaises(shares.ShareError):
-            shares.clean_seed(huge)
+            shares.clean_seed(too_big)
 
 
 if __name__ == "__main__":

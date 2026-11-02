@@ -1062,6 +1062,15 @@ class ShareRoutesTest(unittest.TestCase):
         rev = self.room(token)["rev"]
         self.assertEqual(self.call("GET", f"/api/share/{token}/conversation?rev={rev}")[1]["unchanged"], True)
 
+    def test_a_visitor_can_page_back_through_a_long_history(self):
+        _, token = self.make(messages=[{"role": "user" if i % 2 == 0 else "assistant", "content": f"seed {i}"} for i in range(450)])
+        latest = self.room(token)
+        self.assertEqual((len(latest["messages"]), latest["more"]), (200, True))
+        page = self.call("GET", f"/api/share/{token}/conversation?before={latest['messages'][0]['id']}")[1]
+        self.assertEqual((len(page["messages"]), page["more"], page["messages"][-1]["content"]), (200, True, "seed 249"))
+        last = self.call("GET", f"/api/share/{token}/conversation?before={page['messages'][0]['id']}")[1]
+        self.assertEqual((len(last["messages"]), last["more"], last["messages"][0]["content"]), (50, False, "seed 0"))
+
     def test_the_owner_reads_the_whole_conversation(self):
         share, token = self.make(messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])
         self.say(token, "Ana", "echo: hi")
@@ -1212,7 +1221,12 @@ class ShareRoutesTest(unittest.TestCase):
         stored = self.store.item("admin", "chat", "chat-1")
         self.assertEqual(stored["messages"], chat["messages"], "nothing of the owner's history changes when it is shared")
         self.assertEqual(stored["shared"], {"id": share["id"], "url": share["url"]})
-        self.assertEqual(len(self.room(token)["messages"]), 60, "the room starts from the chat's latest 60 messages")
+        # The room holds the whole text of the chat, long messages whole, for visitors to read.
+        shown = self.room(token)["messages"]
+        self.assertEqual(len(shown), 80)
+        self.assertEqual(shown[0]["content"], chat["messages"][0]["content"])
+        self.assertGreater(len(shown[0]["content"]), 12000)
+        self.assertEqual([m["content"] for m in shown], [m["content"] for m in chat["messages"]])
         self.say(token, "Ana", "echo: from the room")
         stored = self.store.item("admin", "chat", "chat-1")
         self.assertEqual(stored["messages"][:80], chat["messages"])

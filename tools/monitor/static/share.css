@@ -7,3 +7,4 @@ main.chat.share { height: 100dvh; min-height: 0; padding: var(--space-3); box-si
 .share .toolbar { flex-wrap: wrap; }
 .message.user.other { margin-left: 0; background: var(--panel); border-bottom-right-radius: 16px; border-bottom-left-radius: 4px; }
 .message .who { display: block; margin-bottom: 2px; color: var(--muted); font-size: var(--text-xs); }
+.share .earlier { display: block; margin: 0 auto var(--space-4); }

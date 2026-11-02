@@ -81,7 +81,7 @@ microphone (`localhost` or https).
 `GUFO_PUBLIC_URL/s/TOKEN`. Everyone with the link sees the same conversation, which the monitor keeps, and can write in it, press
 Talk to speak to it and have replies read aloud, with no account and no sign-in. Pages poll it about every 1.5 s; a reply appears
 as it is written. Each person is shown by a name they choose (the model is told who said what), one reply is written at a time, and
-the room starts from the chat's latest 60 messages (text only). You choose an expiry (1, 7 or 30 days, or never), a number of
+the room starts with the chat's whole text (long messages whole; images, reasoning and tool steps stay in your own chat), of which a visitor's page shows the latest 200 messages and loads earlier ones on request, while the model reads the latest 40 (at most 60,000 characters). You choose an expiry (1, 7 or 30 days, or never), a number of
 messages (default 100) and of speech requests (default 400). `/shares` (profile menu, *Shared chats*) lists the links with their use
 and state, opens a room, **reads** a whole conversation, **revokes** a link (it stops working at once) and removes revoked or
 expired ones.

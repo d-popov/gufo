@@ -2858,8 +2858,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        else {"voice": None, "speed": 1.0, "reply_style": ""})
         if method == "GET":
             if kind == "conversation":
-                known = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("rev", [""])[0]
-                room = shares.conversation(token, int(known) if known.isdigit() else None)
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                number = lambda name: int(query[name][0]) if query.get(name, [""])[0].isdigit() else None  # noqa: E731
+                room = shares.conversation(token, number("rev"), number("before"))
                 room.update(messages_left=share["max_messages"] - share["messages"], audio_left=share["max_audio"] - share["audio"])
                 return self._json(200, json.dumps(room, ensure_ascii=False).encode())
             model = self._share_model()

@@ -11,6 +11,8 @@ const Lang = window.GufoLanguage;
 
 let info = null;
 let room = { rev: -1, messages: [] };
+let older = [];             // earlier messages the visitor scrolled back for, and whether still earlier ones exist
+let olderMore = null;
 let language = Lang.EMPTY;  // what this visitor's chat is in, from what they say
 let heard = null;           // what speech recognition returned last: { text, language }
 let own = null;             // the reply being streamed to this page: { content } while it is
@@ -82,14 +84,37 @@ function fill(block, message) {
   }
 }
 
+// Earlier history is fetched on request: the latest messages come with every poll, the rest a page at a time.
+async function showEarlier() {
+  const first = (older[0] ?? room.messages[0])?.id;
+  if (first === undefined) return;
+  try {
+    const response = await fetch(`${API}/conversation?before=${first}`);
+    if (!response.ok) return;
+    const page = await response.json();
+    older = [...page.messages, ...older];
+    olderMore = page.more;
+    render();
+  } catch { /* try again */ }
+}
+
 function render() {
   const root = $('messages');
   const scroller = root.parentElement;
   const atEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
   root.replaceChildren();
-  room.messages.forEach((message, index) => {
+  if (olderMore === null ? room.more : olderMore) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'secondary earlier';
+    button.textContent = 'Show earlier messages';
+    button.addEventListener('click', showEarlier);
+    root.append(button);
+  }
+  const all = [...older, ...room.messages];
+  all.forEach((message, index) => {
     // While this page streams its own reply, the text it has is newer than the room's copy.
-    const shown = own && index === room.messages.length - 1 && message.role === 'assistant' && message.done === false
+    const shown = own && index === all.length - 1 && message.role === 'assistant' && message.done === false
       ? { ...message, content: own.content } : message;
     const block = document.createElement('article');
     const mine = message.role === 'user' && message.name === name();
@@ -97,7 +122,7 @@ function render() {
     fill(block, shown);
     root.append(block);
   });
-  $('empty').hidden = room.messages.length > 0;
+  $('empty').hidden = all.length > 0;
   if (atEnd) scroller.scrollTop = scroller.scrollHeight;
 }
 
