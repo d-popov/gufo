@@ -18,6 +18,7 @@
   <script src="/static/markdown.js" defer></script>
   <script src="/static/chatstore.js" defer></script>
   <script src="/static/chatsync.js" defer></script>
+  <script src="/static/language.js" defer></script>
   <script src="/static/talk.js" defer></script>
   <script src="/static/chat.js" defer></script>
 </head>
@@ -94,6 +95,7 @@
         </div>
         <button id="talk" type="button" class="secondary" aria-pressed="false" hidden
                 title="Talk with the model: it listens, answers aloud, and listens again">Talk</button>
+        <span id="language" class="language" hidden title="The language this chat is assumed to be in. Type /lang to change it."></span>
         <span id="status" role="status"></span>
         <button id="send" type="submit">Send</button>
       </div>

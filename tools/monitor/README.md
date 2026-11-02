@@ -73,8 +73,18 @@ and 1236, with the text server's key file) and start the monitor with
 `--asr-url http://127.0.0.1:1235 --tts-url http://127.0.0.1:1236 [--tts-voice ryan]`; the key is the admin's
 `--chat-key-file`. Only Qwen3-ASR 1.7B and Qwen3-TTS 12Hz 1.7B (BF16 safetensors) work: Gufo does not load the audio
 GGUFs of other tools. TTS speaks Chinese, English, German, Italian, Portuguese, Spanish, Japanese, Korean, French and
-Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them. The page
-needs a secure context for the microphone (`localhost` or https).
+Russian; for other languages (Bulgarian, for one) the reply is spoken in a voice that does not know them, unless
+another TTS server holds a model for it: `--tts-route bulgarian=http://127.0.0.1:1237` (repeatable) sends replies in that
+language there, using its own voice if the chosen one is not among its voices. The page needs a secure context for the
+microphone (`localhost` or https).
+
+**Language.** Speech recognition names the language of every spoken message. A chat keeps its language: the first one
+heard is assumed to continue (or English), a message in English does not change it but is answered and spoken in
+English, and a different language takes over only on its second message in a row or in a long one (eight words). The
+language shows beside the controls and the model is told it. `/lang bulgarian english` names the languages the chat
+uses and then only those are assumed (`/lang auto` goes back to detection, `/lang` shows it). It is per chat and syncs
+with it. Qwen3-ASR has no Bulgarian: it hears it as Macedonian, which `/lang bulgarian` corrects for the model and the
+voice; the transcript itself still has Macedonian spelling.
 
 The voice and speed are the account's, set on the **Voice settings** page (profile menu, `/voice`): pick a voice from
 the ones the speech server lists, pick a speed, play a sample of any text, and save. They are kept on the server, so
@@ -83,7 +93,8 @@ use. The server speaks at 1.0 only, so speed is playback rate and the pitch move
 reply has a small speaker button that reads it aloud in the saved voice and speed (press again to stop), so a typed
 conversation can be listened to without Talk. Routes: `GET /api/chat/voice` (models, voices and the saved choice),
 `PUT /api/chat/voice-prefs` (`{voice, speed}`), `POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak`
-(`{text, voice?}` answers a WAV). `static/talk.js` holds the logic, `static/voice.js` the settings page.
+(`{text, voice?, language?}` answers a WAV; transcribe answers `{text, language}`). `static/talk.js` holds the logic,
+`static/language.js` the chat's language, `static/voice.js` the settings page.
 
 **Projects.** The first box in the toolbar picks a project: a folder of chats that share two
 plain Markdown notes, both editable in the **Project** panel.

@@ -21,6 +21,13 @@ const Projects = window.GufoProjects ?? {
   },
 };
 
+// Without language.js the chat works as before, with no language handling.
+const Lang = window.GufoLanguage ?? {
+  EMPTY: null, track: (state) => state, parseCommand: () => null, declare: () => null, note: () => null, label: () => '',
+};
+// What speech recognition heard last: the text and its language, handed to send() with that text.
+let heard = null;
+
 // The page header first, so it is there whatever fails below.
 window.GufoHeader.init();
 window.GufoHeader.refresh().catch(() => {});
@@ -56,8 +63,8 @@ function failedToSave() {
 function plainChat(chat) {
   return {
     ...chat,
-    messages: chat.messages.map(({ role, content, hadImages, images, stats, error, steps, steering }) => ({
-      role, content, hadImages: Boolean(hadImages || images?.length), stats, error, steering,
+    messages: chat.messages.map(({ role, content, hadImages, images, stats, error, steps, steering, language }) => ({
+      role, content, hadImages: Boolean(hadImages || images?.length), stats, error, steering, language,
       steps: steps?.map(({ figures, ...rest }) => (figures ? { ...rest, figureCount: figures.length } : rest)),
     })),
   };
@@ -677,6 +684,12 @@ function fillMessage(block, message) {
     img.alt = image.name;
     block.append(img);
   }
+  if (message.role === 'user' && message.language) {
+    const tag = document.createElement('div');
+    tag.className = 'tag';
+    tag.textContent = `Heard as ${message.language[0].toUpperCase()}${message.language.slice(1)}`;
+    block.append(tag);
+  }
   if (talkAvailable && message.role === 'assistant' && !message.error && !message.pending && message.content) {
     const speak = document.createElement('button');
     speak.type = 'button';
@@ -701,7 +714,16 @@ function fillMessage(block, message) {
   }
 }
 
+// The language this chat is assumed to be in, beside the controls; hidden until it is known.
+function renderLanguage() {
+  const chip = $('language');
+  const text = Lang.label(active()?.language ?? Lang.EMPTY);
+  chip.textContent = text;
+  chip.hidden = !text;
+}
+
 function renderMessages() {
+  renderLanguage();
   const root = $('messages');
   root.replaceChildren();
   const messages = active()?.messages ?? [];
@@ -1002,6 +1024,25 @@ function queueSteer() {
   return true;
 }
 
+// /lang shows the chat's language, names the languages it uses, or goes back to detection.
+function runLanguageCommand(chat, command) {
+  const say = (text) => { $('status').textContent = text; };
+  if (command.error) { say(command.error); return; }
+  if (command.show) {
+    const label = Lang.label(chat.language ?? Lang.EMPTY);
+    say(label ? `This chat is assumed to be in ${label}. /lang NAME… names its languages; /lang auto detects them.`
+      : 'No language yet: it is taken from the first spoken message. /lang NAME… names it.');
+    return;
+  }
+  chat.language = command.auto ? Lang.EMPTY : Lang.declare(command.declared);
+  chat.updated = Date.now();
+  saveChat(chat);
+  $('prompt').value = '';
+  autosize();
+  renderLanguage();
+  say(command.auto ? 'The language will be detected again.' : `This chat now uses ${Lang.label(chat.language)}.`);
+}
+
 async function send() {
   // A memory update that is still running would be missed by this chat's first message.
   if (memoryJob) {
@@ -1015,19 +1056,28 @@ async function send() {
   if (!model) { $('status').textContent = 'No served model yet; try again in a moment.'; return; }
   if (!active()) newChat();
   const chat = active();
+  const command = Lang.parseCommand(text);
+  if (command) { runLanguageCommand(chat, command); return; }
   clearTimeout(memoryTimer);
   const allowed = selectedTools();
   const owner = projectOf(chat);
   // A chat keeps the memory it started with, so the model's own memory updates do not change
   // the start of its prompt and force it to be read again.
   chat.memory ??= owner?.memory ?? '';
-  chat.messages.push({ role: 'user', content: text, images: pendingImages, hadImages: pendingImages.length > 0 });
+  // A spoken message brings the language the recognizer heard; it settles what the chat is in.
+  const spoken = heard && heard.text === text ? heard.language : null;
+  heard = null;
+  if (spoken) chat.language = Lang.track(chat.language ?? Lang.EMPTY, spoken, text);
+  renderLanguage();
+  chat.messages.push({ role: 'user', content: text, images: pendingImages, hadImages: pendingImages.length > 0,
+    ...(spoken ? { language: spoken } : {}) });
   // Earlier tool steps stay in the thread but not in what is sent: the answers carry them.
   const note = allowed.size ? toolkit.note(allowed, new Date().toISOString().slice(0, 10)) : null;
   const system = Projects.systemMessage(owner ? Projects.context(owner, chat.memory) : null, note?.content,
-    talk?.active ? talk.instruction : null);
+    talk?.active ? talk.instruction : null, Lang.note(chat.language ?? Lang.EMPTY));
   const outgoing = [...(system ? [system] : []), ...toApiMessages(chat.messages)];
-  let reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [] };
+  let reply = { role: 'assistant', content: '', reasoning: '', pending: true, steps: [],
+    ...(chat.language?.spoken ? { language: chat.language.spoken } : {}) };
   chat.messages.push(reply);
   if (chat.title === 'New chat') chat.title = text.slice(0, 48) || 'Image chat';
   $('prompt').value = '';
@@ -1319,10 +1369,10 @@ async function speechError(response) {
 }
 
 // One piece of text as a WAV file, in the voice chosen on the voice settings page.
-async function synthesizeSpeech(text) {
+async function synthesizeSpeech(text, language) {
   const response = await fetch('/api/chat/speak', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}) }),
+    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}) }),
   });
   if (!response.ok) throw await speechError(response);
   return response.arrayBuffer();
@@ -1333,7 +1383,7 @@ let reader = null;
 let reading = null;  // the message being read
 function readAloud(message, button) {
   reader ??= window.GufoTalk.createReader({
-    synthesize: synthesizeSpeech,
+    synthesize: (text) => synthesizeSpeech(text, reading?.language),
     speed: () => voicePrefs.speed,
     error: (text) => { $('status').textContent = text; },
   });
@@ -1360,9 +1410,11 @@ function talkController() {
     transcribe: async (wav) => {
       const response = await fetch('/api/chat/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav });
       if (!response.ok) throw await speechError(response);
-      return (await response.json()).text ?? '';
+      const answer = await response.json();
+      heard = { text: (answer.text ?? '').trim(), language: answer.language ?? null };
+      return answer.text ?? '';
     },
-    synthesize: synthesizeSpeech,
+    synthesize: (text) => synthesizeSpeech(text, active()?.language?.spoken),
     setState: (state, detail) => {
       const button = $('talk');
       button.textContent = TALK_LABEL[state] ?? 'Talk';

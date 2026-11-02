@@ -507,7 +507,7 @@ class MonitorHttpTest(unittest.TestCase):
     def test_static_whitelist(self):
         for name in ("app.css", "app.js", "admin.js", "admin.css", "header.js", "header.css",
                      "icons.js", "chat.js", "webtools.js", "pybox.js", "pyworker.js", "tools.js",
-                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js", "talk.js", "voice.js", "voice.css",
+                     "librarytools.js", "libraryadmin.js", "projects.js", "markdown.js", "chatstore.js", "chatsync.js", "talk.js", "language.js", "voice.js", "voice.css",
                      "chat.css", "favicon.svg", "portal.js",
                      "portal.css", "wallet.js"):
             response, _ = self.request("GET", "/static/" + name)
@@ -679,7 +679,24 @@ class FakeSpeech(http.server.BaseHTTPRequestHandler):
         if FakeSpeech.refuse:
             return self._reply(403, b'{"error":{"message":"model not allowed"}}', "application/json")
         if self.path == "/v1/audio/transcriptions":
-            return self._reply(200, b'{"text":"hello world"}', "application/json")
+            return self._reply(200, b'{"text":"hello world","language":"English"}', "application/json")
+        self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
+
+
+class FakeSpeechTwo(FakeSpeech):
+    """A second TTS server, serving a model fine-tuned for one language."""
+
+    seen: list = []
+
+    def do_GET(self):
+        if self.path == "/v1/audio/voices":
+            return self._reply(200, b'{"data":[{"id":"plamen"}]}', "application/json")
+        self._reply(200, b'{"data":[{"id":"fake-bulgarian"}]}', "application/json")
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        FakeSpeechTwo.seen.append((self.path, self.headers.get("Authorization"),
+                                   self.headers.get("Content-Type"), body))
         self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
 
 
@@ -726,12 +743,12 @@ class TalkModeTest(unittest.TestCase):
     def test_an_utterance_reaches_speech_recognition_as_a_multipart_upload(self):
         port = self.serve(gm.VoiceServices(self.url, self.url))
         status, data, _ = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
-        self.assertEqual((status, json.loads(data)), (200, {"text": "hello world"}))
+        self.assertEqual((status, json.loads(data)), (200, {"text": "hello world", "language": "english"}))
         path, authorization, content_type, body = FakeSpeech.seen[-1]
         self.assertEqual((path, authorization), ("/v1/audio/transcriptions", "Bearer chat-key"))
         self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
         self.assertIn(b'name="model"\r\n\r\nfake-speech', body)
-        self.assertIn(b'name="response_format"\r\n\r\njson', body)
+        self.assertIn(b'name="response_format"\r\n\r\nverbose_json', body)
         self.assertIn(b'filename="utterance.wav"\r\nContent-Type: audio/wav\r\n\r\n' + self.WAV, body)
 
     def test_only_the_admin_sends_audio_and_only_wav_of_a_sane_size(self):
@@ -760,6 +777,39 @@ class TalkModeTest(unittest.TestCase):
         for bad in (b'{"text":""}', b'{"text":5}', b'{"text":"x","voice":3}', b"{}",
                     json.dumps({"text": "x" * (gm.VoiceServices.TEXT_MAX + 1)}).encode()):
             self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:30])
+
+    def test_a_reply_is_spoken_by_the_server_that_speaks_its_language(self):
+        # A second server holds a model fine-tuned for one language; the rest go to the first.
+        other = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSpeechTwo))
+        self.addCleanup(lambda: (other.shutdown(), other.server_close()))
+        routed = f"http://127.0.0.1:{other.server_address[1]}"
+        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan", routes={"bulgarian": routed}))
+
+        def speak(**fields):
+            FakeSpeech.seen.clear()
+            FakeSpeechTwo.seen.clear()
+            status = self.call(port, "/api/chat/speak", json.dumps({"text": "Hi.", **fields}).encode(),
+                               "application/json")[0]
+            self.assertEqual(status, 200)
+            where = FakeSpeechTwo if FakeSpeechTwo.seen else FakeSpeech
+            return where is FakeSpeechTwo, json.loads(where.seen[-1][3])
+
+        is_routed, request = speak(language="bulgarian")
+        self.assertTrue(is_routed)
+        self.assertEqual((request["voice"], request["model"]), ("plamen", "fake-bulgarian"),
+                         "the routed server's own voice: ryan is not one of its voices")
+        self.assertNotIn("language", request, "its model has no name for the language")
+        is_routed, request = speak(language="english")
+        self.assertFalse(is_routed)
+        self.assertEqual((request["voice"], request["language"]), ("ryan", "english"))
+        is_routed, request = speak(language="macedonian")  # no server of its own, no name in the model
+        self.assertFalse(is_routed)
+        self.assertNotIn("language", request)
+        is_routed, request = speak()
+        self.assertFalse(is_routed)
+        self.assertNotIn("language", request)
+        for bad in (b'{"text":"x","language":"Bulgarian"}', b'{"text":"x","language":3}', b'{"text":"x","language":"../x"}'):
+            self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad)
 
     def test_a_refusal_keeps_its_status_and_an_absent_server_is_a_bad_gateway(self):
         port = self.serve(gm.VoiceServices(self.url, self.url))

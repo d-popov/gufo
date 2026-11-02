@@ -60,6 +60,8 @@ details.thinking div { margin-top: 6px; }
 .attach { display: inline-flex; align-items: center; }
 .effort { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--text-sm); }
 #model { max-width: 220px; }
+#language { padding: 0.15rem 0.5rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: var(--text-xs); white-space: nowrap; }
+.message .tag { margin-top: 0.25rem; color: var(--muted); font-size: var(--text-xs); }
 #status { margin-left: auto; min-height: 1.2em; color: var(--muted); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
 #send { min-width: 84px; }
 #talk.talking { background: var(--accent); color: var(--surface); border-color: var(--accent); }

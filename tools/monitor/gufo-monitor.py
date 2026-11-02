@@ -76,6 +76,7 @@ STATIC_FILES = {
     "chatstore.js": (STATIC_DIR, _JS),
     "chatsync.js": (STATIC_DIR, _JS),
     "talk.js": (STATIC_DIR, _JS),
+    "language.js": (STATIC_DIR, _JS),
     "voice.js": (STATIC_DIR, _JS),
     "voice.css": (STATIC_DIR, _CSS),
     "markdown.js": (STATIC_DIR, _JS),
@@ -553,6 +554,7 @@ class ChatRuns:
 
 
 VOICE_NAME = re.compile(r"[\w.-]{1,64}")  # a speech server's voice name
+LANGUAGE_NAME = re.compile(r"[a-z]{2,30}")  # a language as the speech models name it: "bulgarian"
 
 CHAT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -770,11 +772,19 @@ class VoiceServices:
 
     UTTERANCE_MAX = 8 << 20   # bytes of WAV the chat may send for one utterance
     TEXT_MAX = 4000           # characters of reply text synthesized per request
+    # The languages Qwen3-TTS takes by name. For any other the request carries none and the model
+    # decides from the text.
+    TTS_LANGUAGES = frozenset({"chinese", "english", "german", "italian", "portuguese", "spanish",
+                               "japanese", "korean", "french", "russian"})
 
-    def __init__(self, asr_url: str, tts_url: str, voice: str | None = None):
+    def __init__(self, asr_url: str, tts_url: str, voice: str | None = None,
+                 routes: dict[str, str] | None = None):
+        """routes maps a language name to the TTS server that speaks it (a fine-tune for one
+        language, say); every other language goes to tts_url."""
         self.asr = asr_url.rstrip("/")
         self.tts = tts_url.rstrip("/")
         self.voice = voice
+        self.routes = {language: url.rstrip("/") for language, url in (routes or {}).items()}
         self._models: dict[str, str] = {}
 
     @staticmethod
@@ -813,27 +823,31 @@ class VoiceServices:
                 self._models[base] = ""
         return self._models[base] or None
 
-    def info(self, key: str | None) -> dict:
-        """The models behind talk mode and the voices the speech model offers: what the chat
-        page shows and lets the admin pick. A server that does not answer leaves its field empty."""
-        voices: list[str] = []
-        request = urllib.request.Request(self.tts + "/v1/audio/voices", headers=self._headers(key))
+    def _voices(self, base: str, key: str | None) -> list[str]:
+        request = urllib.request.Request(base + "/v1/audio/voices", headers=self._headers(key))
         status, body, _ = self._open(request, 5.0)
         try:
             if status == 200:
-                voices = [v["id"] for v in json.loads(body)["data"] if isinstance(v.get("id"), str)]
+                return [v["id"] for v in json.loads(body)["data"] if isinstance(v.get("id"), str)]
         except (ValueError, LookupError, TypeError):
-            voices = []
+            pass
+        return []
+
+    def info(self, key: str | None) -> dict:
+        """The models behind talk mode and the voices the speech model offers: what the chat
+        page shows and lets the admin pick. A server that does not answer leaves its field empty."""
+        voices = self._voices(self.tts, key)
         default = self.voice if self.voice in voices else (voices[0] if voices else None)
         return {"asr": self._model(self.asr, key), "tts": self._model(self.tts, key),
                 "voices": voices, "voice": default}
 
     def transcribe(self, wav: bytes, key: str | None) -> tuple[int, bytes, str]:
-        """POST an utterance (a WAV file) to the ASR server; its JSON answer has "text"."""
+        """POST an utterance (a WAV file) to the ASR server. The answer is {"text", "language"}:
+        the language the recognizer heard (lower case, null if it did not say)."""
         model = self._model(self.asr, key)
         boundary = "gufo" + secrets.token_hex(16)
         parts = [("model", model)] if model else []
-        parts.append(("response_format", "json"))
+        parts.append(("response_format", "verbose_json"))
         body = b"".join(
             f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
             for name, value in parts)
@@ -843,19 +857,38 @@ class VoiceServices:
         request = urllib.request.Request(
             self.asr + "/v1/audio/transcriptions", data=body, method="POST",
             headers=self._headers(key, f"multipart/form-data; boundary={boundary}"))
-        return self._open(request, 120.0)
+        status, answer, content_type = self._open(request, 120.0)
+        if status != 200:
+            return status, answer, content_type
+        try:
+            heard = json.loads(answer)
+            language = heard.get("language")
+            language = language.strip().lower() if isinstance(language, str) else ""
+            reply = {"text": heard["text"], "language": language or None}
+        except (ValueError, LookupError, AttributeError, TypeError):
+            return 502, b'{"error":{"message":"the speech server answered with something else than a transcript"}}', "application/json"
+        return 200, json.dumps(reply, ensure_ascii=False).encode(), "application/json"
 
-    def speak(self, text: str, key: str | None, voice: str | None = None) -> tuple[int, bytes, str]:
-        """POST reply text to the TTS server; its answer is a WAV file."""
+    def speak(self, text: str, key: str | None, voice: str | None = None,
+              language: str | None = None) -> tuple[int, bytes, str]:
+        """POST reply text to a TTS server; its answer is a WAV file. The language picks the
+        server (see routes) and, where the model names it, goes along in the request. A routed
+        server speaks with the chosen voice if it has it, else with its first."""
+        base = self.routes.get(language or "", self.tts)
         payload = {"input": text, "response_format": "wav"}
-        model = self._model(self.tts, key)
+        model = self._model(base, key)
         if model:
             payload["model"] = model
-        voice = voice or self.voice
-        if voice:
-            payload["voice"] = voice
+        wanted = voice or self.voice
+        if base != self.tts:
+            voices = self._voices(base, key)
+            wanted = wanted if wanted in voices else (voices[0] if voices else None)
+        elif language in self.TTS_LANGUAGES:
+            payload["language"] = language
+        if wanted:
+            payload["voice"] = wanted
         request = urllib.request.Request(
-            self.tts + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
+            base + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
             headers=self._headers(key, "application/json"))
         return self._open(request, 180.0)
 
@@ -2635,7 +2668,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _voice_route(self, kind: str):
         """The admin's talk mode. POST /api/chat/transcribe takes one utterance as a WAV body
-        and answers {"text"}; POST /api/chat/speak takes {"text", "voice"?} and answers a WAV
+        and answers {"text", "language"}; POST /api/chat/speak takes {"text", "voice"?, "language"?} and answers a WAV
         file. Both go to Gufo's speech servers with the admin's chat key."""
         voice = self.server.voice
         if voice is None:
@@ -2658,11 +2691,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self._read_json(voice.TEXT_MAX * 4 + 1024)
             text = body.get("text") if body else None
             name = body.get("voice") if body else None
+            language = body.get("language") if body else None
             if not isinstance(text, str) or not text.strip() or len(text) > voice.TEXT_MAX:
                 return self._error(400, f"expected text of 1 to {voice.TEXT_MAX} characters")
             if name is not None and not isinstance(name, str):
                 return self._error(400, "voice is a string")
-            status, answer, content_type = voice.speak(text, key, name)
+            if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
+                return self._error(400, "language is a lower-case name such as bulgarian")
+            status, answer, content_type = voice.speak(text, key, name, language)
         self._send(status, answer, content_type if status == 200 else "application/json")
 
     # -- the private library: /api/library/* (read with the admin or the library token, change
@@ -2982,6 +3018,9 @@ def parse_args(argv=None):
                         help="a `gufo serve asr` server; with --tts-url it turns on the chat's "
                              "talk mode (the admin's, using --chat-key-file)")
     parser.add_argument("--tts-url", metavar="URL", help="a `gufo serve tts` server")
+    parser.add_argument("--tts-route", metavar="LANGUAGE=URL", action="append", default=[],
+                        help="speak this language (a lower-case name such as bulgarian) with another "
+                             "`gufo serve tts` server, for a model fine-tuned for it; repeatable")
     parser.add_argument("--tts-voice", metavar="NAME",
                         help="the voice talk mode speaks with (a CustomVoice speaker or a "
                              "registered clone); the server's default when unset")
@@ -3120,7 +3159,19 @@ def main(argv=None) -> int:
     if bool(args.asr_url) != bool(args.tts_url):
         print("gufo-monitor: --asr-url and --tts-url go together", file=sys.stderr)
         return 2
-    voice = VoiceServices(args.asr_url, args.tts_url, args.tts_voice) if args.asr_url else None
+    routes: dict[str, str] = {}
+    for route in args.tts_route:
+        language, _, url = route.partition("=")
+        if not LANGUAGE_NAME.fullmatch(language) or not url.startswith(("http://", "https://")):
+            print(f"gufo-monitor: --tts-route {route!r}: expected LANGUAGE=URL, such as bulgarian=http://127.0.0.1:1237",
+                  file=sys.stderr)
+            return 2
+        routes[language] = url
+    if routes and not args.asr_url:
+        print("gufo-monitor: --tts-route needs --asr-url and --tts-url", file=sys.stderr)
+        return 2
+    voice = (VoiceServices(args.asr_url, args.tts_url, args.tts_voice, routes)
+             if args.asr_url else None)
     server = Server((args.bind, args.port), monitor, admin, args.secure_cookie, keys, service,
                     chat_key, args.chat_model, chat_store, library, voice)
     threads = [threading.Thread(target=monitor.run, args=(server.stop,), daemon=True,
