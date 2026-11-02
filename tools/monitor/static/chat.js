@@ -228,6 +228,10 @@ function dropIfEmpty(chat) {
 
 // Called when the open chat is about to be left: its project learns what it said.
 function leaveChat() {
+  // Listening and speaking belong to the chat they started in: leaving it ends them, so the microphone is not left
+  // open and the next thing said does not land in another chat.
+  talk?.stop()?.catch?.(() => {});
+  reader?.stop();
   const chat = active();
   clearTimeout(memoryTimer);
   if (!chat) return;
