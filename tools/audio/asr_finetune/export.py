@@ -14,9 +14,6 @@ import json
 import shutil
 from pathlib import Path
 
-from safetensors import safe_open
-from safetensors.torch import save_file
-
 
 TIED = {"thinker.lm_head.weight": "thinker.model.embed_tokens.weight"}  # saved once when the embeddings are tied
 
@@ -37,6 +34,9 @@ def split_by_index(names, weight_map: dict) -> dict:
 
 
 def main():
+    from safetensors import safe_open  # torch is only needed to write the model, not to check names
+    from safetensors.torch import save_file
+
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--base", type=Path, required=True)
