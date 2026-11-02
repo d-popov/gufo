@@ -1407,7 +1407,7 @@ async function speechError(response) {
 async function synthesizeSpeech(text, language) {
   const response = await fetch('/api/chat/speak', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, ...(voicePrefs.voice ? { voice: voicePrefs.voice } : {}), ...(language ? { language } : {}) }),
+    body: JSON.stringify({ text, ...(language ? { language } : {}) }),
   });
   if (!response.ok) throw await speechError(response);
   return response.arrayBuffer();

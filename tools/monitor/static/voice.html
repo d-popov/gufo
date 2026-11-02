@@ -23,7 +23,12 @@
     <form id="voice-form" class="voice-form">
       <label class="field">Voice
         <select id="voice"></select>
+        <span class="hint">Used for every language that has no voice of its own below. Each voice is listed under the language it is native to; any voice can speak any language the speech models know, best in its own.</span>
       </label>
+      <details class="field">
+        <summary>A different voice for a language</summary>
+        <div id="language-voices" class="language-voices"></div>
+      </details>
       <label class="field">Speed
         <select id="speed">
           <option value="0.8">Slow</option>
@@ -43,6 +48,10 @@
       </label>
       <label class="field">Sample text
         <textarea id="sample" rows="3" maxlength="400">Hello! This is how I will read your replies aloud.</textarea>
+      </label>
+      <label class="field">Sample language
+        <select id="sample-language"></select>
+        <span class="hint">The sample is read in the voice chosen for this language, saved or not.</span>
       </label>
       <div class="row">
         <button id="play" type="button" class="secondary">Play sample</button>

@@ -676,6 +676,8 @@ class FakeSpeech(http.server.BaseHTTPRequestHandler):
 
     seen: list = []
     refuse = False
+    voices = ["aiden", "ryan"]
+    languages = None  # None: every language is known; else the ones this server knows
 
     def log_message(self, *args):
         pass
@@ -689,18 +691,32 @@ class FakeSpeech(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/audio/voices":
-            return self._reply(200, b'{"data":[{"id":"aiden"},{"id":"ryan"}]}', "application/json")
+            return self._reply(200, json.dumps({"data": [{"id": v} for v in self.voices]}).encode(), "application/json")
         self._reply(200, b'{"data":[{"id":"fake-speech"}]}', "application/json")
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
-        FakeSpeech.seen.append((self.path, self.headers.get("Authorization"),
+        self.seen.append((self.path, self.headers.get("Authorization"),
                                 self.headers.get("Content-Type"), body))
         if FakeSpeech.refuse:
             return self._reply(403, b'{"error":{"message":"model not allowed"}}', "application/json")
         if self.path == "/v1/audio/transcriptions":
             return self._reply(200, b'{"text":"hello world","language":"English"}', "application/json")
+        language = json.loads(body).get("language")
+        if self.languages is not None and language not in (None, *self.languages):
+            # The answer the real server gives (HTTP 500, code generation_failed).
+            return self._reply(500, json.dumps({"error": {"message": f"unsupported Qwen3-TTS language: {language}",
+                                                          "type": "invalid_request_error", "code": "generation_failed"}}).encode(),
+                               "application/json")
         self._reply(200, b"RIFF....WAVEfmt fake-audio", "audio/wav")
+
+
+class StockSpeech(FakeSpeech):
+    """A second TTS server with other voices, which does not know Bulgarian (as the stock Qwen3-TTS)."""
+
+    seen: list = []
+    voices = ["vivian", "ryan2"]
+    languages = ("english", "french")
 
 
 
@@ -748,7 +764,7 @@ class TalkModeTest(unittest.TestCase):
         self.assertFalse(json.loads(connection.getresponse().read())["talk"])
 
     def test_an_utterance_reaches_speech_recognition_as_a_multipart_upload(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url))
+        port = self.serve(gm.VoiceServices(self.url, [self.url]))
         status, data, _ = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
         self.assertEqual((status, json.loads(data)), (200, {"text": "hello world", "language": "english"}))
         path, authorization, content_type, body = FakeSpeech.seen[-1]
@@ -760,17 +776,17 @@ class TalkModeTest(unittest.TestCase):
 
     def test_an_utterance_heard_as_an_ignored_language_comes_back_as_silence(self):
         # The fake recognizer always says "English"; here that is the noise language.
-        port = self.serve(gm.VoiceServices(self.url, self.url, ignored_languages={"english"}))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], ignored_languages={"english"}))
         status, data, _ = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
         self.assertEqual((status, json.loads(data)), (200, {"text": "", "language": None}))
-        other = self.serve(gm.VoiceServices(self.url, self.url, ignored_languages={"chinese"}))
+        other = self.serve(gm.VoiceServices(self.url, [self.url], ignored_languages={"chinese"}))
         self.assertEqual(json.loads(self.call(other, "/api/chat/transcribe", self.WAV, "audio/wav")[1])["text"], "hello world")
         args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2",
                               "--asr-ignore-language", "chinese", "--asr-ignore-language", "korean"])
         self.assertEqual(args.asr_ignore_language, ["chinese", "korean"])
 
     def test_only_the_admin_sends_audio_and_only_wav_of_a_sane_size(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url))
+        port = self.serve(gm.VoiceServices(self.url, [self.url]))
         self.assertEqual(self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav", admin=False)[0], 401)
         self.assertEqual(self.call(port, "/api/chat/speak", b'{"text":"hi"}', "application/json", admin=False)[0], 401)
         self.assertEqual(self.call(port, "/api/chat/transcribe", self.WAV, "application/json")[0], 415)
@@ -781,7 +797,7 @@ class TalkModeTest(unittest.TestCase):
         self.assertEqual(len(FakeSpeech.seen), 1)  # only the accepted upload was relayed
 
     def test_a_reply_is_spoken_in_the_chosen_voice_and_comes_back_as_wav(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
         status, data, kind = self.call(port, "/api/chat/speak", json.dumps({"text": "Hi there."}).encode(),
                                        "application/json")
         self.assertEqual((status, kind), (200, "audio/wav"))
@@ -797,11 +813,11 @@ class TalkModeTest(unittest.TestCase):
             self.assertEqual(self.call(port, "/api/chat/speak", bad, "application/json")[0], 400, bad[:30])
 
     def test_a_speech_server_that_was_down_when_first_asked_works_once_it_is_up(self):
-        voice = gm.VoiceServices(self.url, self.url, voice="ryan")
+        voice = gm.VoiceServices(self.url, [self.url], voice="ryan")
         with mock.patch.object(gm.VoiceServices, "_open", return_value=(502, b"{}", "application/json")):
             self.assertIsNone(voice._model(self.url, "k"))
         self.assertEqual(voice._model(self.url, "k"), "fake-speech")
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
         self.call(port, "/api/chat/speak", b'{"text":"Hi."}', "application/json")
         self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["model"], "fake-speech")
 
@@ -811,7 +827,7 @@ class TalkModeTest(unittest.TestCase):
 
     def test_a_voice_the_model_no_longer_has_is_replaced_by_its_first(self):
         # A voice saved before the speech model changed (the stock "ryan" after a switch to a one-voice fine-tune).
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="gone"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="gone"))
         self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"vanished"}', "application/json")
         self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["voice"], "aiden")
         self.call(port, "/api/chat/speak", b'{"text":"Hi.","voice":"ryan"}', "application/json")
@@ -820,12 +836,12 @@ class TalkModeTest(unittest.TestCase):
         self.assertEqual(json.loads(FakeSpeech.seen[-1][3])["language"], "bulgarian")
 
     def test_a_refusal_keeps_its_status_and_an_absent_server_is_a_bad_gateway(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url))
+        port = self.serve(gm.VoiceServices(self.url, [self.url]))
         FakeSpeech.refuse = True
         status, data, kind = self.call(port, "/api/chat/transcribe", self.WAV, "audio/wav")
         self.assertEqual((status, kind), (403, "application/json"))
         self.assertEqual(json.loads(data)["error"]["message"], "model not allowed")
-        down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
+        down = self.serve(gm.VoiceServices("http://127.0.0.1:9", ["http://127.0.0.1:9"]))
         self.assertEqual(self.call(down, "/api/chat/transcribe", self.WAV, "audio/wav")[0], 502)
 
     def get_voice(self, port, admin=True):
@@ -837,23 +853,25 @@ class TalkModeTest(unittest.TestCase):
         return response.status, data
 
     def test_the_chat_learns_which_models_and_voices_talk_mode_has(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
         status, data = self.get_voice(port)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": "fake-speech", "tts": "fake-speech", "voices": ["aiden", "ryan"], "voice": "ryan", 
-            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""}}))
+            "asr": "fake-speech", "tts": "fake-speech", "voices": [{"id": "aiden", "language": "english"},
+                                                                    {"id": "ryan", "language": "english"}],
+            "languages": sorted(gm.VoiceServices.TTS_LANGUAGES), "voice": "ryan", 
+            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "language_voices": {}}}))
         self.assertEqual(FakeSpeech.seen, [])
         self.assertEqual(self.get_voice(port, admin=False)[0], 401)
         # A configured voice the server lacks is not offered as the default.
-        other = self.serve(gm.VoiceServices(self.url, self.url, voice="nobody"))
+        other = self.serve(gm.VoiceServices(self.url, [self.url], voice="nobody"))
         self.assertEqual(json.loads(self.get_voice(other)[1])["voice"], "aiden")
         self.assertEqual(self.get_voice(self.serve(None))[0], 404)
         # Speech servers that do not answer leave the lists empty rather than failing the page.
-        down = self.serve(gm.VoiceServices("http://127.0.0.1:9", "http://127.0.0.1:9"))
+        down = self.serve(gm.VoiceServices("http://127.0.0.1:9", ["http://127.0.0.1:9"]))
         status, data = self.get_voice(down)
         self.assertEqual((status, json.loads(data)), (200, {
-            "asr": None, "tts": None, "voices": [], "voice": None, 
-            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""}}))
+            "asr": None, "tts": None, "voices": [], "languages": sorted(gm.VoiceServices.TTS_LANGUAGES), "voice": None, 
+            "prefs": {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "language_voices": {}}}))
 
     def put_prefs(self, port, body, admin=True):
         return self.call_method(port, "PUT", "/api/chat/voice-prefs", json.dumps(body).encode(),
@@ -871,24 +889,24 @@ class TalkModeTest(unittest.TestCase):
         return response.status, data
 
     def test_voice_and_speed_are_kept_on_the_server_for_the_account(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
         prefs = json.loads(self.get_voice(port)[1])["prefs"]
-        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25, "avatar": True, "reply_style": ""})
+        self.assertEqual(prefs, {"voice": "aiden", "speed": 1.25, "avatar": True, "reply_style": "", "language_voices": {}})
         # null returns to the server's default voice.
         self.assertEqual(self.put_prefs(port, {"voice": None, "speed": 1})[0], 200)
-        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "language_voices": {}})
         for bad in ({"voice": "aiden"}, {"speed": 1}, {"voice": "nobody", "speed": 1},
                     {"voice": "../x", "speed": 1}, {"voice": "aiden", "speed": 3},
                     {"voice": "aiden", "speed": 0.1}, {"voice": "aiden", "speed": "fast"},
                     {"voice": "aiden", "speed": True}, {"voice": 5, "speed": 1}):
             self.assertEqual(self.put_prefs(port, bad)[0], 400, bad)
-        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
+        self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"], {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "language_voices": {}})
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1}, admin=False)[0], 401)
         self.assertEqual(self.put_prefs(self.serve(None), {"voice": None, "speed": 1})[0], 404)
 
     def test_the_avatar_is_on_until_the_account_closes_it_and_stays_as_the_voice_changes(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
 
         def avatar():
             return json.loads(self.get_voice(port)[1])["prefs"]["avatar"]
@@ -902,7 +920,7 @@ class TalkModeTest(unittest.TestCase):
         # The voice page saving the voice leaves the avatar as it is, and can set it too.
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25})[0], 200)
         self.assertEqual(json.loads(self.get_voice(port)[1])["prefs"],
-                         {"voice": "aiden", "speed": 1.25, "avatar": False, "reply_style": ""})
+                         {"voice": "aiden", "speed": 1.25, "avatar": False, "reply_style": "", "language_voices": {}})
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1.25, "avatar": True})[0], 200)
         self.assertTrue(avatar())
         # Closing it keeps the voice.
@@ -915,7 +933,7 @@ class TalkModeTest(unittest.TestCase):
                                           "application/json", admin=False)[0], 401)
 
     def test_the_reply_style_is_kept_per_account(self):
-        port = self.serve(gm.VoiceServices(self.url, self.url, voice="ryan"))
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
         prefs = lambda: json.loads(self.get_voice(port)[1])["prefs"]  # noqa: E731
         self.assertEqual(prefs()["reply_style"], "")
         self.assertEqual(self.put_prefs(port, {"voice": "aiden", "speed": 1, "reply_style": " short, informal "})[0], 200)
@@ -928,6 +946,76 @@ class TalkModeTest(unittest.TestCase):
         for bad in ({"reply_style": 5}, {"reply_style": "x" * (gm.STYLE_MAX + 1)}, {"reply_style": ["a"]}):
             self.assertEqual(self.put_prefs(port, {"voice": "ryan", "speed": 1, **bad})[0], 400, bad)
 
+    def two_servers(self):
+        stock = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), StockSpeech))
+        self.addCleanup(lambda: (stock.shutdown(), stock.server_close()))
+        StockSpeech.seen = []
+        return f"http://127.0.0.1:{stock.server_address[1]}"
+
+    def spoken(self, port, **body):
+        """(which server answered, what it was sent) for one reply."""
+        FakeSpeech.seen, StockSpeech.seen = [], []
+        status = self.call(port, "/api/chat/speak", json.dumps({"text": "Hi.", **body}).encode(), "application/json")[0]
+        self.assertEqual(status, 200, body)
+        fine, stock = FakeSpeech.seen, StockSpeech.seen
+        self.assertTrue(not fine or not stock, "only one server was asked")
+        # The last request is the one that was answered (a server that does not know the language is asked again without).
+        return ("fine" if fine else "stock"), json.loads((fine or stock)[-1][3])
+
+    def test_each_voice_is_spoken_by_the_server_that_has_it_whatever_the_language(self):
+        port = self.serve(gm.VoiceServices(self.url, [self.url, self.two_servers()], voice="ryan"))
+        voices = json.loads(self.get_voice(port)[1])["voices"]
+        self.assertEqual([v["id"] for v in voices], ["aiden", "ryan", "vivian", "ryan2"])
+        # A stock-server voice chosen for English, Bulgarian and French text stays on its server.
+        for language in ("english", "bulgarian", "french"):
+            self.put_prefs(port, {"voice": None, "speed": 1, "language_voices": {language: "vivian"}})
+            where, sent = self.spoken(port, language=language)
+            self.assertEqual((where, sent["voice"]), ("stock", "vivian"), language)
+        # The stock server does not know Bulgarian: the language is left out for it, the speech is not refused.
+        self.put_prefs(port, {"voice": None, "speed": 1, "language_voices": {"bulgarian": "vivian", "french": "vivian"}})
+        self.assertNotIn("language", self.spoken(port, language="bulgarian")[1])
+        self.assertEqual(len(StockSpeech.seen), 2, "refused with the language, answered without")
+        self.assertEqual(self.spoken(port, language="french")[1]["language"], "french")
+        self.assertEqual(len(StockSpeech.seen), 1)
+        # And the other way: a voice of the first server for a language of the second.
+        self.put_prefs(port, {"voice": None, "speed": 1, "language_voices": {"french": "aiden"}})
+        where, sent = self.spoken(port, language="french")
+        self.assertEqual((where, sent["voice"], sent["language"]), ("fine", "aiden", "french"))
+
+    def test_a_refusal_that_is_not_about_the_language_is_not_retried(self):
+        port = self.serve(gm.VoiceServices(self.url, [self.url], voice="ryan"))
+        FakeSpeech.refuse = True
+        self.assertEqual(self.call(port, "/api/chat/speak", b'{"text":"Hi.","language":"french"}', "application/json")[0], 403)
+        self.assertEqual(len(FakeSpeech.seen), 1)
+
+    def test_the_voice_of_a_language_falls_back_to_the_default_then_a_native_one(self):
+        port = self.serve(gm.VoiceServices(self.url, [self.url, self.two_servers()]))
+        # Nothing chosen: the voice native to the language, else the first.
+        self.assertEqual(self.spoken(port, language="english")[1]["voice"], "aiden")
+        self.assertEqual(self.spoken(port, language="french")[1]["voice"], "aiden")
+        self.put_prefs(port, {"voice": "ryan2", "speed": 1, "language_voices": {"english": "ryan"}})
+        self.assertEqual(self.spoken(port, language="english")[1]["voice"], "ryan", "the language's own choice")
+        self.assertEqual(self.spoken(port, language="german")[1]["voice"], "ryan2", "the account default")
+        self.assertEqual(self.spoken(port)[1]["voice"], "ryan2")
+        self.assertEqual(self.spoken(port, language="english", voice="vivian")[1]["voice"], "vivian", "asked for by name")
+        # A saved voice that no server has any more is skipped, not an error.
+        self.put_prefs(port, {"voice": "ryan2", "speed": 1, "language_voices": {"english": "ryan"}})
+        with mock.patch.object(StockSpeech, "voices", ["vivian"]), mock.patch.object(FakeSpeech, "voices", ["aiden"]):
+            self.assertEqual(self.spoken(port, language="english")[1]["voice"], "aiden")
+
+    def test_language_voices_are_validated_and_kept_until_changed(self):
+        port = self.serve(gm.VoiceServices(self.url, [self.url, self.two_servers()]))
+        prefs = lambda: json.loads(self.get_voice(port)[1])["prefs"]  # noqa: E731
+        self.assertEqual(self.put_prefs(port, {"voice": None, "speed": 1, "language_voices": {"french": "vivian"}})[0], 200)
+        self.assertEqual(prefs()["language_voices"], {"french": "vivian"})
+        for bad in ({"french": "nobody"}, {"klingon": "vivian"}, {"french": 5}, ["vivian"], "vivian"):
+            self.assertEqual(self.put_prefs(port, {"voice": None, "speed": 1, "language_voices": bad})[0], 400, bad)
+        self.assertEqual(prefs()["language_voices"], {"french": "vivian"}, "a refused save changes nothing")
+        self.put_prefs(port, {"voice": "aiden", "speed": 1})
+        self.assertEqual(prefs()["language_voices"], {"french": "vivian"}, "saving without them keeps them")
+        self.put_prefs(port, {"voice": "aiden", "speed": 1, "language_voices": {}})
+        self.assertEqual(prefs()["language_voices"], {})
+
     def test_a_store_from_before_the_avatar_setting_gains_it_on(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "old.sqlite"
@@ -937,21 +1025,21 @@ class TalkModeTest(unittest.TestCase):
             old.close()
             store = gm.ChatStore(path)
             self.addCleanup(store.close)
-            self.assertEqual(store.voice_prefs("admin"), {"voice": "ryan", "speed": 1.25, "avatar": True, "reply_style": ""})
+            self.assertEqual(store.voice_prefs("admin"), {"voice": "ryan", "speed": 1.25, "avatar": True, "reply_style": "", "language_voices": {}})
             store.set_avatar("admin", False)
             self.assertFalse(store.voice_prefs("admin")["avatar"])
 
     def test_prefs_belong_to_their_owner(self):
         store = gm.ChatStore(":memory:")
         store.set_voice_prefs("user:7", "serena", 1.5)
-        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5, "avatar": True, "reply_style": ""})
-        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
+        self.assertEqual(store.voice_prefs("user:7"), {"voice": "serena", "speed": 1.5, "avatar": True, "reply_style": "", "language_voices": {}})
+        self.assertEqual(store.voice_prefs("admin"), {"voice": None, "speed": 1.0, "avatar": True, "reply_style": "", "language_voices": {}})
         store.set_voice_prefs("admin", "ryan", 0.8)
         self.assertEqual(store.voice_prefs("user:7")["voice"], "serena")
 
     def test_the_options_come_as_a_pair(self):
-        args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2", "--tts-voice", "ryan"])
-        self.assertEqual((args.asr_url, args.tts_url, args.tts_voice), ("http://a:1", "http://t:2", "ryan"))
+        args = gm.parse_args(["--asr-url", "http://a:1", "--tts-url", "http://t:2", "--tts-url", "http://t:3", "--tts-voice", "ryan"])
+        self.assertEqual((args.asr_url, args.tts_url, args.tts_voice), ("http://a:1", ["http://t:2", "http://t:3"], "ryan"))
         self.assertIsNone(gm.parse_args([]).asr_url)
 
 
@@ -976,7 +1064,7 @@ class ShareRoutesTest(unittest.TestCase):
         self.shares = gm.shares_module().ShareStore(":memory:")
         server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False, chat_key=GUFO_KEY,
                                  chat_model="fn-sub", chat_store=self.store,
-                                 voice=gm.VoiceServices(speech_url, speech_url, voice="ryan"), shares=self.shares))
+                                 voice=gm.VoiceServices(speech_url, [speech_url], voice="ryan"), shares=self.shares))
         server.public_url = self.PUBLIC
         self.server = server
         self.addCleanup(lambda: (server.shutdown(), server.server_close(), self.shares.close()))

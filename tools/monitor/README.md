@@ -69,12 +69,13 @@ microphone, ends an utterance at a pause, sends it to speech recognition, sends 
 written, then listens again. Tap Talk while it thinks or speaks to interrupt; tap it while it listens to stop.
 The microphone is ignored while a reply is thought out and spoken, so use it half-duplex; headphones are not needed.
 Run `gufo serve asr` and `gufo serve tts` (`~/.local/bin/gufo-speech` starts both in one container, on ports 1235
-and 1236, with the text server's key file) and start the monitor with
-`--asr-url http://127.0.0.1:1235 --tts-url http://127.0.0.1:1236 [--tts-voice plamen]`; the key is the admin's
+and 1236, plus the stock nine-voice TTS on 1237, with the text server's key file) and start the monitor with
+`--asr-url http://127.0.0.1:1235 --tts-url http://127.0.0.1:1236 --tts-url http://127.0.0.1:1237 [--tts-voice plamen]`; the key is the admin's
 `--chat-key-file`. Only Qwen3-ASR 1.7B and Qwen3-TTS 12Hz 1.7B (BF16 safetensors) work: Gufo does not load the audio
-GGUFs of other tools. The speech model here is a Bulgarian fine-tune of Qwen3-TTS (one voice, `plamen`; it also speaks English and the model's
-other languages, with a Bulgarian accent), see `tools/audio/tts_finetune`. The language the chat has heard goes along with each reply, and a
-voice saved before the speech model changed is replaced by the model's first. The page needs a secure context for the
+GGUFs of other tools. `--tts-url` may be repeated: each voice is spoken by the server that has it. Here one is a Bulgarian fine-tune of
+Qwen3-TTS (voice `plamen`, see `tools/audio/tts_finetune`) and one the stock model (Ryan, Aiden, Vivian and others, native to English, Chinese,
+Japanese and Korean; any voice speaks the model's other languages, best in its own). The language the chat has heard goes along with each reply;
+a server that does not know it (the stock one has no Bulgarian) is asked again without it. The page needs a secure context for the
 microphone (`localhost` or https).
 
 **Shared chats.** *Share* on the chat page (the admin's) turns the open chat into a room with a public link,
@@ -115,13 +116,13 @@ uses and then only those are assumed (`/lang auto` goes back to detection, `/lan
 with it. Qwen3-ASR has no Bulgarian: it hears it as Macedonian, which `/lang bulgarian` corrects for the model and the
 voice; the transcript itself still has Macedonian spelling.
 
-The voice and speed are the account's, set on the **Voice settings** page (profile menu, `/voice`): pick a voice from
-the ones the speech server lists, pick a speed, play a sample of any text, and save. They are kept on the server, so
+The voice and speed are the account's, set on the **Voice settings** page (profile menu, `/voice`): pick a default voice
+from the ones the speech servers list (grouped by native language), optionally a different voice for any language, pick a speed, play a sample of any text, and save. They are kept on the server, so
 every device speaks the same, and the chat itself has no voice controls. The page also names the speech models in
 use. The server speaks at 1.0 only, so speed is playback rate and the pitch moves a little with it. Every finished
 reply has a small speaker button that reads it aloud in the saved voice and speed (press again to stop), so a typed
 conversation can be listened to without Talk. Routes: `GET /api/chat/voice` (models, voices and the saved choice),
-`PUT /api/chat/voice-prefs` (`{voice, speed}`), `POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak`
+`PUT /api/chat/voice-prefs` (`{voice, speed, language_voices?}`), `POST /api/chat/transcribe` (a WAV body) and `POST /api/chat/speak`
 (`{text, voice?, language?}` answers a WAV; transcribe answers `{text, language}`). `static/talk.js` holds the logic,
 `static/language.js` the chat's language, `static/voice.js` the settings page.
 
@@ -251,8 +252,8 @@ Scripts send the admin token as `X-Admin-Token: <token>` or
 |---|---|---|
 | `--gufo URL` | `http://127.0.0.1:8080` | Gufo base URL |
 | `--gufo-key-file FILE` | none | file holding the server's `--api-key`; read and used only by the monitor |
-| `--asr-url URL`, `--tts-url URL` | off | `gufo serve asr` and `gufo serve tts` servers; both turn on the chat's talk mode (the admin's) |
-| `--tts-voice NAME` | the server's default | the voice talk mode speaks with (a CustomVoice speaker such as `ryan`, or a registered clone) |
+| `--asr-url URL`, `--tts-url URL` | off | `gufo serve asr` and `gufo serve tts` servers (`--tts-url` may repeat); both turn on the chat's talk mode (the admin's) |
+| `--tts-voice NAME` | a voice native to the language, else the first | the voice used where an account has chosen none (a CustomVoice speaker such as `ryan`, or a registered clone) |
 | `--chat-key-file FILE` | the monitor's key | file holding an inference key for the admin's chat; keeps `--gufo-key-file` read-only |
 | `--chat-model NAME` | the first served model | the model the chat page selects until a user picks another; the page then remembers that choice in the browser |
 | `--chat-store FILE` | `~/.config/gufo-monitor/chats.sqlite` | where every account's chats and projects are kept, so they follow the account between devices |

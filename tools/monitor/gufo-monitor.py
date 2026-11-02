@@ -582,8 +582,12 @@ CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('rev', 0);
 CREATE TABLE IF NOT EXISTS voice_prefs (
   owner TEXT PRIMARY KEY, voice TEXT, speed REAL NOT NULL, updated INTEGER NOT NULL,
-  avatar INTEGER NOT NULL DEFAULT 1, reply_style TEXT NOT NULL DEFAULT '');
+  avatar INTEGER NOT NULL DEFAULT 1, reply_style TEXT NOT NULL DEFAULT '',
+  language_voices TEXT NOT NULL DEFAULT '{}');
 """
+
+
+DEFAULT_VOICE_PREFS = {"voice": None, "language_voices": {}, "speed": 1.0, "avatar": True, "reply_style": ""}
 
 
 class ChatStoreError(Exception):
@@ -613,7 +617,8 @@ class ChatStore:
             # A store made before the avatar setting has no such column.
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(voice_prefs)")}
             for name, definition in (("avatar", "INTEGER NOT NULL DEFAULT 1"),
-                                     ("reply_style", "TEXT NOT NULL DEFAULT ''")):
+                                     ("reply_style", "TEXT NOT NULL DEFAULT ''"),
+                                     ("language_voices", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in columns:
                     self.conn.execute(f"ALTER TABLE voice_prefs ADD COLUMN {name} {definition}")
         self.purge()
@@ -638,27 +643,31 @@ class ChatStore:
                 "deleted": bool(deleted), "data": None if deleted else json.loads(body)}
 
     def voice_prefs(self, owner: str) -> dict:
-        """How this owner's replies are spoken and shown, the same on every device: "voice" (a name, or None for the
-        server's default), "speed" (playback rate), "avatar" (shown until the owner closes it) and "reply_style" (a hint to
-        the model about how to write replies, "" for none)."""
+        """How this owner's replies are spoken and shown, the same on every device: "voice" (the default voice, or None
+        for the server's), "language_voices" ({language: voice} for the languages that have their own), "speed" (playback
+        rate), "avatar" (shown until the owner closes it) and "reply_style" (a hint to the model about how to write
+        replies, "" for none)."""
         with self.lock:
-            row = self.conn.execute(
-                "SELECT voice, speed, avatar, reply_style FROM voice_prefs WHERE owner = ?", (owner,)).fetchone()
-        return ({"voice": row[0], "speed": row[1], "avatar": bool(row[2]), "reply_style": row[3]} if row
-                else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
+            row = self.conn.execute("SELECT voice, speed, avatar, reply_style, language_voices FROM voice_prefs "
+                                    "WHERE owner = ?", (owner,)).fetchone()
+        return ({"voice": row[0], "language_voices": json.loads(row[4]), "speed": row[1], "avatar": bool(row[2]),
+                 "reply_style": row[3]} if row else dict(DEFAULT_VOICE_PREFS))
 
     def set_voice_prefs(self, owner: str, voice: str | None, speed: float, avatar: bool | None = None,
-                        reply_style: str | None = None) -> dict:
-        """Keep the voice and speed; a setting passed as None is left as it was."""
+                        reply_style: str | None = None, language_voices: dict | None = None) -> dict:
+        """Keep the voices and speed; a setting passed as None is left as it was."""
         with self.lock:
             self.conn.execute(
-                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar, reply_style) VALUES (?, ?, ?, ?, ?, ?) "
+                "INSERT INTO voice_prefs (owner, voice, speed, updated, avatar, reply_style, language_voices) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (owner) DO UPDATE SET voice = excluded.voice, speed = excluded.speed, "
                 "updated = excluded.updated, "
                 "avatar = CASE WHEN ? THEN excluded.avatar ELSE avatar END, "
-                "reply_style = CASE WHEN ? THEN excluded.reply_style ELSE reply_style END",
+                "reply_style = CASE WHEN ? THEN excluded.reply_style ELSE reply_style END, "
+                "language_voices = CASE WHEN ? THEN excluded.language_voices ELSE language_voices END",
                 (owner, voice, speed, int(time.time() * 1000), int(avatar is not False), reply_style or "",
-                 avatar is not None, reply_style is not None))
+                 json.dumps(language_voices or {}), avatar is not None, reply_style is not None,
+                 language_voices is not None))
         return self.voice_prefs(owner)
 
     def set_avatar(self, owner: str, enabled: bool) -> dict:
@@ -813,7 +822,7 @@ class GufoClient:
 class VoiceServices:
     """Gufo's speech servers behind the chat's talk mode: `gufo serve asr` turns a recorded
     utterance into text and `gufo serve tts` turns a reply into audio. Each is its own Gufo
-    process (--asr-url, --tts-url); the browser reaches them only through the monitor, which
+    process (--asr-url, --tts-url, which may be repeated); the browser reaches them only through the monitor, which
     adds the admin's chat key."""
 
     UTTERANCE_MAX = 8 << 20   # bytes of WAV the chat may send for one utterance
@@ -823,10 +832,15 @@ class VoiceServices:
     TTS_LANGUAGES = frozenset({"chinese", "english", "german", "italian", "portuguese", "spanish",
                                "japanese", "korean", "french", "russian", "bulgarian"})
 
-    def __init__(self, asr_url: str, tts_url: str, voice: str | None = None,
+    # The language each stock voice is native to (the model's own table); the fine-tune's voice speaks Bulgarian. A voice
+    # not listed here is grouped under "other".
+    NATIVE = {"plamen": "bulgarian", "ryan": "english", "aiden": "english", "vivian": "chinese", "serena": "chinese",
+              "uncle_fu": "chinese", "dylan": "chinese", "eric": "chinese", "ono_anna": "japanese", "sohee": "korean"}
+
+    def __init__(self, asr_url: str, tts_urls: list[str], voice: str | None = None,
                  ignored_languages: frozenset[str] | set[str] = frozenset()):
         self.asr = asr_url.rstrip("/")
-        self.tts = tts_url.rstrip("/")
+        self.tts_servers = [url.rstrip("/") for url in tts_urls]
         # Languages the recognizer may name that are not wanted: noise and breath are often heard as one of them (Chinese,
         # for Qwen3-ASR). An utterance heard as one comes back with no text, so the chat goes on listening.
         self.ignored_languages = frozenset(name.lower() for name in ignored_languages)
@@ -881,12 +895,41 @@ class VoiceServices:
             pass
         return []
 
+    def _catalog(self, key: str | None) -> dict[str, str]:
+        """{voice: the speech server that owns it}. A voice is spoken only by its own server, whatever the language."""
+        catalog: dict[str, str] = {}
+        for base in self.tts_servers:
+            for name in self._voices(base, key):
+                catalog.setdefault(name, base)
+        return catalog
+
+    def _default(self, catalog: dict[str, str], language: str | None) -> str | None:
+        """The voice for a language that no setting names: one native to it, else the configured voice, else the first."""
+        native = next((name for name in catalog if self.NATIVE.get(name) == language), None)
+        return native or (self.voice if self.voice in catalog else next(iter(catalog), None))
+
     def info(self, key: str | None) -> dict:
-        """The models behind talk mode and the voices the speech model offers: what the chat page shows and lets the
-        admin pick. A server that does not answer leaves its field empty."""
-        voices = self._voices(self.tts, key)
-        default = self.voice if self.voice in voices else (voices[0] if voices else None)
-        return {"asr": self._model(self.asr, key), "tts": self._model(self.tts, key), "voices": voices, "voice": default}
+        """The models behind talk mode and the voices the speech models offer, each with its native language, and the
+        languages a voice can be chosen for: what the voice settings page shows. A server that does not answer leaves
+        its voices out."""
+        catalog = self._catalog(key)
+        models = [self._model(base, key) for base in self.tts_servers]
+        return {"asr": self._model(self.asr, key), "tts": " + ".join(m for m in models if m) or None,
+                "voices": [{"id": name, "language": self.NATIVE.get(name, "other")} for name in catalog],
+                "languages": sorted(self.TTS_LANGUAGES), "voice": self._default(catalog, None)}
+
+    def resolve(self, key: str | None, prefs: dict | None = None, voice: str | None = None,
+                language: str | None = None) -> tuple[str, str] | None:
+        """(server, voice) for a reply: the voice asked for, else the one the owner set for the reply's language, else the
+        owner's default, else a native or the configured one. A name no server offers is skipped, so a voice saved before
+        the voices changed still speaks."""
+        catalog = self._catalog(key)
+        prefs = prefs or {}
+        for name in (voice, (prefs.get("language_voices") or {}).get(language), prefs.get("voice")):
+            if name in catalog:
+                return catalog[name], name
+        name = self._default(catalog, language)
+        return (catalog[name], name) if name else None
 
     def transcribe(self, wav: bytes, key: str | None) -> tuple[int, bytes, str]:
         """POST an utterance (a WAV file) to the ASR server. The answer is {"text", "language"}:
@@ -918,26 +961,29 @@ class VoiceServices:
             return 502, b'{"error":{"message":"the speech server answered with something else than a transcript"}}', "application/json"
         return 200, json.dumps(reply, ensure_ascii=False).encode(), "application/json"
 
-    def speak(self, text: str, key: str | None, voice: str | None = None,
-              language: str | None = None) -> tuple[int, bytes, str]:
-        """POST reply text to the TTS server; its answer is a WAV file. A voice the model does not have (one saved
-        before the voices changed, say) is replaced by its first. The language goes along where the model names it."""
-        payload = {"input": text, "response_format": "wav"}
-        model = self._model(self.tts, key)
+    def speak(self, text: str, key: str | None, voice: str | None = None, language: str | None = None,
+              prefs: dict | None = None) -> tuple[int, bytes, str]:
+        """POST reply text to the voice's own TTS server; its answer is a WAV file. The language goes along where the
+        models name it; a server that does not know it (the stock one has no Bulgarian) is asked again without."""
+        target = self.resolve(key, prefs, voice, language)
+        if target is None:
+            return 502, b'{"error":{"message":"the speech server is unreachable"}}', "application/json"
+        base, name = target
+        payload = {"input": text, "response_format": "wav", "voice": name}
+        model = self._model(base, key)
         if model:
             payload["model"] = model
-        voices = self._voices(self.tts, key)
-        wanted = voice or self.voice
-        if voices and wanted not in voices:
-            wanted = voices[0]
-        if wanted:
-            payload["voice"] = wanted
         if language in self.TTS_LANGUAGES:
             payload["language"] = language
-        request = urllib.request.Request(
-            self.tts + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
-            headers=self._headers(key, "application/json"))
-        return self._open(request, 180.0)
+        for attempt in range(2):
+            request = urllib.request.Request(
+                base + "/v1/audio/speech", data=json.dumps(payload).encode(), method="POST",
+                headers=self._headers(key, "application/json"))
+            status, body, content_type = self._open(request, 180.0)
+            if status == 200 or "language" not in payload or b"unsupported Qwen3-TTS language" not in body:
+                break
+            del payload["language"]
+        return status, body, content_type
 
 
 def _read_text(path: Path) -> str | None:
@@ -2855,7 +2901,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(429, "too many tries")
             return self._error(404, "not_found")
         owner_prefs = (self.server.chat_store.voice_prefs(share["owner"]) if self.server.chat_store is not None
-                       else {"voice": None, "speed": 1.0, "reply_style": ""})
+                       else dict(DEFAULT_VOICE_PREFS))
         if method == "GET":
             if kind == "conversation":
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -2978,7 +3024,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if kind == "transcribe":
                 status, answer, content_type = voice.transcribe(wav, key)
             else:
-                status, answer, content_type = voice.speak(text, key, owner_prefs.get("voice"), language)
+                status, answer, content_type = voice.speak(text, key, None, language, owner_prefs)
         finally:
             self.server.guest_speech.release()
         if status != 200:
@@ -2994,7 +3040,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         info = self.server.voice.info(self.server.chat_key)
         store = self.server.chat_store
         info["prefs"] = (store.voice_prefs(self._chat_owner()) if store is not None
-                         else {"voice": None, "speed": 1.0, "avatar": True, "reply_style": ""})
+                         else dict(DEFAULT_VOICE_PREFS))
         self._json(200, json.dumps(info).encode())
 
     def _voice_prefs_put(self):
@@ -3013,7 +3059,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 or not isinstance(speed, (int, float)) or not 0.5 <= speed <= 2.0
                 or not (name is None or (isinstance(name, str) and VOICE_NAME.fullmatch(name)))):
             return self._error(400, "expected {voice: name or null, speed: 0.5 to 2}")
-        offered = voice.info(self.server.chat_key)["voices"]
+        offered = {v["id"] for v in voice.info(self.server.chat_key)["voices"]}
+        per_language = body.get("language_voices")
+        if per_language is not None and not (
+                isinstance(per_language, dict) and all(
+                    language in voice.TTS_LANGUAGES and isinstance(chosen, str) and (chosen in offered or not offered)
+                    for language, chosen in per_language.items())):
+            return self._error(400, "language_voices is {language: a voice the speech servers have}")
         if name is not None and offered and name not in offered:
             return self._error(400, "the speech server has no such voice")
         avatar = body.get("avatar")
@@ -3023,7 +3075,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if style is not None and not (isinstance(style, str) and len(style) <= STYLE_MAX):
             return self._error(400, f"reply_style is text of at most {STYLE_MAX} characters")
         self._json(200, json.dumps(store.set_voice_prefs(
-            self._chat_owner(), name, float(speed), avatar, style.strip() if style is not None else None)).encode())
+            self._chat_owner(), name, float(speed), avatar, style.strip() if style is not None else None, per_language)).encode())
 
     def _avatar_put(self):
         """PUT /api/chat/avatar {enabled}: show or hide the chat's avatar for the admin's account;
@@ -3070,7 +3122,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(400, "voice is a string")
             if language is not None and not (isinstance(language, str) and LANGUAGE_NAME.fullmatch(language)):
                 return self._error(400, "language is a lower-case name such as bulgarian")
-            status, answer, content_type = voice.speak(text, key, name, language)
+            store = self.server.chat_store
+            prefs = store.voice_prefs(self._chat_owner()) if store is not None else None
+            status, answer, content_type = voice.speak(text, key, name, language, prefs)
         self._send(status, answer, content_type if status == 200 else "application/json")
 
     # -- the private library: /api/library/* (read with the admin or the library token, change
@@ -3405,13 +3459,14 @@ def parse_args(argv=None):
     parser.add_argument("--asr-url", metavar="URL",
                         help="a `gufo serve asr` server; with --tts-url it turns on the chat's "
                              "talk mode (the admin's, using --chat-key-file)")
-    parser.add_argument("--tts-url", metavar="URL", help="a `gufo serve tts` server")
+    parser.add_argument("--tts-url", metavar="URL", action="append",
+                        help="a `gufo serve tts` server; repeat for more (each voice is spoken by the server that has it)")
     parser.add_argument("--asr-ignore-language", metavar="LANGUAGE", action="append", default=[],
                         help="treat an utterance the recognizer hears as this language (a lower-case name such as "
                              "chinese) as noise: no text comes back and talk mode keeps listening. Repeatable")
     parser.add_argument("--tts-voice", metavar="NAME",
-                        help="the voice talk mode speaks with (a CustomVoice speaker or a "
-                             "registered clone); the server's default when unset")
+                        help="the voice used where an account has not chosen one (a CustomVoice speaker or a "
+                             "registered clone); else one native to the language, else the first")
     parser.add_argument("--chat-store", type=Path,
                         default=config / "gufo-monitor" / "chats.sqlite",
                         help="the chats and projects of every signed-in user, so one account sees "
