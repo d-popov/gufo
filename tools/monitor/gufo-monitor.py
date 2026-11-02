@@ -914,7 +914,7 @@ class VoiceServices:
         its voices out."""
         catalog = self._catalog(key)
         models = [self._model(base, key) for base in self.tts_servers]
-        return {"asr": self._model(self.asr, key), "tts": " + ".join(m for m in models if m) or None,
+        return {"asr": self._model(self.asr, key), "tts": " + ".join(dict.fromkeys(m for m in models if m)) or None,
                 "voices": [{"id": name, "language": self.NATIVE.get(name, "other")} for name in catalog],
                 "languages": sorted(self.TTS_LANGUAGES), "voice": self._default(catalog, None)}
 
