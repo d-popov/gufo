@@ -53,9 +53,9 @@ def error_rates(pairs) -> dict:
             "words": word_total, "chars": char_total}
 
 
-def transcribe(url: str, wav: bytes, key, model) -> dict:
+def transcribe(url: str, wav: bytes, key, model, language=None) -> dict:
     boundary = uuid.uuid4().hex
-    parts = ([("model", model)] if model else []) + [("response_format", "verbose_json")]
+    parts = ([("model", model)] if model else []) + ([("language", language)] if language else []) + [("response_format", "verbose_json")]
     body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode() for n, v in parts)
     body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n'
              f'Content-Type: audio/wav\r\n\r\n').encode() + wav + f"\r\n--{boundary}--\r\n".encode()
@@ -115,6 +115,7 @@ def main():
     p.add_argument("--api-key-file", type=Path)
     p.add_argument("--model")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--language", help="tell the server the language (a name such as French) instead of letting it detect it")
     p.add_argument("--worst", type=int, default=5)
     p.add_argument("--out", type=Path, help="save every clip here as it is done (and continue from it if it exists)")
     p.add_argument("--rescore", type=Path, help="score a file saved with --out again, without the server")
@@ -128,7 +129,7 @@ def main():
         key = args.api_key_file.read_text().strip() if args.api_key_file else None
         rows = [json.loads(line) for line in args.jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
         rows = rows[: args.limit] if args.limit else rows
-        results = score(rows, lambda audio: transcribe(args.url, Path(audio).read_bytes(), key, args.model), args.out,
+        results = score(rows, lambda audio: transcribe(args.url, Path(audio).read_bytes(), key, args.model, args.language), args.out,
                         lambda done, total: print(f"{done}/{total}", flush=True))
     summary = summarize(results, args.worst)
     worst = summary.pop("worst")
