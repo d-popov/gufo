@@ -36,6 +36,9 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from language_layout import collate as collate_rows, tagged_rows  # noqa: E402
+
 SPEAKER_ROW = 3000  # the codec-embedding row the official script gives the new speaker
 
 
@@ -63,6 +66,13 @@ def parse_args(argv=None):
                    help="minutes between resume checkpoints (a save of the 1.7B model takes 15-75 s: 1-6%% of a 30-minute interval)")
     p.add_argument("--keep", type=int, default=2, help="resume checkpoints kept (each holds weights and optimizer)")
     p.add_argument("--resume", default="none", help="'auto' (newest in OUTPUT_DIR/ckpt), a checkpoint directory, or 'none'")
+    p.add_argument("--language-id", action="append", default=[], metavar="NAME=ID",
+                   help="a language the model has no ID for, e.g. bulgarian=2100 (a talker codec token not in use); "
+                        "written to the exported config.json so the server accepts the name. Repeatable")
+    p.add_argument("--default-language", metavar="NAME", help="the language of rows that have no `language` field")
+    p.add_argument("--tagged-fraction", type=float, default=0.0,
+                   help="share of the rows whose language the model has an ID for that train with it (the rest "
+                        "train as auto); 0 trains every row as auto, the upstream behavior")
     p.add_argument("--export-every-epoch", action="store_true", help="also write checkpoint-epoch-N/ in the final layout")
     p.add_argument("--export-only", action="store_true", help="write final/ from --resume and exit")
     return p.parse_args(argv)
@@ -144,6 +154,17 @@ def find_resume(spec: str, out: Path) -> Path | None:
     return Path(spec)
 
 
+def language_ids(args, config: dict) -> dict:
+    """Language name -> codec token ID: the ones the model has, plus --language-id."""
+    ids = {name.lower(): int(i) for name, i in config.get("talker_config", {}).get("codec_language_id", {}).items()}
+    for entry in args.language_id:
+        name, _, number = entry.partition("=")
+        if not name.strip() or not number.isdigit():
+            sys.exit(f"--language-id {entry!r}: expected NAME=ID, such as bulgarian=2100")
+        ids[name.strip().lower()] = int(number)
+    return ids
+
+
 def export_model(model_state: dict, speaker, args, dest: Path) -> None:
     """The official layout: the base model's files, config switched to custom_voice with the new
     speaker, and model.safetensors in bf16 without the speaker encoder."""
@@ -154,6 +175,7 @@ def export_model(model_state: dict, speaker, args, dest: Path) -> None:
     talker = config.get("talker_config", {})
     talker["spk_id"] = {args.speaker_name: SPEAKER_ROW}
     talker["spk_is_dialect"] = {args.speaker_name: False}
+    talker.setdefault("codec_language_id", {}).update(language_ids(args, config))
     config["talker_config"] = talker
     (dest / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     state = {k: v.detach().to("cpu", torch.bfloat16) for k, v in model_state.items()
@@ -262,7 +284,27 @@ def main() -> int:
     qwen = Qwen3TTSModel.from_pretrained(str(args.init_model), torch_dtype=dtype, attn_implementation=args.attn)
     config = AutoConfig.from_pretrained(str(args.init_model))
     rows = [json.loads(line) for line in args.train_jsonl.read_text().splitlines() if line.strip()]
-    dataset = TTSDataset(rows, qwen.processor, config)
+    if args.default_language:
+        for row in rows:
+            row.setdefault("language", args.default_language)
+    base_config = json.loads((args.init_model / "config.json").read_text(encoding="utf-8"))
+    ids = language_ids(args, base_config)
+    tags = tagged_rows(rows, ids, args.tagged_fraction, args.seed)
+    if args.tagged_fraction:
+        print(f"{sum(tag is not None for tag in tags)} of {len(rows)} rows train with a language ID", flush=True)
+
+    class Dataset(TTSDataset):
+        """Upstream's rows; the layout, which depends on the language ID, is language_layout's."""
+
+        def __getitem__(self, index):
+            item = super().__getitem__(index)
+            item["language_id"] = tags[index]
+            return item
+
+        def collate_fn(self, batch):
+            return collate_rows(batch, self.config)
+
+    dataset = Dataset(rows, qwen.processor, config)
     optimizer = AdamW(qwen.model.parameters(), lr=args.lr, weight_decay=0.01)
     model, optimizer = accelerator.prepare(qwen.model, optimizer)
     model.train()
@@ -327,7 +369,7 @@ def step(model, batch, accelerator):
         input_codec_ids = input_ids[:, :, 1]
         input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
         input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-        input_codec_embedding[:, 6, :] = speaker_embedding
+        input_codec_embedding[torch.arange(input_ids.shape[0]), batch["speaker_index"], :] = speaker_embedding
         input_embeddings = input_text_embedding + input_codec_embedding
         for i in range(1, 16):
             codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])

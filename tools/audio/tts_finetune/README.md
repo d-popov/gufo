@@ -49,6 +49,15 @@ exports a checkpoint on demand.
 official script trains bf16 weights); compute is bf16 either way. `--attn sdpa` is the default because
 `flash_attention_2` is not built for this GPU.
 
+**Language IDs.** Qwen3-TTS prompts its talker either with "language auto" or with a language's codec token, and
+`gufo serve tts` builds both. The upstream script trains every row as auto. With `--tagged-fraction F` the share `F` of
+the rows whose `language` the model has an ID for (or that `--default-language` names) train with the ID, in the same
+prefix the server builds (`language_layout.py`; a tagged row's text, codes, labels and speaker slot sit one position
+later), and the rest train as auto, so the model answers both to a named language and to none. A language the model
+lacks takes an unused talker codec token: `--language-id bulgarian=2100 --default-language bulgarian
+--tagged-fraction 0.5`. The ID is written to the exported `config.json`, which is what makes the server accept
+`"language": "bulgarian"`. Whether a new token learns a language well is not validated; listen to the held-out clips.
+
 **A new language is not validated.** The upstream script handles one speaker and gives the model no
 language tag for it. A community thread ([QwenLM/Qwen3-TTS#323](https://github.com/QwenLM/Qwen3-TTS/issues/323))
 reports a Bengali fine-tune that kept a Hindi accent and suggests registering a codec language ID in

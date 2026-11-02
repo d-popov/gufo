@@ -6,6 +6,7 @@ Python has both: ~/.unsloth/studio/unsloth_studio/bin/python tests/tools/tts_fin
 
 import argparse
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -158,6 +159,130 @@ class ResumeTest(unittest.TestCase):
             self.assertEqual([l["step"] for l in lines], [1, 2, 1, 2])
             state = __import__("json").loads((out / "state.json").read_text())
             self.assertEqual((state["total_steps"], state["steps_per_epoch"], state["global_step"]), (4, 2, 4))
+
+
+try:
+    BUILD = importlib.util.spec_from_file_location(
+        "tts_build", Path(__file__).parents[2] / "tools/audio/tts_finetune/build_dataset.py")
+    dataset = importlib.util.module_from_spec(BUILD)
+    BUILD.loader.exec_module(dataset)
+except ImportError:  # pragma: no cover
+    dataset = None
+
+
+@unittest.skipIf(dataset is None, "pyarrow, soundfile and scipy are not installed")
+class DatasetFilterTest(unittest.TestCase):
+    def verdict(self, text, seconds):
+        return dataset.keep_clip(text, seconds, 2.0, 15.0, 7.0, 21.0, r"[\u0400-\u04FF]")
+
+    def test_a_transcript_that_cannot_belong_to_the_audio_is_dropped(self):
+        sentence = "Всичко е наред, помисли се той."  # 31 characters
+        self.assertIsNone(self.verdict(sentence, 2.5))
+        self.assertEqual(self.verdict(sentence, 12.0), "chars per second")  # text far too short for it
+        self.assertEqual(self.verdict(sentence * 4, 3.0), "chars per second")  # text far too long for it
+
+    def test_other_scripts_and_bad_durations_are_dropped(self):
+        self.assertEqual(self.verdict("This is an English sentence read aloud.", 3.0), "script")
+        self.assertEqual(self.verdict("Всичко е наред.", 1.0), "duration")
+        self.assertEqual(self.verdict("  ", 3.0), "empty text")
+
+    def test_resampling_keeps_the_duration(self):
+        import numpy
+        samples = numpy.zeros(44100, dtype=numpy.float32)
+        self.assertEqual(len(dataset.to_rate(samples, 44100)), dataset.RATE)
+
+
+try:
+    LAYOUT = importlib.util.spec_from_file_location(
+        "tts_layout", Path(__file__).parents[2] / "tools/audio/tts_finetune/language_layout.py")
+    layout = importlib.util.module_from_spec(LAYOUT)
+    LAYOUT.loader.exec_module(layout)
+except ImportError:  # pragma: no cover
+    layout = None
+
+# Token IDs of the real talker config; the values only have to differ from each other.
+TALKER = argparse.Namespace(codec_think_id=2154, codec_nothink_id=2155, codec_think_bos_id=2156,
+                            codec_think_eos_id=2157, codec_pad_id=2148, codec_bos_id=2149, codec_eos_token_id=2150)
+CONFIG = argparse.Namespace(talker_config=TALKER, tts_pad_token_id=151671, tts_bos_token_id=151672,
+                            tts_eos_token_id=151673)
+BULGARIAN = 2100
+
+
+def example(text_len, codes, language_id=None):
+    """role tokens 11 12 13, then text_len - 3 text tokens (the upstream script cuts 5 off the end)."""
+    ids = torch.tensor([[11, 12, 13] + [100 + n for n in range(text_len - 3)]])
+    audio = torch.arange(1, codes + 1).unsqueeze(1).repeat(1, 16)
+    return {"text_ids": ids, "audio_codes": audio, "ref_mel": torch.zeros(1, 4, 8), "language_id": language_id}
+
+
+@unittest.skipIf(layout is None, "torch is not installed")
+class LanguageLayoutTest(unittest.TestCase):
+    def codec(self, batch, row):
+        return batch["input_ids"][row, :, 1].tolist()
+
+    def test_an_untagged_row_is_the_auto_prefix_the_server_builds(self):
+        batch = layout.collate([example(6, 3)], CONFIG)
+        # [nothink, think_bos, think_eos, speaker, pad] from position 3, then pads under the text, bos, codes, eos
+        self.assertEqual(self.codec(batch, 0)[3:8], [2155, 2156, 2157, 0, 2148])
+        self.assertEqual(batch["speaker_index"].tolist(), [6])
+        self.assertEqual(batch["input_ids"][0, 7, 0].item(), CONFIG.tts_bos_token_id)
+
+    def test_a_tagged_row_is_the_explicit_prefix_the_server_builds_and_everything_after_it_moves_by_one(self):
+        plain = layout.collate([example(6, 3)], CONFIG)
+        tagged = layout.collate([example(6, 3, BULGARIAN)], CONFIG)
+        # [think, think_bos, language_id, think_eos, speaker, pad]
+        self.assertEqual(self.codec(tagged, 0)[3:9], [2154, 2156, BULGARIAN, 2157, 0, 2148])
+        self.assertEqual(tagged["speaker_index"].tolist(), [7])
+        self.assertFalse(tagged["codec_embedding_mask"][0, 7].item())
+        self.assertTrue(tagged["codec_embedding_mask"][0, 6].item())
+        self.assertEqual(tagged["input_ids"][0, 8, 0].item(), CONFIG.tts_bos_token_id)
+        # From the speaker slot on, a tagged row is the untagged one shifted right by one: the text, bos,
+        # codes and eos, the labels, the code rows and the masks.
+        for name in ("input_ids", "codec_0_labels", "codec_ids", "codec_mask"):
+            before, after = plain[name][0], tagged[name][0]
+            self.assertEqual(after[8:].tolist()[: before[7:].shape[0] - 1], before[7:-1].tolist(), name)
+        self.assertEqual(tagged["codec_mask"][0].sum().item(), plain["codec_mask"][0].sum().item())
+        self.assertEqual(tagged["attention_mask"][0].sum().item(), plain["attention_mask"][0].sum().item() + 1)
+
+    def test_tagged_and_untagged_rows_share_a_batch_without_disturbing_each_other(self):
+        alone = [layout.collate([example(7, 4)], CONFIG), layout.collate([example(6, 3, BULGARIAN)], CONFIG)]
+        both = layout.collate([example(7, 4), example(6, 3, BULGARIAN)], CONFIG)
+        self.assertEqual(both["speaker_index"].tolist(), [6, 7])
+        for row, single in enumerate(alone):
+            length = int(single["attention_mask"][0].sum())
+            for name in ("input_ids", "codec_0_labels", "codec_ids"):
+                self.assertEqual(both[name][row, :length].tolist(), single[name][0, :length].tolist(), (row, name))
+
+    def test_without_tags_it_matches_the_upstream_collate(self):
+        # Needs the upstream checkout setup.sh makes and qwen-tts: QWEN3_TTS_FINETUNING_DIR=.../finetuning
+        directory = os.environ.get("QWEN3_TTS_FINETUNING_DIR")
+        if not directory:
+            self.skipTest("QWEN3_TTS_FINETUNING_DIR is not set")
+        sys.path.insert(0, directory)
+        try:
+            from dataset import TTSDataset
+        except ImportError as error:
+            self.skipTest(f"upstream dataset.py does not import: {error}")
+        upstream = TTSDataset.__new__(TTSDataset)
+        upstream.config, upstream.lag_num = CONFIG, -1
+        rows = [example(9, 5), example(6, 3)]
+        expected = upstream.collate_fn([{k: v for k, v in r.items() if k != "language_id"} for r in rows])
+        actual = layout.collate(rows, CONFIG)
+        for name, value in expected.items():
+            self.assertTrue(torch.equal(value, actual[name]), name)
+
+    def test_which_rows_are_tagged_depends_only_on_the_row_and_the_seed(self):
+        rows = [{"language": "Bulgarian"}] * 400 + [{"language": "klingon"}, {}]
+        ids = {"bulgarian": BULGARIAN}
+        first = layout.tagged_rows(rows, ids, 0.5, 7)
+        self.assertEqual(first, layout.tagged_rows(rows, ids, 0.5, 7))
+        self.assertNotEqual(first, layout.tagged_rows(rows, ids, 0.5, 8))
+        self.assertTrue(150 < sum(tag == BULGARIAN for tag in first[:400]) < 250)
+        self.assertEqual(first[400:], [None, None], "a language without an ID, or none, is never tagged")
+        self.assertEqual(layout.tagged_rows(rows, ids, 0.0, 7), [None] * 402)
+        # Changing one row's language leaves the others' choices alone.
+        changed = layout.tagged_rows([{"language": "klingon"}] + rows[1:], ids, 0.5, 7)
+        self.assertEqual(changed[1:], first[1:])
 
 
 if __name__ == "__main__":
