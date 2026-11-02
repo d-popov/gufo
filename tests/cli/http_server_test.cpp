@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cassert>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -19,10 +18,10 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/decision_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -36,266 +35,6 @@ using gufo::server::Logger;
 using gufo::server::LogLevel;
 using gufo::server::LogLevelFromName;
 using gufo::server::LogLevelName;
-
-void TestAuthorization() {
-  RunningServer secured({.api_key = "test-secret"});
-  for (const std::string path :
-       {"/health", "/ready", "/v1/models", "/v1/chat/completions",
-        "/v1/responses", "/v1/messages", "/v1/audio/speech",
-        "/v1/audio/transcriptions", "/v1/video/generations", "/echo"}) {
-    ExpectStatus(secured.Send("POST " + path + " HTTP/1.1\r\n\r\n"), 401);
-  }
-  for (const std::string header :
-       {"", "Authorization: Bearer wrong\r\n",
-        "Authorization: Basic test-secret\r\n",
-        "Authorization: Bearer test-secret\r\nAuthorization: Bearer "
-        "test-secret\r\n"}) {
-    const auto response =
-        secured.Send("GET /v1/models HTTP/1.1\r\n" + header + "\r\n");
-    ExpectStatus(response, 401);
-    assert(response.find("WWW-Authenticate: Bearer") != std::string::npos);
-    assert(response.find("test-secret") == std::string::npos);
-  }
-  assert(secured.backend->calls == 0);
-  ExpectStatus(secured.Send("GET /v1/models HTTP/1.1\r\naUtHoRiZaTiOn: bEaReR  "
-                            "test-secret\r\n\r\n"),
-               200);
-  ExpectStatus(secured.Send("OPTIONS /v1/chat/completions HTTP/1.1\r\n\r\n"),
-               204);
-  const std::string body = R"({"prompt":"hi","max_tokens":1})";
-  ExpectStatus(secured.Send("POST /v1/completions HTTP/1.1\r\nAuthorization: "
-                            "Bearer test-secret\r\n"
-                            "Content-Length: " +
-                            std::to_string(body.size()) + "\r\n\r\n" + body),
-               200);
-  assert(secured.backend->calls == 1);
-}
-
-void TestApiKeyFileParsing() {
-  using gufo::server::ApiKeyAccess;
-  using gufo::server::ApiKeyDigest;
-  using gufo::server::ApiKeyTable;
-  const std::string alice = ApiKeyDigest("alice-secret");
-  std::string upper_bob = ApiKeyDigest("bob-secret");
-  for (char& c : upper_bob)
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  std::string error;
-  const auto table = ApiKeyTable::Parse(
-      "# name credential options\n\n  alice sha256:" + alice +
-          " models=fn,fn-sub\r\nbob\tsha256:" + upper_bob + "\nwatch sha256:" +
-          ApiKeyDigest("watch-secret") + " access=monitor\n",
-      &error);
-  assert(table.has_value());
-  assert(table->size() == 3);
-  const auto* key = table->match("alice-secret");
-  assert(key != nullptr && key->name == "alice");
-  assert(key->access == ApiKeyAccess::kInference);
-  assert(key->allows_model("fn-sub") && !key->allows_model("other"));
-  // Uppercase hex matches, and a key without models allows every model.
-  key = table->match("bob-secret");
-  assert(key != nullptr && key->allows_model("anything"));
-  assert(table->match("watch-secret")->access == ApiKeyAccess::kMonitor);
-  assert(table->match("alice-secret ") == nullptr);
-  assert(table->match("") == nullptr);
-
-  const std::string good = " sha256:" + alice;
-  for (const auto& [text, message] :
-       std::vector<std::pair<std::string, std::string>>{
-           {"", "no keys"},
-           {"# only a comment\n", "no keys"},
-           {"alice", "line 1: expected"},
-           {"al ice" + good, "line 1: credential"},
-           {"al/ice" + good, "line 1: key name"},
-           {"alice sha256:abc", "line 1: credential"},
-           {"alice plain-secret", "line 1: credential"},
-           {"alice" + good + " access=admin", "line 1: access"},
-           {"alice" + good + " colour=red", "line 1: unknown or repeated"},
-           {"alice" + good + " models=a models=b",
-            "line 1: unknown or repeated"},
-           {"alice" + good + " models=a,,b", "line 1: models"},
-           {"alice" + good + " models=", "line 1: models"},
-           {"alice" + good + " models=a,", "line 1: models"},
-           {"alice" + good + " access=monitor models=a", "line 1: a monitor"},
-           {"alice" + good + "\nalice sha256:" + ApiKeyDigest("x"),
-            "line 2: duplicate key name"},
-           {"alice" + good + "\nbob" + good, "line 2: credential of 'bob'"},
-       }) {
-    error.clear();
-    assert(!ApiKeyTable::Parse(text, &error).has_value());
-    if (!error.starts_with(message)) {
-      std::cerr << text << " -> " << error << '\n';
-      std::abort();
-    }
-  }
-}
-
-// With session classes the text service serves several models; a key's
-// models are checked against the class the request runs on.
-void TestApiKeyFileSessionClasses() {
-  using gufo::server::ApiKeyDigest;
-  const auto directory =
-      std::filesystem::temp_directory_path() /
-      ("gufo-class-keys-" + std::to_string(gufo::platform::ProcessId()));
-  std::filesystem::create_directories(directory);
-  const auto path = directory / "keys";
-  std::ofstream(path) << "sub sha256:" << ApiKeyDigest("sub-secret")
-                      << " models=sub\nowner sha256:"
-                      << ApiKeyDigest("owner-secret") << "\n";
-  {
-    RunningServer server({.api_key_file = path});
-    server.backend->served = {{"main", 1000}, {"sub", 32}};
-    const auto send = [&](const std::string& key, const std::string& body) {
-      return server.Send(
-          "POST /v1/completions HTTP/1.1\r\nAuthorization: Bearer " + key +
-          "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
-          body);
-    };
-    const auto body = [](const std::string& model) {
-      return (model.empty() ? std::string("{")
-                            : R"({"model":")" + model + "\",") +
-             R"("prompt":"hi","max_tokens":1})";
-    };
-    ExpectStatus(send("sub-secret", body("sub")), 200);
-    // The first class runs a request without a model.
-    for (const std::string model : {"main", "", "nope"}) {
-      const auto response = send("sub-secret", body(model));
-      ExpectStatus(response, 403);
-      assert(response.find("model_not_allowed") != std::string::npos);
-    }
-    ExpectStatus(send("owner-secret", body("main")), 200);
-    ExpectStatus(send("owner-secret", body("nope")), 404);
-    assert(server.backend->calls == 2);
-  }
-  std::filesystem::remove_all(directory);
-}
-
-void TestApiKeyFile() {
-  using gufo::server::ApiKeyDigest;
-  const auto directory =
-      std::filesystem::temp_directory_path() /
-      ("gufo-keys-" + std::to_string(gufo::platform::ProcessId()));
-  std::filesystem::create_directories(directory);
-  const auto path = directory / "keys";
-  const auto write = [&](const std::string& text) {
-    // Replace atomically, as an editor or admin tool would.
-    const auto temporary = directory / "keys.tmp";
-    std::ofstream(temporary) << text;
-    std::filesystem::rename(temporary, path);
-  };
-  write("alice sha256:" + ApiKeyDigest("alice-secret") + " models=test\n" +
-        "bob sha256:" + ApiKeyDigest("bob-secret") + " models=other\n" +
-        "watch sha256:" + ApiKeyDigest("watch-secret") + " access=monitor\n");
-
-  bool rejected = false;
-  try {
-    HttpServer both("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
-                    {.api_key = "x", .api_key_file = path});
-  } catch (const std::invalid_argument&) {
-    rejected = true;
-  }
-  assert(rejected);
-
-  const LogLevel previous = Logger::Level();
-  Logger::SetLevel(LogLevel::kInfo);
-  std::ostringstream logs;
-  auto* previous_sink = std::clog.rdbuf(logs.rdbuf());
-  {
-    RunningServer server({.api_key_file = path});
-    const auto send = [&](const std::string& key, const std::string& method,
-                          const std::string& target,
-                          const std::string& body = "") {
-      return server.Send(method + " " + target +
-                         " HTTP/1.1\r\nAuthorization: Bearer " + key +
-                         "\r\nContent-Length: " + std::to_string(body.size()) +
-                         "\r\n\r\n" + body);
-    };
-    const std::string completion = R"({"prompt":"hi","max_tokens":1})";
-    ExpectStatus(server.Post("/v1/completions", completion), 401);
-    ExpectStatus(send("nobody", "GET", "/health"), 401);
-    assert(server.backend->calls == 0);
-
-    // The key's name is its client identity for scheduling and logs.
-    const auto peer = send("alice-secret", "GET", "/peer");
-    ExpectStatus(peer, 200);
-    assert(peer.ends_with("\r\n\r\nalice"));
-    // The text service's model is `test`, which alice may use.
-    ExpectStatus(send("alice-secret", "POST", "/v1/completions", completion),
-                 200);
-    assert(server.backend->calls == 1);
-
-    // bob may only use `other`, which this server does not serve. A request
-    // naming no model runs on `test` and is refused; one naming `other` passes
-    // the key check and the route reports the model is not loaded. A query
-    // `?model=` does not select the model and cannot steer the check.
-    for (
-        const auto& [target, body, status] :
-        std::vector<std::tuple<std::string, std::string, int>>{
-            {"/v1/completions", completion, 403},
-            {"/v1/completions",
-             R"({"model":"other","prompt":"hi","max_tokens":1})", 404},
-            {"/v1/completions?model=other", completion, 403},
-            {"/completion", R"({"model":"other","prompt":"hi"})", 404},
-            {"/v1/chat/completions",
-             R"({"model":"other","messages":[{"role":"user","content":"hi"}]})",
-             404},
-            {"/peer", "", 403}}) {
-      const auto response =
-          send("bob-secret", body.empty() ? "GET" : "POST", target, body);
-      ExpectStatus(response, status);
-      if (status == 403)
-        assert(response.find("model_not_allowed") != std::string::npos);
-    }
-    assert(server.backend->calls == 1);
-    // A monitoring key reads status routes and nothing else.
-    for (const std::string target :
-         {"/health", "/ready", "/v1/models", "/props", "/slots", "/metrics"}) {
-      ExpectStatus(send("watch-secret", "GET", target), 200);
-    }
-    for (const auto& [method, target] :
-         std::vector<std::pair<std::string, std::string>>{
-             {"POST", "/v1/completions"},
-             {"POST", "/v1/chat/completions"},
-             {"GET", "/peer"},
-             {"POST", "/metrics"}}) {
-      const auto response = send("watch-secret", method, target, completion);
-      ExpectStatus(response, 403);
-      assert(response.find("permission_denied") != std::string::npos);
-    }
-    assert(server.backend->calls == 1);
-
-    // Edits apply without a restart: alice is revoked, carol added.
-    write("carol sha256:" + ApiKeyDigest("carol-secret") + "\n");
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (send("carol-secret", "GET", "/health").starts_with("HTTP/1.1 401")) {
-      assert(std::chrono::steady_clock::now() < deadline);
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    ExpectStatus(send("alice-secret", "GET", "/health"), 401);
-
-    // A broken file keeps the previous keys rather than locking everyone out
-    // or opening the server.
-    write("carol not-a-digest\n");
-    std::this_thread::sleep_for(std::chrono::milliseconds(2'500));
-    ExpectStatus(send("carol-secret", "GET", "/health"), 200);
-    ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 401);
-  }
-  std::clog.rdbuf(previous_sink);
-  Logger::SetLevel(previous);
-  const std::string log = logs.str();
-  assert(log.find("auth=key_file keys=3") != std::string::npos);
-  assert(log.find("event=received method=POST path=/v1/completions "
-                  "body_bytes=30 key=alice") != std::string::npos);
-  // The completion line names the key just before the memory fields.
-  assert(log.find("key=alice rss_mib=") != std::string::npos);
-  assert(log.find("error_code=model_not_allowed key=bob") != std::string::npos);
-  assert(log.find("event=api_keys_reloaded keys=1") != std::string::npos);
-  assert(log.find("event=api_keys_reload_failed") != std::string::npos);
-  for (const std::string secret :
-       {"alice-secret", "bob-secret", "watch-secret", "carol-secret"})
-    assert(log.find(secret) == std::string::npos);
-  std::filesystem::remove_all(directory);
-}
 
 struct CapturedLogs {
   std::string text;
@@ -405,7 +144,7 @@ std::string ChunkedBody(const std::string& response) {
 }
 
 // `--trace` keeps what a text request carried in and out under the id the
-// logs name. Polls, other routes and unauthenticated requests stay out.
+// logs name. Polls and other routes stay out.
 void TestContentTrace() {
   namespace fs = std::filesystem;
   using gufo::server::Trace;
@@ -420,16 +159,12 @@ void TestContentTrace() {
   std::string invalid_id;
   {
     RunningServer server(
-        {.api_key = "test-secret",
-         .sse_heartbeat_interval = std::chrono::milliseconds(5)});
+        {.sse_heartbeat_interval = std::chrono::milliseconds(5)});
     server.backend->SetOutput("<tool_call>leak");
-    const auto post = [&](std::string_view route, std::string_view body,
-                          bool authorized = true) {
-      return server.Send(
-          "POST " + std::string(route) + " HTTP/1.1\r\n" +
-          (authorized ? "Authorization: Bearer test-secret\r\n" : "") +
-          "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
-          std::string(body));
+    const auto post = [&](std::string_view route, std::string_view body) {
+      return server.Send("POST " + std::string(route) + " HTTP/1.1\r\n" +
+                         "Content-Length: " + std::to_string(body.size()) +
+                         "\r\n\r\n" + std::string(body));
     };
     const auto plain = post("/v1/completions",
                             R"({"prompt":"private-prompt","max_tokens":8})");
@@ -453,13 +188,8 @@ void TestContentTrace() {
     const auto invalid = post("/v1/completions", "{");
     ExpectStatus(invalid, 400);
     invalid_id = ResponseRequestId(invalid);
-    ExpectStatus(
-        post("/v1/completions", R"({"prompt":"unauthorized-prompt"})", false),
-        401);
     ExpectStatus(post("/echo", "echo-body"), 200);
-    ExpectStatus(server.Send("GET /health HTTP/1.1\r\nAuthorization: Bearer "
-                             "test-secret\r\n\r\n"),
-                 200);
+    ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
   }
   Trace::Close();
 
@@ -469,7 +199,6 @@ void TestContentTrace() {
   {
     std::ifstream input(path);
     for (std::string line; std::getline(input, line);) {
-      assert(line.find("unauthorized-prompt") == std::string::npos);
       assert(line.find("echo-body") == std::string::npos);
       records.push_back(gufo::json::parse(line));
     }
@@ -593,6 +322,11 @@ void TestLogLevelNames() {
 void TestFramingAndMetrics() {
   RunningServer server({.max_request_body_bytes = 8192});
   ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
+  // The root path answers like /health so llama-swap Load and preload
+  // succeed (#957).
+  const auto root = server.Send("GET / HTTP/1.1\r\n\r\n");
+  ExpectStatus(root, 200);
+  assert(root.find("\"status\":\"ok\"") != std::string::npos);
   for (const std::string header :
        {"Content-Length: nope", "Content-Length: -1", "Content-Length: 4junk",
         "Content-Length: 18446744073709551616",
@@ -2280,79 +2014,6 @@ void TestServedModelNames() {
   server.backend->rendered_prompt.reset();
 }
 
-// One backend serving two session classes: each name is listed with its own
-// context, selects its class, and is limited by that class's context.
-void TestSessionClassRouting() {
-  RunningServer server;
-  using gufo::json::parse;
-  const auto body = [](const std::string& response) {
-    return parse(response.substr(response.find("\r\n\r\n") + 4));
-  };
-  server.backend->served = {{"main", 1000}, {"sub", 32}};
-  const auto listing = body(server.Send("GET /v1/models HTTP/1.1\r\n\r\n"));
-  const auto& models = listing.find("data")->items();
-  assert(models.size() == 2);
-  assert(models[0].member_str("id") == "main" &&
-         models[0].member_size("context_length") == 1000);
-  assert(models[1].member_str("id") == "sub" &&
-         models[1].member_size("context_length") == 32);
-
-  auto response =
-      server.Post("/v1/completions", R"({"model":"sub","prompt":"hello"})");
-  ExpectStatus(response, 200);
-  assert(server.backend->LastCall().model == "sub");
-  assert(body(response).member_str("model") == "sub");
-  // A request without a model runs on the first class.
-  ExpectStatus(server.Post("/v1/completions", R"({"prompt":"hello"})"), 200);
-  assert(server.backend->LastCall().model == "main");
-
-  response =
-      server.Post("/v1/completions", R"({"model":"test","prompt":"hello"})");
-  ExpectStatus(response, 404);
-  assert(response.find("model_not_found") != std::string::npos);
-
-  const std::string long_prompt(40, 'x');
-  response = server.Post("/v1/completions", R"({"model":"sub","prompt":")" +
-                                                long_prompt + R"("})");
-  ExpectStatus(response, 400);
-  assert(response.find("context_length_exceeded") != std::string::npos);
-  ExpectStatus(server.Post("/v1/completions", R"({"model":"main","prompt":")" +
-                                                  long_prompt + R"("})"),
-               200);
-
-  response = server.Post(
-      "/v1/chat/completions",
-      R"({"model":"sub","messages":[{"role":"user","content":"hi"}]})");
-  ExpectStatus(response, 200);
-  assert(server.backend->LastCall().chat.model == "sub");
-  assert(body(response).member_str("model") == "sub");
-  ExpectStatus(
-      server.Post(
-          "/v1/chat/completions",
-          R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"),
-      404);
-
-  server.backend->sessions.resize(2);
-  server.backend->sessions[0].model = "main";
-  server.backend->sessions[0].context = 1000;
-  server.backend->sessions[1].model = "sub";
-  server.backend->sessions[1].context = 32;
-  const auto slots = body(server.Send("GET /slots HTTP/1.1\r\n\r\n"));
-  assert(slots.items()[0].member_str("model") == "main" &&
-         slots.items()[0].member_size("n_ctx") == 1000);
-  assert(slots.items()[1].member_str("model") == "sub" &&
-         slots.items()[1].member_size("n_ctx") == 32);
-  const auto props = body(server.Send("GET /props?model=sub HTTP/1.1\r\n\r\n"));
-  assert(props.member_str("model_alias") == "sub" &&
-         props.member_size("total_slots") == 1 &&
-         props.find("default_generation_settings")->member_size("n_ctx") == 32);
-  const auto all = body(server.Send("GET /props HTTP/1.1\r\n\r\n"));
-  assert(all.member_str("model_alias") == "test" &&
-         all.member_size("total_slots") == 2);
-  server.backend->sessions.clear();
-  server.backend->served.clear();
-}
-
 void TestRawCompletionStreaming() {
   RunningServer server;
   using gufo::json::parse;
@@ -2530,8 +2191,8 @@ void TestDeviceLoss() {
   assert(hook_calls == 1);
 
   server.backend->failure = 0;
-  for (const std::string path : {"/health", "/v1/health", "/healthz", "/ready",
-                                 "/v1/ready", "/readyz"}) {
+  for (const std::string path : {"/", "/health", "/v1/health", "/healthz",
+                                 "/ready", "/v1/ready", "/readyz"}) {
     const auto response = server.Send("GET " + path + " HTTP/1.1\r\n\r\n");
     ExpectStatus(response, 503);
     assert(response.find("\"status\":\"device_lost\"") != std::string::npos);
@@ -2770,9 +2431,11 @@ void TestLoadingResponder() {
   LoadingResponder loading("127.0.0.1", port);
   assert(loading.listening());
   // Health and readiness included: a 200 would read as ready to llama-swap
-  // and other pollers, then their requests would fail.
-  for (const std::string path : {"/health", "/v1/health", "/healthz", "/ready",
-                                 "/v1/ready", "/readyz", "/v1/models"}) {
+  // and other pollers, then their requests would fail. The root path answers
+  // like /health, so the loading gate holds it too (#957).
+  for (const std::string path :
+       {"/", "/health", "/v1/health", "/healthz", "/ready", "/v1/ready",
+        "/readyz", "/v1/models"}) {
     ExpectLoading(
         SendParts("127.0.0.1", port, {"GET " + path + " HTTP/1.1\r\n\r\n"}));
   }
@@ -3599,7 +3262,7 @@ void TestRawCompletionPromptProgress() {
 }
 
 // A server with only an embedding service and no text backend answers
-// /v1/embeddings behind the API key, lists the model, and reports readiness.
+// /v1/embeddings, lists the model, and reports readiness.
 std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
     bool ready) {
   using gufo::server::EmbeddingBatch;
@@ -3610,6 +3273,7 @@ std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
           .model_root = "/nonexistent/embeddinggemma",
           .validate_model = !ready,  // Validation fails without a checkpoint.
           .model_id = "embedding-test",
+          .model_aliases = {"embedding-alias"},
           .prompts = {},
           .default_prompt_name = {},
           .runner =
@@ -3638,13 +3302,60 @@ std::string EmbeddingPost(int port, std::string_view body,
                     "\r\n\r\n" + std::string(body)});
 }
 
+void TestDecisionService() {
+  auto service = std::make_shared<gufo::server::DecisionService>();
+  service->model_id = "d1-test";
+  service->model_aliases = {"d1-alias"};
+  service->multimodal = true;
+  int calls = 0;
+  service->decide = [&](const gufo::json::Value& request) {
+    ++calls;
+    if (!request.contains("questions"))
+      throw std::invalid_argument("questions required");
+    return gufo::json::parse(
+        R"({"answers":{"refund":{"type":"noul","noul":0.9}},"usage":{"input_tokens":38,"output_tokens":0}})");
+  };
+  HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+                    gufo::server::HttpServerOptions{}, nullptr, nullptr,
+                    service);
+  std::string error;
+  assert(server.start(&error));
+  std::jthread worker([&] { server.run(false); });
+  const int port = server.port();
+  const auto post = [&](std::string_view body) {
+    return EmbeddingPost(port, body, {}, "/v1/systemone");
+  };
+  ExpectStatus(post("{"), 400);
+  ExpectStatus(post("{}"), 400);
+  ExpectStatus(post(R"({"model":"other","questions":{}})"), 404);
+  assert(calls == 1);
+  const auto answer = post(R"({"model":"d1-test","questions":{"refund":{}}})");
+  ExpectStatus(answer, 200);
+  assert(answer.find("\"noul\":0.9") != std::string::npos);
+  assert(answer.find("\"output_tokens\":0") != std::string::npos);
+  assert(answer.find("\"model\":\"d1-test\"") != std::string::npos);
+  // A repeated --served-model-name alias answers and keeps the primary ID
+  // in the response (#957).
+  const auto aliased =
+      post(R"({"model":"d1-alias","questions":{"refund":{}}})");
+  ExpectStatus(aliased, 200);
+  assert(aliased.find("\"model\":\"d1-test\"") != std::string::npos);
+  for (const auto* path : {"/ready", "/v1/models"}) {
+    const auto reply = SendParts(
+        "127.0.0.1", port, {"GET " + std::string(path) + " HTTP/1.1\r\n\r\n"});
+    ExpectStatus(reply, 200);
+    assert(reply.find("d1-test") != std::string::npos);
+  }
+  server.stop();
+}
+
 void TestEmbeddingService() {
   const std::string request = R"({"model":"embedding-test","input":"hi"})";
   {
     auto service = MakeEmbeddingService(true);
     assert(service->ready());
     HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
-                      {.api_key = "test-secret"}, nullptr, service);
+                      gufo::server::HttpServerOptions{}, nullptr, service);
     std::string error;
     assert(server.start(&error));
     std::binary_semaphore finished{0};
@@ -3653,49 +3364,44 @@ void TestEmbeddingService() {
       finished.release();
     });
     const int port = server.port();
-    ExpectStatus(EmbeddingPost(port, request), 401);
-    ExpectStatus(EmbeddingPost(port, request, "Authorization: Bearer nope\r\n"),
-                 401);
-    const auto response =
-        EmbeddingPost(port, request, "Authorization: Bearer test-secret\r\n");
+    const auto response = EmbeddingPost(port, request);
     ExpectStatus(response, 200);
     assert(response.find("\"object\":\"list\"") != std::string::npos);
     assert(response.find("\"embedding\":[1,0]") != std::string::npos);
     assert(response.find("\"prompt_tokens\":4") != std::string::npos);
     assert(response.find("\"model\":\"embedding-test\"") != std::string::npos);
-    // llama.cpp's native route shares the service and the API key (#764).
+    // llama.cpp's native route shares the service (#764).
     const std::string native_request =
         R"({"model":"embedding-test","content":[{"prompt_string":"hi"}]})";
-    ExpectStatus(EmbeddingPost(port, native_request, {}, "/embeddings"), 401);
-    const auto native =
-        EmbeddingPost(port, native_request,
-                      "Authorization: Bearer test-secret\r\n", "/embeddings");
+    const auto native = EmbeddingPost(port, native_request, {}, "/embeddings");
     ExpectStatus(native, 200);
     assert(native.find("\r\n\r\n[{\"index\":0,\"embedding\":[[1,0]]}]") !=
            std::string::npos);
     const auto missing_model =
-        EmbeddingPost(port, R"({"model":"other","input":"hi"})",
-                      "Authorization: Bearer test-secret\r\n");
+        EmbeddingPost(port, R"({"model":"other","input":"hi"})");
     ExpectStatus(missing_model, 404);
     assert(missing_model.find("\"code\":\"model_not_found\"") !=
            std::string::npos);
-    const auto models = SendParts("127.0.0.1", port,
-                                  {"GET /v1/models HTTP/1.1\r\nAuthorization: "
-                                   "Bearer test-secret\r\n\r\n"});
+    // A repeated --served-model-name alias reaches the service and is listed
+    // beside the primary ID (#957).
+    const auto aliased =
+        EmbeddingPost(port, R"({"model":"embedding-alias","input":"hi"})");
+    ExpectStatus(aliased, 200);
+    const auto models =
+        SendParts("127.0.0.1", port, {"GET /v1/models HTTP/1.1\r\n\r\n"});
     ExpectStatus(models, 200);
     assert(models.find("\"id\":\"embedding-test\"") != std::string::npos);
+    assert(models.find("\"id\":\"embedding-alias\"") != std::string::npos);
     assert(models.find("\"capability\":\"embedding\"") != std::string::npos);
-    const auto ready = SendParts(
-        "127.0.0.1", port,
-        {"GET /ready HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n"});
+    const auto ready =
+        SendParts("127.0.0.1", port, {"GET /ready HTTP/1.1\r\n\r\n"});
     ExpectStatus(ready, 200);
     assert(ready.find("\"model\":\"embedding-test\"") != std::string::npos);
     // Routes of other modalities stay absent.
-    ExpectStatus(
-        SendParts("127.0.0.1", port,
-                  {"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: "
-                   "Bearer test-secret\r\nContent-Length: 2\r\n\r\n{}"}),
-        404);
+    ExpectStatus(SendParts("127.0.0.1", port,
+                           {"POST /v1/chat/completions HTTP/1.1\r\n"
+                            "Content-Length: 2\r\n\r\n{}"}),
+                 404);
     server.stop();
     worker.join();
   }
@@ -3792,6 +3498,335 @@ void TestEmbeddingService() {
   }
 }
 
+void TestSessionClassRouting() {
+  RunningServer server;
+  using gufo::json::parse;
+  const auto body = [](const std::string& response) {
+    return parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  server.backend->served = {{"main", 1000}, {"sub", 32}};
+  const auto listing = body(server.Send("GET /v1/models HTTP/1.1\r\n\r\n"));
+  const auto& models = listing.find("data")->items();
+  assert(models.size() == 2);
+  assert(models[0].member_str("id") == "main" &&
+         models[0].member_size("context_length") == 1000);
+  assert(models[1].member_str("id") == "sub" &&
+         models[1].member_size("context_length") == 32);
+
+  auto response =
+      server.Post("/v1/completions", R"({"model":"sub","prompt":"hello"})");
+  ExpectStatus(response, 200);
+  assert(server.backend->LastCall().model == "sub");
+  assert(body(response).member_str("model") == "sub");
+  // A request without a model runs on the first class.
+  ExpectStatus(server.Post("/v1/completions", R"({"prompt":"hello"})"), 200);
+  assert(server.backend->LastCall().model == "main");
+
+  response =
+      server.Post("/v1/completions", R"({"model":"test","prompt":"hello"})");
+  ExpectStatus(response, 404);
+  assert(response.find("model_not_found") != std::string::npos);
+
+  const std::string long_prompt(40, 'x');
+  response = server.Post("/v1/completions", R"({"model":"sub","prompt":")" +
+                                                long_prompt + R"("})");
+  ExpectStatus(response, 400);
+  assert(response.find("context_length_exceeded") != std::string::npos);
+  ExpectStatus(server.Post("/v1/completions", R"({"model":"main","prompt":")" +
+                                                  long_prompt + R"("})"),
+               200);
+
+  response = server.Post(
+      "/v1/chat/completions",
+      R"({"model":"sub","messages":[{"role":"user","content":"hi"}]})");
+  ExpectStatus(response, 200);
+  assert(server.backend->LastCall().chat.model == "sub");
+  assert(body(response).member_str("model") == "sub");
+  ExpectStatus(
+      server.Post(
+          "/v1/chat/completions",
+          R"({"model":"other","messages":[{"role":"user","content":"hi"}]})"),
+      404);
+
+  server.backend->sessions.resize(2);
+  server.backend->sessions[0].model = "main";
+  server.backend->sessions[0].context = 1000;
+  server.backend->sessions[1].model = "sub";
+  server.backend->sessions[1].context = 32;
+  const auto slots = body(server.Send("GET /slots HTTP/1.1\r\n\r\n"));
+  assert(slots.items()[0].member_str("model") == "main" &&
+         slots.items()[0].member_size("n_ctx") == 1000);
+  assert(slots.items()[1].member_str("model") == "sub" &&
+         slots.items()[1].member_size("n_ctx") == 32);
+  const auto props = body(server.Send("GET /props?model=sub HTTP/1.1\r\n\r\n"));
+  assert(props.member_str("model_alias") == "sub" &&
+         props.member_size("total_slots") == 1 &&
+         props.find("default_generation_settings")->member_size("n_ctx") == 32);
+  const auto all = body(server.Send("GET /props HTTP/1.1\r\n\r\n"));
+  assert(all.member_str("model_alias") == "test" &&
+         all.member_size("total_slots") == 2);
+  server.backend->sessions.clear();
+  server.backend->served.clear();
+}
+
+void TestApiKeyFileParsing() {
+  using gufo::server::ApiKeyAccess;
+  using gufo::server::ApiKeyDigest;
+  using gufo::server::ApiKeyTable;
+  const std::string alice = ApiKeyDigest("alice-secret");
+  std::string upper_bob = ApiKeyDigest("bob-secret");
+  for (char& c : upper_bob)
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  std::string error;
+  const auto table = ApiKeyTable::Parse(
+      "# name credential options\n\n  alice sha256:" + alice +
+          " models=fn,fn-sub\r\nbob\tsha256:" + upper_bob + "\nwatch sha256:" +
+          ApiKeyDigest("watch-secret") + " access=monitor\n",
+      &error);
+  assert(table.has_value());
+  assert(table->size() == 3);
+  const auto* key = table->match("alice-secret");
+  assert(key != nullptr && key->name == "alice");
+  assert(key->access == ApiKeyAccess::kInference);
+  assert(key->allows_model("fn-sub") && !key->allows_model("other"));
+  // Uppercase hex matches, and a key without models allows every model.
+  key = table->match("bob-secret");
+  assert(key != nullptr && key->allows_model("anything"));
+  assert(table->match("watch-secret")->access == ApiKeyAccess::kMonitor);
+  assert(table->match("alice-secret ") == nullptr);
+  assert(table->match("") == nullptr);
+
+  const std::string good = " sha256:" + alice;
+  for (const auto& [text, message] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"", "no keys"},
+           {"# only a comment\n", "no keys"},
+           {"alice", "line 1: expected"},
+           {"al ice" + good, "line 1: credential"},
+           {"al/ice" + good, "line 1: key name"},
+           {"alice sha256:abc", "line 1: credential"},
+           {"alice plain-secret", "line 1: credential"},
+           {"alice" + good + " access=admin", "line 1: access"},
+           {"alice" + good + " colour=red", "line 1: unknown or repeated"},
+           {"alice" + good + " models=a models=b",
+            "line 1: unknown or repeated"},
+           {"alice" + good + " models=a,,b", "line 1: models"},
+           {"alice" + good + " models=", "line 1: models"},
+           {"alice" + good + " models=a,", "line 1: models"},
+           {"alice" + good + " access=monitor models=a", "line 1: a monitor"},
+           {"alice" + good + "\nalice sha256:" + ApiKeyDigest("x"),
+            "line 2: duplicate key name"},
+           {"alice" + good + "\nbob" + good, "line 2: credential of 'bob'"},
+       }) {
+    error.clear();
+    assert(!ApiKeyTable::Parse(text, &error).has_value());
+    if (!error.starts_with(message)) {
+      std::cerr << text << " -> " << error << '\n';
+      std::abort();
+    }
+  }
+}
+
+void TestAuthorization() {
+  RunningServer secured({.api_key = "test-secret"});
+  for (const std::string path :
+       {"/health", "/ready", "/v1/models", "/v1/chat/completions",
+        "/v1/responses", "/v1/messages", "/v1/audio/speech",
+        "/v1/audio/transcriptions", "/v1/video/generations", "/echo"}) {
+    ExpectStatus(secured.Send("POST " + path + " HTTP/1.1\r\n\r\n"), 401);
+  }
+  for (const std::string header :
+       {"", "Authorization: Bearer wrong\r\n",
+        "Authorization: Basic test-secret\r\n",
+        "Authorization: Bearer test-secret\r\nAuthorization: Bearer "
+        "test-secret\r\n"}) {
+    const auto response =
+        secured.Send("GET /v1/models HTTP/1.1\r\n" + header + "\r\n");
+    ExpectStatus(response, 401);
+    assert(response.find("WWW-Authenticate: Bearer") != std::string::npos);
+    assert(response.find("test-secret") == std::string::npos);
+  }
+  assert(secured.backend->calls == 0);
+  ExpectStatus(secured.Send("GET /v1/models HTTP/1.1\r\naUtHoRiZaTiOn: bEaReR  "
+                            "test-secret\r\n\r\n"),
+               200);
+  ExpectStatus(secured.Send("OPTIONS /v1/chat/completions HTTP/1.1\r\n\r\n"),
+               204);
+  const std::string body = R"({"prompt":"hi","max_tokens":1})";
+  ExpectStatus(secured.Send("POST /v1/completions HTTP/1.1\r\nAuthorization: "
+                            "Bearer test-secret\r\n"
+                            "Content-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body),
+               200);
+  assert(secured.backend->calls == 1);
+}
+
+void TestApiKeyFile() {
+  using gufo::server::ApiKeyDigest;
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("gufo-keys-" + std::to_string(gufo::platform::ProcessId()));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "keys";
+  const auto write = [&](const std::string& text) {
+    // Replace atomically, as an editor or admin tool would.
+    const auto temporary = directory / "keys.tmp";
+    std::ofstream(temporary) << text;
+    std::filesystem::rename(temporary, path);
+  };
+  write("alice sha256:" + ApiKeyDigest("alice-secret") + " models=test\n" +
+        "bob sha256:" + ApiKeyDigest("bob-secret") + " models=other\n" +
+        "watch sha256:" + ApiKeyDigest("watch-secret") + " access=monitor\n");
+
+  bool rejected = false;
+  try {
+    HttpServer both("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+                    {.api_key = "x", .api_key_file = path});
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+
+  const LogLevel previous = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  std::ostringstream logs;
+  auto* previous_sink = std::clog.rdbuf(logs.rdbuf());
+  {
+    RunningServer server({.api_key_file = path});
+    const auto send = [&](const std::string& key, const std::string& method,
+                          const std::string& target,
+                          const std::string& body = "") {
+      return server.Send(method + " " + target +
+                         " HTTP/1.1\r\nAuthorization: Bearer " + key +
+                         "\r\nContent-Length: " + std::to_string(body.size()) +
+                         "\r\n\r\n" + body);
+    };
+    const std::string completion = R"({"prompt":"hi","max_tokens":1})";
+    ExpectStatus(server.Post("/v1/completions", completion), 401);
+    ExpectStatus(send("nobody", "GET", "/health"), 401);
+    assert(server.backend->calls == 0);
+
+    // The key's name is its client identity for scheduling and logs.
+    const auto peer = send("alice-secret", "GET", "/peer");
+    ExpectStatus(peer, 200);
+    assert(peer.ends_with("\r\n\r\nalice"));
+    // The text service's model is `test`, which alice may use.
+    ExpectStatus(send("alice-secret", "POST", "/v1/completions", completion),
+                 200);
+    assert(server.backend->calls == 1);
+
+    // bob may only use `other`, which this server does not serve. A request
+    // naming no model runs on `test` and is refused; one naming `other` passes
+    // the key check and the route reports the model is not loaded. A query
+    // `?model=` does not select the model and cannot steer the check.
+    for (
+        const auto& [target, body, status] :
+        std::vector<std::tuple<std::string, std::string, int>>{
+            {"/v1/completions", completion, 403},
+            {"/v1/completions",
+             R"({"model":"other","prompt":"hi","max_tokens":1})", 404},
+            {"/v1/completions?model=other", completion, 403},
+            {"/completion", R"({"model":"other","prompt":"hi"})", 404},
+            {"/v1/chat/completions",
+             R"({"model":"other","messages":[{"role":"user","content":"hi"}]})",
+             404},
+            {"/peer", "", 403}}) {
+      const auto response =
+          send("bob-secret", body.empty() ? "GET" : "POST", target, body);
+      ExpectStatus(response, status);
+      if (status == 403)
+        assert(response.find("model_not_allowed") != std::string::npos);
+    }
+    assert(server.backend->calls == 1);
+    // A monitoring key reads status routes and nothing else.
+    for (const std::string target :
+         {"/health", "/ready", "/v1/models", "/props", "/slots", "/metrics"}) {
+      ExpectStatus(send("watch-secret", "GET", target), 200);
+    }
+    for (const auto& [method, target] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"POST", "/v1/completions"},
+             {"POST", "/v1/chat/completions"},
+             {"GET", "/peer"},
+             {"POST", "/metrics"}}) {
+      const auto response = send("watch-secret", method, target, completion);
+      ExpectStatus(response, 403);
+      assert(response.find("permission_denied") != std::string::npos);
+    }
+    assert(server.backend->calls == 1);
+
+    // Edits apply without a restart: alice is revoked, carol added.
+    write("carol sha256:" + ApiKeyDigest("carol-secret") + "\n");
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (send("carol-secret", "GET", "/health").starts_with("HTTP/1.1 401")) {
+      assert(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ExpectStatus(send("alice-secret", "GET", "/health"), 401);
+
+    // A broken file keeps the previous keys rather than locking everyone out
+    // or opening the server.
+    write("carol not-a-digest\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2'500));
+    ExpectStatus(send("carol-secret", "GET", "/health"), 200);
+    ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 401);
+  }
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous);
+  const std::string log = logs.str();
+  assert(log.find("auth=key_file keys=3") != std::string::npos);
+  assert(log.find("event=received method=POST path=/v1/completions "
+                  "body_bytes=30 key=alice") != std::string::npos);
+  // The completion line names the key just before the memory fields.
+  assert(log.find("key=alice rss_mib=") != std::string::npos);
+  assert(log.find("error_code=model_not_allowed key=bob") != std::string::npos);
+  assert(log.find("event=api_keys_reloaded keys=1") != std::string::npos);
+  assert(log.find("event=api_keys_reload_failed") != std::string::npos);
+  for (const std::string secret :
+       {"alice-secret", "bob-secret", "watch-secret", "carol-secret"})
+    assert(log.find(secret) == std::string::npos);
+  std::filesystem::remove_all(directory);
+}
+
+void TestApiKeyFileSessionClasses() {
+  using gufo::server::ApiKeyDigest;
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("gufo-class-keys-" + std::to_string(gufo::platform::ProcessId()));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "keys";
+  std::ofstream(path) << "sub sha256:" << ApiKeyDigest("sub-secret")
+                      << " models=sub\nowner sha256:"
+                      << ApiKeyDigest("owner-secret") << "\n";
+  {
+    RunningServer server({.api_key_file = path});
+    server.backend->served = {{"main", 1000}, {"sub", 32}};
+    const auto send = [&](const std::string& key, const std::string& body) {
+      return server.Send(
+          "POST /v1/completions HTTP/1.1\r\nAuthorization: Bearer " + key +
+          "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+          body);
+    };
+    const auto body = [](const std::string& model) {
+      return (model.empty() ? std::string("{")
+                            : R"({"model":")" + model + "\",") +
+             R"("prompt":"hi","max_tokens":1})";
+    };
+    ExpectStatus(send("sub-secret", body("sub")), 200);
+    // The first class runs a request without a model.
+    for (const std::string model : {"main", "", "nope"}) {
+      const auto response = send("sub-secret", body(model));
+      ExpectStatus(response, 403);
+      assert(response.find("model_not_allowed") != std::string::npos);
+    }
+    ExpectStatus(send("owner-secret", body("main")), 200);
+    ExpectStatus(send("owner-secret", body("nope")), 404);
+    assert(server.backend->calls == 2);
+  }
+  std::filesystem::remove_all(directory);
+}
+
 int main() {
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
@@ -3806,10 +3841,6 @@ int main() {
   TestListenAddresses();
   TestLoadingResponder();
   TestQueryParameters();
-  TestAuthorization();
-  TestApiKeyFileParsing();
-  TestApiKeyFile();
-  TestApiKeyFileSessionClasses();
   TestFramingAndMetrics();
   TestExpectContinue();
   TestFallbackBackendMetrics();
@@ -3822,7 +3853,6 @@ int main() {
   TestResponsesToolImages();
   TestModelInputModalities();
   TestServedModelNames();
-  TestSessionClassRouting();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();
   TestDeviceLoss();
@@ -3845,5 +3875,11 @@ int main() {
   TestDeferredStreamHeaders();
   TestAdmittedStreamHeaders();
   TestEmbeddingService();
+  TestDecisionService();
+  TestAuthorization();
+  TestApiKeyFileParsing();
+  TestApiKeyFile();
+  TestApiKeyFileSessionClasses();
+  TestSessionClassRouting();
   std::cout << "HTTP transport checks passed.\n";
 }

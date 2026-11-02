@@ -10,7 +10,6 @@
 #include <ctime>
 #include <map>
 #include <random>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -227,7 +226,7 @@ void ValidateRequest(const ext::ImageRequest& request) {
     throw std::invalid_argument(
         "image size must be multiples of 32, at most 4096 per side and 4 "
         "megapixels");
-  if (request.steps < 2 || request.steps > 100)
+  if (request.steps != 0 && (request.steps < 2 || request.steps > 100))
     throw std::invalid_argument("image steps must be between 2 and 100");
   if (request.images.size() > 10)
     throw std::invalid_argument(
@@ -379,8 +378,11 @@ std::string String(const json::Value& fields, const char* name,
 }  // namespace
 
 ImageService::ImageService(const std::filesystem::path& root,
-                           std::string model_id, Runner runner)
-    : model_id_(std::move(model_id)), runner_(std::move(runner)) {
+                           std::string model_id, Runner runner,
+                           std::vector<std::string> model_aliases)
+    : model_id_(std::move(model_id)),
+      model_aliases_(std::move(model_aliases)),
+      runner_(std::move(runner)) {
   if (model_id_.empty())
     throw std::invalid_argument("image model ID must not be empty");
   if (!runner_) {
@@ -439,19 +441,11 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
     const auto& fields = parsed.fields;
     if (!fields.is_object())
       throw std::invalid_argument("request must be a JSON object");
-    const std::set<std::string> allowed{
-        "prompt",        "model",   "n",          "size", "response_format",
-        "output_format", "quality", "background", "user", "seed",
-        "steps",         "stream"};
-    for (const auto& [name, value] : fields.members()) {
-      (void)value;
-      if (!allowed.contains(name))
-        throw std::invalid_argument("unsupported image parameter: " + name);
-    }
+    // As in the other OpenAI-compatible servers, unknown members are ignored.
     if (!fields.contains("prompt"))
       throw std::invalid_argument("prompt is required");
     const auto model = String(fields, "model", service.model_id().c_str());
-    if (model != service.model_id())
+    if (!service.serves_model(model))
       return Error(404, "requested image model is not loaded",
                    "model_not_found");
     if (String(fields, "response_format", "b64_json") != "b64_json" ||
@@ -461,7 +455,8 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
     const auto quality = String(fields, "quality", "auto");
     if (quality != "auto" && quality != "standard" && quality != "high")
       throw std::invalid_argument(
-          "quality must be auto, standard or high (40 steps)");
+          "quality must be auto, standard or high; steps are "
+          "checkpoint-specific");
     if (const auto* stream = fields.find("stream");
         stream && (!stream->is_bool() || stream->as_bool()))
       throw std::invalid_argument("streaming image responses are unsupported");
@@ -501,7 +496,8 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       generation.width = parse(std::string_view(size).substr(0, separator));
       generation.height = parse(std::string_view(size).substr(separator + 1));
     }
-    generation.steps = static_cast<int>(Number(fields, "steps", 40, 2, 100));
+    // Omitted steps keep zero so the runner applies its checkpoint default.
+    generation.steps = static_cast<int>(Number(fields, "steps", 0, 2, 100));
     std::random_device entropy;
     generation.seed =
         Number(fields, "seed",
@@ -532,7 +528,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << " seed=" << generation.seed << " size=" << generation.width
               << 'x' << generation.height
               << " references=" << generation.images.size()
-              << " steps=" << generation.steps
+              << " steps=" << result.metrics.steps
               << " prompt_ms=" << result.metrics.prompt_ms
               << " denoise_ms=" << result.metrics.denoise_ms
               << " vae_ms=" << result.metrics.vae_ms

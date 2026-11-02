@@ -47,18 +47,31 @@ struct TtsService::Impl {
     }
 
     if (!options.runner) {
-      if (!provider || !provider->create) {
+      if (!provider || (!provider->create && !provider->create_with_options)) {
         initialization_error = "TTS provider not available for model: " +
                                options.model_root.string();
         return;
       }
-      native_runtime = provider->create(options.model_root.string(),
-                                        options.native_context_tokens,
-                                        &initialization_error);
+      if (provider->create_with_options)
+        native_runtime = provider->create_with_options(
+            {.model_root = options.model_root.string(),
+             .maximum_context_tokens = options.native_context_tokens,
+             .projector_path = options.projector_path.string()},
+            &initialization_error);
+      else if (!options.projector_path.empty())
+        initialization_error =
+            "this TTS model does not take a projector sidecar";
+      else
+        native_runtime = provider->create(options.model_root.string(),
+                                          options.native_context_tokens,
+                                          &initialization_error);
       if (native_runtime == nullptr) {
         return;
       }
       options.variant = native_runtime->Variant();
+      options.concurrent = options.concurrent || native_runtime->Concurrent();
+      if (options.model_id.empty())
+        options.model_id = native_runtime->ModelId();
       if (options.voices.empty()) {
         options.voices = native_runtime->Voices();
       }
@@ -123,6 +136,17 @@ std::string TtsService::model_id() const {
   return impl_->options.model_id;
 }
 
+bool TtsService::serves_model(std::string_view name) const {
+  return name == model_id() || name == "qwen3-tts" ||
+         std::find(impl_->options.model_aliases.begin(),
+                   impl_->options.model_aliases.end(),
+                   name) != impl_->options.model_aliases.end();
+}
+
+const std::vector<std::string>& TtsService::model_aliases() const {
+  return impl_->options.model_aliases;
+}
+
 std::string TtsService::backend_name() const {
   return "native-hip";
 }
@@ -149,6 +173,8 @@ bool TtsService::Synthesize(const ext::SynthesisRequest& request,
     }
     return false;
   }
+  if (impl_->options.concurrent)
+    return impl_->options.runner(request, is_cancelled, result, error);
   auto lease = impl_->generation_gate.Acquire(is_cancelled, error);
   if (!lease) {
     if (result)

@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
 #define GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -91,6 +92,8 @@ private:
 
   ds4_engine* engine_ = nullptr;
   ModelOptions options_;
+  /// Vocabulary IDs indexed by ControlToken, resolved at load.
+  std::array<int, kControlTokenCount> control_tokens_{};
 
   friend class Session;
 };
@@ -149,6 +152,9 @@ public:
     bool operator==(const DsparkStats&) const = default;
   };
   [[nodiscard]] DsparkStats DsparkStatistics() const;
+  /// Valid until the next Evaluate, Sync, step, or restore on this session.
+  [[nodiscard]] std::span<const float> Logits(
+      std::string* error_msg = nullptr) const;
   [[nodiscard]] std::vector<float> CopyLogits(
       std::string* error_msg = nullptr) const;
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(

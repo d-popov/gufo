@@ -29,6 +29,7 @@ class TtsService;
 class AsrService;
 class ImageService;
 class EmbeddingService;
+struct DecisionService;
 class WebSocket;
 
 struct HttpRequest {
@@ -128,7 +129,8 @@ public:
              std::shared_ptr<AsrService> asr = nullptr,
              HttpServerOptions options = {},
              std::shared_ptr<ImageService> images = nullptr,
-             std::shared_ptr<EmbeddingService> embeddings = nullptr);
+             std::shared_ptr<EmbeddingService> embeddings = nullptr,
+             std::shared_ptr<DecisionService> decisions = nullptr);
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -173,6 +175,7 @@ private:
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
+  std::shared_ptr<DecisionService> decisions_;
   HttpServerOptions options_;
   ApiKeyAuthority api_keys_;
   int listen_fd_ = -1;

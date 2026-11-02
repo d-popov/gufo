@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 
+#include "gufo/ext/text.hpp"
 #include "src/cache/checkpoint.hpp"
 #include "src/cache/component_resources.hpp"
 #include "src/cache/streaming.hpp"
@@ -13,12 +14,12 @@
 #include "src/cli/serve/text_publication_wait.hpp"
 
 namespace gufo::server {
-class TextModelRunner;
-class TextRunnerState;
-class TextRunnerSnapshot;
-struct TextRunnerDiskCacheOptions;
-struct TextSessionClass;
-struct TextPromptContext;
+using ext::TextModelRunner;
+using ext::TextPromptContext;
+using ext::TextRunnerDiskCacheOptions;
+using ext::TextRunnerSnapshot;
+using ext::TextRunnerState;
+using ext::TextSessionClass;
 
 // The capture/backing contracts are cache-owned (RFC step 6); these aliases
 // keep the serving spelling.

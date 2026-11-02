@@ -19,7 +19,7 @@ unit tests (including the identity goldens), CPU/hosted checks, static audits
 and formatting; their functional requirements stay recorded as deferred,
 pending evidence with exact commands — never as passes.
 
-Statuses: pending, implementing, reviewing, integrating, complete. The agent
+Statuses: pending, implementing, reviewing, integrating, complete, won't do. The agent
 orchestrating this work records agent names, review findings, their disposition,
 commands and retained evidence in the execution record. Splitting a card further
 is allowed; dropping a requirement or replacing a gate with weaker evidence is
@@ -124,17 +124,17 @@ the current implementation milestone stops after Card 14.
 | 16 | 8 TTS; 15 | [Migrate speech synthesis](cards/16-speech-synthesis.md) | complete |
 | 17 | 8 image; 16 | [Migrate image generation](cards/17-image-generation.md) | complete |
 | 18 | 8 video; 17 | [Migrate video generation](cards/18-video-generation.md) | complete |
-| 19 | 10 shared text; 18 | [Finalize the shared text-generation contract](cards/19-shared-text-contract.md) | pending |
-| 20 | 10 Qwen 27B; 19 | [Migrate Qwen 27B text generation](cards/20-qwen27b-extension.md) | pending |
-| 21 | 10 Flash-Next; 20 | [Migrate Flash-Next text generation](cards/21-flash-next-extension.md) | pending |
-| 22 | 10 DeepSeek; 21 | [Migrate DeepSeek text generation](cards/22-deepseek-extension.md) | pending |
-| 23 | 11; 22 | [Support external extension source trees](cards/23-external-extensions.md) | pending |
-| 24 | 11; 23 | [Prove capability extensibility with second providers](cards/24-second-provider-conformance.md) | pending |
-| 25 | 11b; 24 | [Generate Nix serving arguments and validation](cards/25-generated-serve-module.md) | pending |
+| 19 | 10 shared text; 18 | [Finalize the shared text-generation contract](cards/19-shared-text-contract.md) | complete |
+| 20 | 10 Qwen 27B; 19 | [Migrate Qwen 27B text generation](cards/20-qwen27b-extension.md) | complete |
+| 21 | 10 Flash-Next; 20 | [Migrate Flash-Next text generation](cards/21-flash-next-extension.md) | complete |
+| 22 | 10 DeepSeek; 21 | [Migrate DeepSeek text generation](cards/22-deepseek-extension.md) | complete |
+| 23 | 11; 22 | [Support external extension source trees](cards/23-external-extensions.md) | complete |
+| 24 | 11; 23 | [Prove capability extensibility with second providers](cards/24-second-provider-conformance.md) | implementing |
+| 25 | 11b; 24 | [Generate Nix serving arguments and validation](cards/25-generated-serve-module.md) | implementing |
 | 26 | distribution/conformance; 25 | [Complete distribution recipes and conformance policy](cards/26-distribution-and-policy.md) | pending |
-| 27 | success criteria; 26 | [Audit every RFC success criterion](cards/27-final-requirements-audit.md) | pending |
-| 28 | 12 preparation; 27 | [Pin external compatibility fixtures and stability evidence](cards/28-external-compatibility-ledger.md) | pending |
-| 29 | 12 graduation; 28 | [Graduate the extension API to 1.0](cards/29-api-one-graduation.md) | pending |
+| 27 | success criteria; 26 | [Audit every RFC success criterion](cards/27-final-requirements-audit.md) | won't do |
+| 28 | 12 preparation; 27 | [Pin external compatibility fixtures and stability evidence](cards/28-external-compatibility-ledger.md) | won't do |
+| 29 | 12 graduation; 28 | [Graduate the extension API to 1.0](cards/29-api-one-graduation.md) | won't do |
 
 ## Execution records
 
@@ -348,5 +348,64 @@ and `roc::rocblas`; resolved reviewer findings N1 (`CHANGES.md`) and N2 (`platfo
 namespace alias removed); resolved user finding U1; and passed all CI checks, `check-pr`,
 and `nix build`.
 
+### Card 19
 
+See [Card 19: execution record](cards/19-shared-text-contract.md#execution-record).
+It finalized the public provider-neutral text-generation runtime contracts in
+`<gufo/ext/text.hpp>` (`TextModelRunner`, `TextRunnerState`, `TextDecodeStep`,
+`TextProvider`, `TextBenchOptions`, `TextPromptOptions`); published `ToolDialect`
+with dynamic schema and native tool dialect registration; decoupled `src/cli/serve/component_text_cache.hpp`
+and `text_model_runner.hpp`; bumped the extension API version to `0.1.6` with
+verified `SURFACE` closure (120 headers); resolved reviewer findings M1, N1, and N2;
+and passed all CI checks, `check-pr` (96/96 suites passed), and `nix build` (active in diagnostics).
 
+### Card 20
+
+See [Card 20: execution record](cards/20-qwen27b-extension.md#execution-record).
+It migrated `src/models/qwen` (Qwen 27B) into an isolated extension; replaced the
+permissive fallback with strict `ProbeQwenGguf` shape validation (`embedding_length == 5120`),
+noted as a breaking change (`!`) in commit title; moved standalone benchmark and
+interactive prompt/chat drivers into `src/models/qwen/drivers.cpp`; split the manifest
+into `gufo_qwen` and `gufo_qwen_hip` (`requires: ["hip"]`); resolved reviewer finding M1
+(metadata registration of `kProvider_qwen27_q4`); passed `qwen27b_continuation_identity_test`;
+and passed all verification gates.
+
+### Card 21
+
+See [Card 21: execution record](cards/21-flash-next-extension.md#execution-record).
+It migrated `src/models/qwen38_flash_next` into an isolated extension; implemented
+`ProbeFlashNextGguf` for `qwen4exp`; migrated MTP speculative decoding ownership,
+YaRN RoPE scaling (`bench_yarn.hpp`/`cpp`), and CLI drivers into `drivers.cpp`; split the
+manifest into `gufo_qwen38_flash_next` and `gufo_qwen38_flash_next_hip` (`requires: ["hip"]`);
+resolved reviewer finding M1 (`kProvider_flash_next_q4`); passed `qwen38_flash_next_continuation_identity_test`;
+and passed all verification gates.
+
+### Card 22
+
+See [Card 22: execution record](cards/22-deepseek-extension.md#execution-record).
+It migrated `src/models/deepseek_v4_flash` into an isolated extension; decoupled
+`tool_calls.cpp` from `gufo_http` using neutral `ext::ScannedToolCall` / `ext::ScannedToolArgument`;
+migrated DSpark speculation, native snapshot persistence, and CLI drivers into `drivers.cpp`;
+split the manifest into `gufo_deepseek_v4_flash` and `gufo_deepseek_v4_flash_hip` (`requires: ["hip"]`);
+resolved reviewer findings M1 (`kProvider_deepseek4`) and N1 (canonical `deepseek4` ID);
+passed `deepseek_v4_flash_continuation_identity_test`; and passed all verification gates.
+
+### Card 23
+
+See [Card 23: execution record](cards/23-external-extensions.md#execution-record).
+
+### Card 24
+
+See [Card 24: execution record](cards/24-second-provider-conformance.md#execution-record).
+In progress (`implementing`): completed the external `text_generation` second-provider
+port in `lfm3-gufo-extension` (`git@github.com:gufo-org/lfm3-gufo-extension.git`,
+commit `6360b0fc`) with zero core/build/preset/workflow/Nix/registry edits, passing
+GPU/CPU builds, `lfm3_config_test`, `lfm3_ops_test`, `lfm3_session_test`, CPU vs GPU
+`lfm3_probe`, CLI `prompt`/`bench`, and live `gufo serve llm` HTTP conformance.
+Non-text second providers and the full exclusion matrix remain pending.
+
+### Cards 27–29
+
+Won't do by user decision (2026-11-02): the final audit, external compatibility
+ledger and API 1.0 graduation add no functionality. Nothing was executed; no
+audit, compatibility pin or 1.0 criterion is claimed. The API stays 0.x.

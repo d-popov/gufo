@@ -23,8 +23,13 @@
       "speculative": [
         "dspark"
       ],
-      "target": "gufo_deepseek_v4_flash",
-      "entry": "deepseek_v4_flash_provider_register"
+      "target": "gufo_deepseek_v4_flash_hip",
+      "entry": "deepseek_v4_flash_provider_register",
+      "serving": {
+        "draft_options": {
+          "dspark": "--dspark-model"
+        }
+      }
     }
   ],
   "options": [
@@ -45,6 +50,11 @@
   "targets": {
     "gufo_deepseek_v4_flash": {
       "requires": []
+    },
+    "gufo_deepseek_v4_flash_hip": {
+      "requires": [
+        "hip"
+      ]
     }
   },
   "licenses": [

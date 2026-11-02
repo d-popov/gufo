@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "gufo/ext/text.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/logprobs.hpp"
 #include "src/core/reasoning.hpp"
@@ -94,42 +95,7 @@ private:
   TextGenerationErrorCode code_;
 };
 
-struct ChatRequest {
-  enum class ToolChoice : std::uint8_t {
-    kAuto,
-    kNone,
-    kRequired,
-  };
-
-  ChatRequest() = default;
-  explicit ChatRequest(std::vector<tokenization::ChatMessage> chat_messages)
-      : messages(std::move(chat_messages)) {}
-
-  std::vector<tokenization::ChatMessage> messages;
-  std::vector<tokenization::ChatTool> tools;
-  std::string client_id{"anonymous"};
-  ToolChoice tool_choice{ToolChoice::kAuto};
-  std::string forced_tool_name;
-  /// Responses namespace of each flattened function, echoed on its calls.
-  std::map<std::string, std::string> tool_namespaces;
-  bool constrained_tools{false};
-  bool parallel_tool_calls{true};
-  ReasoningOptions reasoning;
-  bool add_vision_id{false};
-  /// Bypass prompt reuse for this request; its completed state may be retained.
-  bool cache_prompt{true};
-  /// Served model that runs this request; empty selects the first one.
-  std::string model;
-  /// False keeps this request's checkpoints out of the disk cache; it may
-  /// still read existing disk checkpoints and use the RAM cache.
-  bool cache_persist{true};
-  /// Optional streaming prompt progress; never changes prompt or cache
-  /// identity.
-  bool return_progress{false};
-  std::vector<std::string> stop_sequences;
-  std::shared_ptr<const sampling::JsonConstraint> response_format;
-  std::string response_format_description;
-};
+using ChatRequest = ext::ChatRequest;
 
 /// Model-agnostic text generation boundary used by the HTTP transport.
 ///
@@ -184,11 +150,7 @@ public:
     kCancelled,
   };
 
-  enum class InitialOutputState : std::uint8_t {
-    kAuto,
-    kReasoning,
-    kContent,
-  };
+  using InitialOutputState = gufo::ext::InitialOutputState;
 
   struct SamplingDefaults {
     /// Zero means generate until EOS or the remaining context is exhausted.
@@ -203,22 +165,7 @@ public:
     }
   };
 
-  /// Image inputs of one request. Preprocessing counts CPU decode/resize;
-  /// encoder fields count only vision encoding run for this request.
-  struct ImageMetrics {
-    std::size_t images{0};
-    /// Image pads plus vision start/end markers in the prompt.
-    std::size_t tokens{0};
-    std::size_t encoded_bytes{0};
-    /// Pixels after resize.
-    std::size_t pixels{0};
-    std::size_t preprocess_hits{0};
-    std::size_t preprocess_misses{0};
-    std::size_t encoder_images{0};
-    double encode_ms{0.0};
-    /// Visual tokens inside the reused prompt prefix (cached_prompt_tokens).
-    std::size_t reused_tokens{0};
-  };
+  using ImageMetrics = ext::TextImageMetrics;
 
   struct Result {
     std::optional<ComponentCacheMetrics> component_cache;
