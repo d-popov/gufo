@@ -26,6 +26,7 @@
 
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/session_hint.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 
@@ -92,6 +93,9 @@ struct OutputPiece {
 struct ScheduledRequest {
   std::uint64_t id{0};
   std::string client_id{"anonymous"};
+  // Who the cache keeps a session for: the client, and within it the agent
+  // that named itself (SessionHint). Quotas use `client_id` alone.
+  std::string affinity;
   // Index into the pool's session classes; admission uses only its slots.
   std::size_t session_class{0};
   std::vector<TextRunnerToken> prompt;
@@ -1453,7 +1457,7 @@ struct TextGenerationScheduler::Impl {
             },
             request->prompt_context, request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->session_class, request->cache_persist, request->client_id);
+            request->session_class, request->cache_persist, request->affinity);
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
@@ -2648,6 +2652,9 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
+  request->affinity = request->client_id;
+  if (const auto hint = SessionHint::Current(); !hint.empty())
+    request->affinity += "/" + hint;
   request->result.prompt_tokens = prompt.size();
   request->result.token_metrics_recorded = true;
   request->result.client_id = request->client_id;

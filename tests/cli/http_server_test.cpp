@@ -24,6 +24,7 @@
 #include "src/cli/serve/decision_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/session_hint.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/net.hpp"
@@ -3569,6 +3570,31 @@ void TestSessionClassRouting() {
   server.backend->served.clear();
 }
 
+// A client may name the conversation behind a request with `prompt_cache_key`;
+// only a short string counts, and a hint never outlives its request's scope.
+void TestSessionHint() {
+  using gufo::server::SessionHint;
+  const auto read = [](const std::string& text) {
+    SessionHint::FromBody(gufo::json::parse(text));
+    return SessionHint::Current();
+  };
+  const SessionHint::Scope outer;
+  assert(SessionHint::Current().empty());
+  assert(read(R"({"prompt_cache_key":"agent-7"})") == "agent-7");
+  {
+    const SessionHint::Scope inner;
+    assert(SessionHint::Current().empty());
+    assert(read(R"({"prompt_cache_key":5})").empty());
+    assert(read(R"({"prompt_cache_key":""})").empty());
+    assert(read(R"({"model":"x"})").empty());
+    assert(read(R"({"prompt_cache_key":")" + std::string(129, 'a') + R"("})")
+               .empty());
+    assert(read(R"({"prompt_cache_key":")" + std::string(128, 'a') + R"("})")
+               .size() == 128);
+  }
+  assert(SessionHint::Current() == "agent-7");
+}
+
 void TestApiKeyFileParsing() {
   using gufo::server::ApiKeyAccess;
   using gufo::server::ApiKeyDigest;
@@ -3940,6 +3966,7 @@ int main() {
   TestDecisionService();
   TestAuthorization();
   TestApiKeyFileParsing();
+  TestSessionHint();
   TestApiKeyFile();
   TestApiKeyFileSessionClasses();
   TestSessionClassRouting();

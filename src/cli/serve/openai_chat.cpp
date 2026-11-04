@@ -29,6 +29,7 @@
 #include "src/cli/serve/response_format.hpp"
 #include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/session_hint.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
@@ -849,6 +850,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   json::Value body;
   try {
     body = json::parse(request.body);
+    SessionHint::FromBody(body);
   } catch (const std::exception& exception) {
     return Error(400, "Bad Request", exception.what(), "parse_error");
   }

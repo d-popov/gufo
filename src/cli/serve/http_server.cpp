@@ -42,6 +42,7 @@
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/session_hint.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -880,6 +881,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value body;
   try {
     body = json::parse(req.body);
+    SessionHint::FromBody(body);
   } catch (const std::exception& e) {
     return Err(400, "Bad Request", e.what(), "invalid_request_error",
                "parse_error");
@@ -1181,6 +1183,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   json::Value body;
   try {
     body = json::parse(req.body);
+    SessionHint::FromBody(body);
   } catch (const std::exception& e) {
     return Err(400, "Bad Request", e.what(), "invalid_request_error",
                "parse_error");
@@ -1415,6 +1418,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   json::Value body;
   try {
     body = json::parse(req.body);
+    SessionHint::FromBody(body);
   } catch (const std::exception& e) {
     return Err(400, "Bad Request", e.what(), "invalid_request_error",
                "parse_error");
@@ -2510,6 +2514,7 @@ void HttpServer::handle_connection(int client_fd,
   // Generation submitted on this thread, by the handler or by a stream body
   // that defers it, names this request in its trace record.
   const Trace::RequestScope trace_scope(req.request_id);
+  const SessionHint::Scope hint_scope;
   try {
     bool ok = false;
     bool payload_too_large = false;
