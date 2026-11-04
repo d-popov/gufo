@@ -271,7 +271,6 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
 }  // namespace
 
 struct TextRunnerPool::Impl {
-  static constexpr std::size_t kIntermediateCheckpoints = 4;
   Impl(std::shared_ptr<TextModelRunner> model_runner,
        std::vector<TextSessionClass> session_classes,
        std::optional<TextRunnerDiskCacheOptions> disk_cache_options,
@@ -1749,8 +1748,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
 std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
     std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
     std::uint64_t checkpoint_id, std::size_t session_class) const {
-  return impl_->component_cache->PendingPublication(prompt, context,
-                                                    checkpoint_id, session_class);
+  return impl_->component_cache->PendingPublication(
+      prompt, context, checkpoint_id, session_class);
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(
