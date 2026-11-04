@@ -152,7 +152,7 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         keys = os.path.join(directory, "keys")
         with open(keys, "w") as handle:
-            handle.write("alice sha256:" + "ab" * 32 + " access=admin\n")
+            handle.write("alice sha256:" + "ab" * 32 + " access=root\n")
         check(load + ["--api-key-file", keys], 2,
               "--api-key-file " + keys + ": line 1: access must be")
         check(load + ["--api-key-file", os.path.join(directory, "missing")], 2,
