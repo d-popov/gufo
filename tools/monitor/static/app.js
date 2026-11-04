@@ -278,8 +278,9 @@ function renderCards() {
     card.subNode.textContent = card.sub ? card.sub(sample) : '';
     const series = state.history[card.key] ?? [];
     const extreme = extremeOf(series, card.low);
-    // In the title, so the tile does not grow; the window and unit are in its tooltip.
-    card.peakNode.textContent = extreme == null ? '' : `${card.low ? 'low' : 'max'} ${fmt(extreme, card.digits)}`;
+    // In the title, so the tile does not grow; the window is in its tooltip.
+    card.peakNode.textContent = extreme == null ? ''
+      : `${card.low ? 'low' : 'max'} ${fmt(extreme, card.digits)}${card.unit ? ` ${card.unit}` : ''}`;
     card.peakNode.title = extreme == null ? '' : `${card.low ? 'Lowest' : 'Highest'} in the last ${span}: `
       + `${fmt(extreme, card.digits)}${card.unit ? ` ${card.unit}` : ''}`;
     sparkline(card, series);
