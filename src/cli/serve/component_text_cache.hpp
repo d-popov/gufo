@@ -88,6 +88,9 @@ public:
                      bool automatic_ram = false, std::size_t ceiling_bytes = 0,
                      bool ram_enabled = true);
   ~ComponentTextCache();
+  /// Replaces the clock client preferences are judged against.
+  void SetTimeForTesting(
+      std::function<std::chrono::steady_clock::time_point()> time);
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,
       const ContinuationCache::CancellationCheck&,

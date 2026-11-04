@@ -331,6 +331,8 @@ void InPassCapturePreservesBoundaryAndLiveTail() {
 void ClientKeepsItsSession() {
   auto runner = std::make_shared<Runner>();
   ComponentTextCache cache(runner, 2, 1 << 22, {});
+  auto now = std::chrono::steady_clock::now();
+  cache.SetTimeForTesting([&] { return now; });
   const auto use = [&](std::string_view client,
                        const std::vector<TextRunnerToken>& prompt) {
     auto lease = cache.Acquire(prompt, {}, {}, false, 0, true, 0, true, client);
@@ -347,6 +349,13 @@ void ClientKeepsItsSession() {
   // An unknown client finds b's session preferred, and a's too: with none
   // free of preference the least recently used one is taken.
   assert(use("c", {13, 14, 15}) == first);
+  // The preference lapses after 15 minutes without use: b's session was used
+  // 10 minutes ago and is still b's; 16 minutes later it no longer is, so b's
+  // next unmatched prompt takes the least recently used session instead.
+  now += std::chrono::minutes(10);
+  assert(use("b", {16, 17, 18}) == second);
+  now += std::chrono::minutes(16);
+  assert(use("b", {19, 20, 21}) == first);
 }
 void ColdAcquireResetsOnce() {
   auto runner = std::make_shared<Runner>();

@@ -210,6 +210,8 @@ struct ComponentTextCache::Impl {
   mutable std::mutex mutex;
   std::vector<std::unique_ptr<Entry>> entries;
   std::uint64_t clock{};
+  // The time client preferences are judged against; tests replace it.
+  std::function<Clock::time_point()> time = [] { return Clock::now(); };
   std::unique_ptr<cache::DiskCatalog> catalog;
   std::unique_ptr<cache::StreamedStore> streaming;
   std::unique_ptr<cache::PersistenceQueue> queue;
@@ -1082,6 +1084,11 @@ ComponentTextCache::ComponentTextCache(
                                    std::max(ram, ceiling), disk, automatic_ram,
                                    ram_enabled)) {}
 ComponentTextCache::~ComponentTextCache() = default;
+void ComponentTextCache::SetTimeForTesting(
+    std::function<std::chrono::steady_clock::time_point()> time) {
+  const std::lock_guard lock(impl_->mutex);
+  impl_->time = std::move(time);
+}
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
 }
@@ -1141,7 +1148,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       // used it: others take sessions that are not (or no longer) preferred
       // first, and a client takes its own before anyone else's. When every
       // session is preferred by someone, the ordinary order decides.
-      const auto now = Clock::now();
+      const auto now = impl_->time();
       const auto taken = [&](const Impl::Entry& e) {
         return !e.owner.empty() && e.owner != client && now < e.owner_until;
       };
@@ -1227,7 +1234,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     entry->busy = true;
     entry->used = ++impl_->clock;
     entry->owner = std::string(client);
-    entry->owner_until = Clock::now() + kClientAffinity;
+    entry->owner_until = impl_->time() + kClientAffinity;
     if (!live) {
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
