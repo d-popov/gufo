@@ -103,8 +103,10 @@ gufo serve llm --model models/flash-next.gguf \
 
 `--session-class NAME=COUNTxCONTEXT` is repeatable and replaces `--sessions`,
 `--context` and `--served-model-name`, which it cannot be combined with.
-Names must be unique; COUNT and CONTEXT must be at least 1, and CONTEXT may
-not exceed the model's native context. The model and its shared scratch are
+Names must be unique; CONTEXT must be at least 1, and CONTEXT may
+not exceed the model's native context. COUNT 0 switches a class off (for
+example `sub=0x65536`): it is validated, but allocates nothing, is not served
+and does not size the model; at least one class needs sessions. The model and its shared scratch are
 loaded for the largest class; each session allocates state for its own
 class's context only. Other model families refuse the option at startup. On the
 27B each class also gets its own draft-model state, and a request longer than

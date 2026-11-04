@@ -265,13 +265,17 @@ def main():
                      ["--served-model-name", "x"], ["-c", "4096"]):
         check(["serve", "llm", "--model", "missing.gguf", *classes,
                *replaced], 2, "cannot combine with")
-    for bad in ("main", "main=", "=1x10", "main=1", "main=0x10", "main=1x0",
+    for bad in ("main", "main=", "=1x10", "main=1", "main=1x0",
                 "main=1x", "main=x10", "main=1x10x2", "main=-1x10",
                 "main=1x4294967296"):
         check(["serve", "llm", "--model", "missing.gguf",
                "--session-class", bad], 2, "NAME=COUNTxCONTEXT")
     check(["serve", "llm", "--model", "missing.gguf", "--session-class",
            "a=1x10", "--session-class", "a=2x20"], 2, "given twice")
+    check(["serve", "llm", "--model", "missing.gguf", "--session-class",
+           "a=0x10"], 2, "0 sessions")
+    check(["serve", "llm", "--model", "missing.gguf", "--session-class",
+           "a=1x10", "--session-class", "b=0x20"], 1, "Error loading model")
     for command in ("prompt", "chat", "bench"):
         check([command, "--help"], 0, "--draft-policy")
         check([command, "--draft-tokens", "0"], 2, "draft-tokens")

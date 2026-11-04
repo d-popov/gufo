@@ -24,8 +24,9 @@ public:
       : classes_(std::move(classes)) {}
 
   /// Parses one `--session-class NAME=COUNTxCONTEXT` (COUNT sessions of
-  /// CONTEXT tokens, both at least 1, served under model NAME) and appends
-  /// it. Names are unique across the invocation. False sets `*error`.
+  /// CONTEXT tokens served under model NAME; CONTEXT at least 1) and appends
+  /// it. COUNT 0 switches the class off: it is validated but not appended.
+  /// Names are unique among the appended classes. False sets `*error`.
   static bool Add(std::string_view spec, std::vector<TextSessionClass>* classes,
                   std::string* error);
 

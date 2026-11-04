@@ -13,8 +13,8 @@ bool SessionClassSet::Add(std::string_view spec,
                           std::string* error) {
   const auto invalid = [&] {
     *error =
-        "--session-class expects NAME=COUNTxCONTEXT with COUNT and "
-        "CONTEXT at least 1, e.g. main=1x262144; got '" +
+        "--session-class expects NAME=COUNTxCONTEXT with COUNT at least 0 "
+        "and CONTEXT at least 1, e.g. main=1x262144; got '" +
         std::string(spec) + "'";
     return false;
   };
@@ -37,15 +37,18 @@ bool SessionClassSet::Add(std::string_view spec,
       std::from_chars(count_end + 1, context_end, context);
   if (parsed_count.ec != std::errc{} || parsed_count.ptr != count_end ||
       parsed_context.ec != std::errc{} || parsed_context.ptr != context_end ||
-      count == 0 || context == 0)
+      context == 0)
     return invalid();
   if (std::ranges::any_of(*classes,
                           [&](const auto& c) { return c.name == name; })) {
     *error = "--session-class name '" + name + "' is given twice";
     return false;
   }
-  classes->push_back(
-      {.name = std::move(name), .count = count, .max_context = context});
+  // A class without sessions is switched off: nothing is allocated for it and
+  // the model name is not served.
+  if (count != 0)
+    classes->push_back(
+        {.name = std::move(name), .count = count, .max_context = context});
   return true;
 }
 

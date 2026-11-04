@@ -33,11 +33,15 @@ void TestParsing() {
          "the parsed fields are kept");
   const auto before = classes;
   for (const char* bad :
-       {"", "main", "=1x2", "main=", "main=1", "main=x5", "main=0x5",
-        "main=5x0", "main=1x2x3", "main=-1x5", "main=1xfive", "sub=1x1"}) {
+       {"", "main", "=1x2", "main=", "main=1", "main=x5", "main=5x0",
+        "main=1x2x3", "main=-1x5", "main=1xfive", "sub=1x1"}) {
     Expect(!Parses(bad, &classes), std::string("rejected: ") + bad);
   }
   Expect(classes == before, "a refused class changes nothing");
+  Expect(Parses("off=0x65536", &classes) && classes == before,
+         "a class with no sessions is accepted and not served");
+  Expect(!Parses("off=0x0", &classes),
+         "a switched-off class still needs a context");
   std::string error;
   Expect(!SessionClassSet::Add("main=2x4096", &classes, &error) &&
              error.find("twice") != std::string::npos,

@@ -725,8 +725,9 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddCustomOption(
         "", "--session-class", "NAME=COUNTxCONTEXT",
         "Serve COUNT sessions of CONTEXT tokens as model NAME from the same "
-        "loaded weights (repeatable; replaces --sessions, --context and "
-        "--served-model-name; Qwen3.8 27B and Flash-Next)",
+        "loaded weights (repeatable; COUNT 0 switches the class off; replaces "
+        "--sessions, --context and --served-model-name; Qwen3.8 27B and "
+        "Flash-Next)",
         "Model",
         [](std::string_view, std::string_view, std::string*) { return true; });
 
@@ -1429,8 +1430,9 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddCustomOption(
         "", "--session-class", "NAME=COUNTxCONTEXT",
         "Serve COUNT sessions of CONTEXT tokens as model NAME from the same "
-        "loaded weights (repeatable; replaces --sessions, --context and "
-        "--served-model-name; Qwen3.8 27B and Flash-Next)",
+        "loaded weights (repeatable; COUNT 0 switches the class off; replaces "
+        "--sessions, --context and --served-model-name; Qwen3.8 27B and "
+        "Flash-Next)",
         "Model",
         [&session_classes](std::string_view, std::string_view value,
                            std::string* err) {
@@ -1560,7 +1562,12 @@ int RunServe(std::span<const char* const> args) {
       max_pending_requests_per_client = std::min(
           max_pending_requests, server::kDefaultMaxPendingRequestsPerClient);
     }
-    if (!session_classes.empty()) {
+    if (llm_parser.WasSupplied("--session-class")) {
+      if (session_classes.empty()) {
+        std::cerr << "Error: every --session-class has 0 sessions, so "
+                     "nothing would be served\n";
+        return 2;
+      }
       for (const std::string_view replaced :
            {"--sessions", "--context", "--served-model-name"}) {
         if (llm_parser.WasSupplied(replaced)) {
