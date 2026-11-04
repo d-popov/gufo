@@ -206,6 +206,10 @@ constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
 constexpr std::string_view kTraceHelp =
     "Append text request bodies, rendered prompts, generated text and replies "
     "to PATH as JSON Lines; the file holds client content";
+constexpr std::string_view kPeekHelp =
+    "Keep the last N finished requests, and show running and queued ones, with "
+    "their prompt tail and generated text in memory for administrator keys "
+    "(GET /v1/admin/sessions); 0 disables it (default: 0)";
 
 void AddCacheRamOption(gufo::cli::ArgParser& parser,
                        server::TextRunnerRamCacheOptions* target) {
@@ -694,6 +698,7 @@ void PrintServeHelp(std::string_view program_name,
     bool log_progress = false;
     bool enable_yarn = false;
     std::string trace_path;
+    std::size_t peek_sessions = 0;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
@@ -829,6 +834,8 @@ void PrintServeHelp(std::string_view program_name,
                    "--log-level=info or debug)",
                    "Logging", &log_progress);
     parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging", &trace_path);
+    parser.AddOption("", "--peek-sessions", "N", kPeekHelp, "Logging",
+                     &peek_sessions);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -1383,6 +1390,7 @@ int RunServe(std::span<const char* const> args) {
     bool log_progress = false;
     bool enable_yarn = false;
     std::string trace_path;
+    std::size_t peek_sessions = 0;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -1535,6 +1543,8 @@ int RunServe(std::span<const char* const> args) {
                        "Logging", &log_progress);
     llm_parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging",
                          &trace_path);
+    llm_parser.AddOption("", "--peek-sessions", "N", kPeekHelp, "Logging",
+                         &peek_sessions);
 
     add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
@@ -1602,6 +1612,13 @@ int RunServe(std::span<const char* const> args) {
         (stall_timeout_ms != 0 && stall_timeout_ms < kMinStallTimeoutMs) ||
         !sampling_valid) {
       std::cerr << "Error: sampling and scheduling limits are invalid\n";
+      return 2;
+    }
+    // The peek route answers only an `access=admin` key. With no key file
+    // nobody could read it, and the content would sit in memory unread.
+    if (peek_sessions > 0 && api_key_file.empty()) {
+      std::cerr << "Error: --peek-sessions needs --api-key-file with an "
+                   "access=admin key\n";
       return 2;
     }
     if (draft_tokens == 0 || min_draft_tokens == 0 ||
@@ -1698,6 +1715,7 @@ int RunServe(std::span<const char* const> args) {
                 std::chrono::milliseconds{
                     static_cast<std::chrono::milliseconds::rep>(
                         stall_timeout_ms)},
+            .peek_sessions = peek_sessions,
             .log_progress = log_progress,
         },
         speculative_config,

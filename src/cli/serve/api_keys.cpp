@@ -137,8 +137,10 @@ std::optional<ApiKeyTable> ApiKeyTable::Parse(std::string_view text,
           key.access = ApiKeyAccess::kInference;
         } else if (value == "monitor") {
           key.access = ApiKeyAccess::kMonitor;
+        } else if (value == "admin") {
+          key.access = ApiKeyAccess::kAdmin;
         } else {
-          return fail("access must be inference or monitor");
+          return fail("access must be inference, monitor or admin");
         }
       } else if (option.starts_with("models=") && !models_seen) {
         models_seen = true;
@@ -155,8 +157,8 @@ std::optional<ApiKeyTable> ApiKeyTable::Parse(std::string_view text,
         return fail("unknown or repeated option '" + std::string(option) + "'");
       }
     }
-    if (key.access == ApiKeyAccess::kMonitor && !key.models.empty())
-      return fail("a monitor key cannot list models");
+    if (key.access != ApiKeyAccess::kInference && !key.models.empty())
+      return fail("a monitor or admin key cannot list models");
     if (!names.insert(key.name).second)
       return fail("duplicate key name '" + key.name + "'");
     if (!digests.insert(key.digest).second)

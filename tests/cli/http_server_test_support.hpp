@@ -99,6 +99,8 @@ public:
   }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;
+  std::vector<SessionPeek> session_peeks() const override { return peeks; }
+  std::vector<SessionPeek> peeks;
   std::string model_path() const override { return served_path; }
   std::string build_info() const override { return served_build; }
   std::string served_path;

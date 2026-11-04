@@ -78,6 +78,10 @@ struct SessionTable {
 
   std::mutex mutex;
   std::vector<std::shared_ptr<const ScheduledRequest>> requests;
+  /// Requests that held a session and ended, oldest first, for the
+  /// administrator's peek. At most `finished_limit` (`--peek-sessions`).
+  std::deque<TextGenerationBackend::SessionPeek> finished;
+  std::size_t finished_limit{0};
 };
 
 struct OutputPiece {
@@ -162,6 +166,19 @@ struct ScheduledRequest {
   std::atomic<std::size_t> live_cached_prompt_tokens{0};
   std::atomic<std::size_t> live_prefill_tokens{0};
   std::atomic<std::size_t> live_generated_tokens{0};
+
+  // Administrator's peek (`--peek-sessions`). The prompt tail is decoded at
+  // submission; the scheduler thread appends streamed text to `peek_output`
+  // and the peek reads both from another thread, so `peek_mutex` guards them.
+  bool peek{false};
+  std::string peek_model;
+  std::string peek_http_request;
+  std::int64_t peek_started_ms{0};
+  mutable std::mutex peek_mutex;
+  std::string peek_prompt;
+  bool peek_prompt_truncated{false};
+  std::string peek_output;
+  bool peek_output_truncated{false};
   std::exception_ptr failure;
   bool terminal{false};
 
@@ -177,6 +194,65 @@ struct PendingClient {
   std::string client_id;
   std::deque<std::shared_ptr<ScheduledRequest>> requests;
 };
+
+/// Prompt tokens decoded for the peek, counted from the end of the prompt:
+/// the latest turn is what an administrator wants, and decoding a whole
+/// 200k-token prompt on every request would not be free.
+constexpr std::size_t kPeekPromptTokens = 4096;
+/// Streamed text kept per request. The buffer is trimmed in halves, so it
+/// holds between this much and twice this much.
+constexpr std::size_t kPeekOutputBytes = 32 * 1024;
+
+const char* FinishName(const TextGenerationScheduler::Result& result);
+
+std::int64_t UnixMilliseconds() noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+/// Appends text the client receives to the request's peek, trimming from the
+/// front at a UTF-8 boundary once it exceeds twice `kPeekOutputBytes`.
+void AppendPeekOutput(ScheduledRequest& request, std::string_view piece) {
+  if (piece.empty())
+    return;
+  const std::lock_guard<std::mutex> lock(request.peek_mutex);
+  auto& output = request.peek_output;
+  output.append(piece);
+  if (output.size() <= 2 * kPeekOutputBytes)
+    return;
+  std::size_t cut = output.size() - kPeekOutputBytes;
+  while (cut < output.size() &&
+         (static_cast<unsigned char>(output[cut]) & 0xC0U) == 0x80U)
+    ++cut;
+  output.erase(0, cut);
+  request.peek_output_truncated = true;
+}
+
+/// A copy of the request's current peek content. Reads the live counters, so
+/// it is safe from any thread.
+[[nodiscard]] TextGenerationBackend::SessionPeek PeekOf(
+    const ScheduledRequest& request,
+    TextGenerationBackend::SessionPeek::State state) {
+  TextGenerationBackend::SessionPeek peek;
+  peek.state = state;
+  peek.request_id = request.id;
+  peek.client = request.client_id;
+  peek.model = request.peek_model;
+  peek.http_request = request.peek_http_request;
+  peek.prompt_tokens = request.result.prompt_tokens;
+  peek.cached_prompt_tokens =
+      request.live_cached_prompt_tokens.load(std::memory_order_relaxed);
+  peek.generated_tokens =
+      request.live_generated_tokens.load(std::memory_order_relaxed);
+  peek.started_ms = request.peek_started_ms;
+  const std::lock_guard<std::mutex> lock(request.peek_mutex);
+  peek.prompt = request.peek_prompt;
+  peek.prompt_truncated = request.peek_prompt_truncated;
+  peek.output = request.peek_output;
+  peek.output_truncated = request.peek_output_truncated;
+  return peek;
+}
 
 void LogPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
                         std::string_view stage, std::string_view release = {}) {
@@ -234,10 +310,34 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
     request->terminal = true;
     if (std::exchange(request->counted_processing, false)) {
       if (request->session != kNoSession) {
+        // Built before the table's mutex is taken: that mutex never nests
+        // another lock. A failure here only drops the entry.
+        std::optional<TextGenerationBackend::SessionPeek> peek;
+        if (request->peek) {
+          try {
+            peek = PeekOf(*request,
+                          TextGenerationBackend::SessionPeek::State::kFinished);
+            peek->ended_ms = UnixMilliseconds();
+            peek->finish = request->failure != nullptr
+                               ? "error"
+                               : FinishName(request->result);
+          } catch (...) {
+            peek.reset();
+          }
+        }
         const std::lock_guard<std::mutex> sessions_lock(
             request->sessions->mutex);
         request->sessions->requests[std::exchange(request->session, kNoSession)]
             .reset();
+        if (peek) {
+          try {
+            auto& finished = request->sessions->finished;
+            finished.push_back(std::move(*peek));
+            while (finished.size() > request->sessions->finished_limit)
+              finished.pop_front();
+          } catch (...) {
+          }
+        }
       }
       detail::RequestsProcessing().fetch_sub(1, std::memory_order_relaxed);
     }
@@ -534,6 +634,7 @@ struct TextGenerationScheduler::Impl {
           "text generation scheduler runner pool must not be null");
     }
     sessions = std::make_shared<SessionTable>(runner_pool->capacity());
+    sessions->finished_limit = scheduler_policy.peek_sessions;
     // `/slots` lists each class's sessions together, in class order.
     for (std::size_t first = 0; const auto& c : runner_pool->classes()) {
       class_first.push_back(first);
@@ -824,6 +925,38 @@ struct TextGenerationScheduler::Impl {
     return states;
   }
 
+  [[nodiscard]] std::vector<TextGenerationBackend::SessionPeek> PeekSnapshot()
+      const {
+    using Peek = TextGenerationBackend::SessionPeek;
+    std::vector<Peek> peeks;
+    if (scheduler_policy.peek_sessions == 0)
+      return peeks;
+    std::vector<std::shared_ptr<const ScheduledRequest>> running;
+    std::vector<Peek> finished;
+    {
+      const std::lock_guard<std::mutex> lock(sessions->mutex);
+      for (const auto& request : sessions->requests)
+        if (request != nullptr)
+          running.push_back(request);
+      finished.assign(sessions->finished.rbegin(), sessions->finished.rend());
+    }
+    const auto listed = [&](std::uint64_t id) {
+      return std::ranges::any_of(
+          peeks, [id](const Peek& peek) { return peek.request_id == id; });
+    };
+    for (const auto& request : running)
+      peeks.push_back(PeekOf(*request, Peek::State::kRunning));
+    // Taken after the sessions, so a request admitted in between may appear
+    // in both; it is listed once, as running.
+    for (const auto& request : QueuedSnapshot())
+      if (request->peek && !listed(request->id))
+        peeks.push_back(PeekOf(*request, Peek::State::kQueued));
+    for (auto& peek : finished)
+      if (!listed(peek.request_id))
+        peeks.push_back(std::move(peek));
+    return peeks;
+  }
+
   [[nodiscard]] std::vector<std::shared_ptr<ScheduledRequest>> QueuedSnapshot()
       const {
     const std::lock_guard<std::mutex> lock(queue_mutex);
@@ -1025,6 +1158,8 @@ struct TextGenerationScheduler::Impl {
     if (request->stop_filter.enabled()) {
       auto tail = request->stop_filter.Finish();
       request->result.text += tail;
+      if (request->peek)
+        AppendPeekOutput(*request, tail);
       if (!tail.empty() && !PublishPiece(request, std::move(tail)))
         throw TextGenerationError(
             TextGenerationErrorCode::kOutputBackpressure,
@@ -1557,6 +1692,8 @@ struct TextGenerationScheduler::Impl {
                           "text generation buffered output limit exceeded")));
       return false;
     }
+    if (request->peek)
+      AppendPeekOutput(*request, piece);
     if (incremental_text_is_exact) {
       request->result.text += piece;
     }
@@ -2438,6 +2575,11 @@ TextGenerationScheduler::SessionStates() const {
   return impl_->SessionSnapshot();
 }
 
+std::vector<TextGenerationBackend::SessionPeek>
+TextGenerationScheduler::SessionPeeks() const {
+  return impl_->PeekSnapshot();
+}
+
 std::size_t TextGenerationScheduler::buffered_output_bytes() const noexcept {
   return impl_->output_budget->buffered_bytes.load(std::memory_order_relaxed);
 }
@@ -2543,6 +2685,18 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       impl_->scheduler_policy.max_buffered_output_bytes_per_request;
   request->output_budget = impl_->output_budget;
   request->sessions = impl_->sessions;
+  if (impl_->scheduler_policy.peek_sessions > 0) {
+    request->peek = true;
+    request->peek_model = session_class.name;
+    // The HTTP server binds its request id to the submitting thread.
+    request->peek_http_request = Trace::CurrentRequest();
+    request->peek_started_ms = UnixMilliseconds();
+    const std::size_t keep =
+        std::min(request->prompt.size(), kPeekPromptTokens);
+    request->peek_prompt_truncated = keep < request->prompt.size();
+    request->peek_prompt = Trace::Text(impl_->runner_pool->runner().Decode(
+        std::span<const TextRunnerToken>(request->prompt).last(keep)));
+  }
 
   // Decoded before the enqueue below hands the prompt to the scheduler thread.
   std::optional<GenerationTrace> trace;

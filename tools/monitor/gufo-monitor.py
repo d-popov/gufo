@@ -778,12 +778,13 @@ class GufoClient:
             self._headers["Authorization"] = "Bearer " + api_key
         self.timeout = timeout
 
-    def get(self, path: str) -> tuple[int, bytes]:
-        """GET path; returns (status, body). Raises OSError when unreachable."""
+    def get(self, path: str, limit: int = 4 << 20) -> tuple[int, bytes]:
+        """GET path; returns (status, body), the body cut at `limit` bytes. Raises OSError when
+        unreachable."""
         request = urllib.request.Request(self.base_url + path, headers=self._headers)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.status, response.read(4 << 20)
+                return response.status, response.read(limit)
         except urllib.error.HTTPError as error:
             try:
                 body = error.read(64 << 10)
@@ -1921,23 +1922,23 @@ def parse_key_line(line: str) -> dict | None:
             raise KeyFileError(f"unknown or repeated option '{option}'")
         seen.add(option_name)
         if option_name == "access":
-            if value not in ("inference", "monitor"):
-                raise KeyFileError("access must be inference or monitor")
+            if value not in ("inference", "monitor", "admin"):
+                raise KeyFileError("access must be inference, monitor or admin")
             key["access"] = value
         else:
             models = value.split(",")
             if not value or not all(models):
                 raise KeyFileError("models must list served model names")
             key["models"] = models
-    if key["access"] == "monitor" and key["models"]:
-        raise KeyFileError("a monitor key cannot list models")
+    if key["access"] != "inference" and key["models"]:
+        raise KeyFileError("a monitor or admin key cannot list models")
     return key
 
 
 def format_key_line(key: dict) -> str:
     parts = [key["name"], "sha256:" + key["digest"]]
-    if key["access"] == "monitor":
-        parts.append("access=monitor")
+    if key["access"] != "inference":
+        parts.append("access=" + key["access"])
     if key["models"]:
         parts.append("models=" + ",".join(key["models"]))
     return " ".join(parts)
@@ -1993,8 +1994,8 @@ class KeyStore:
             raise KeyFileError("name, access and models are required")
         if not KEY_NAME.fullmatch(name):
             raise KeyFileError("key name must be 1-64 characters of A-Z a-z 0-9 . _ -")
-        if access not in ("inference", "monitor"):
-            raise KeyFileError("access must be inference or monitor")
+        if access not in ("inference", "monitor", "admin"):
+            raise KeyFileError("access must be inference, monitor or admin")
         if any(not KEY_MODEL.fullmatch(model) for model in models):
             raise KeyFileError("model names cannot be empty or contain spaces or commas")
         key = {"name": name, "digest": "0" * 64, "access": access, "models": models}
@@ -2548,6 +2549,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except billing.Error as error:
             return self._account_error(error.status, error.code, error.message)
         self._json(200, json.dumps(report).encode())
+
+    def _sessions(self):
+        """GET /api/sessions: Gufo's /v1/admin/sessions, the queued, running and recently
+        finished requests with their prompt tail and generated text. Gufo answers it only to an
+        `access=admin` key, so the monitor's own key has to be one; nothing is stored here."""
+        try:
+            status, body = self.server.monitor.gufo.get("/v1/admin/sessions", limit=16 << 20)
+        except OSError:
+            return self._json(502, b'{"error":"gufo_unreachable"}')
+        if status == 200:
+            return self._json(200, body)
+        detail = {
+            403: "Gufo refused the monitor's key: give it access=admin in the key file",
+            404: "this Gufo has no session peek: update it and start it with --peek-sessions",
+        }.get(status, f"Gufo answered HTTP {status}")
+        return self._json(502, json.dumps({"error": "unavailable", "detail": detail}).encode())
 
     def _long_stats(self):
         """The last 24 h / 7 days tile: StatsStore.long_window, O(hours)."""
@@ -3352,6 +3369,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._stream(until)
         if path == "/api/stats/long":
             return self._long_stats()
+        if path == "/api/sessions":
+            return self._sessions()
         if path == "/api/chat/models":
             return self._chat_models()
         if path == "/api/admin/accounts":

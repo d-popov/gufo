@@ -15,8 +15,10 @@
 namespace gufo::server {
 
 /// What a key may do. Monitoring keys read health, readiness, models, props,
-/// slots and metrics; they cannot submit work.
-enum class ApiKeyAccess { kInference, kMonitor };
+/// slots and metrics; they cannot submit work. Admin keys read the same and
+/// also the content of queued, running and finished requests; they cannot
+/// submit work either.
+enum class ApiKeyAccess { kInference, kMonitor, kAdmin };
 
 struct ApiKey {
   /// Empty for the single `--api-key`; otherwise the file's NAME.
@@ -43,7 +45,7 @@ public:
   static ApiKeyTable FromKey(std::string_view key);
 
   /// Parses an `--api-key-file`. One key per line:
-  ///   NAME sha256:HEX [access=inference|monitor] [models=NAME,...]
+  ///   NAME sha256:HEX [access=inference|monitor|admin] [models=NAME,...]
   /// Blank lines and lines starting with `#` are ignored. Returns nullopt and
   /// sets `*error` (with the line number) for any invalid line, duplicate
   /// name or duplicate credential, or a file without keys.

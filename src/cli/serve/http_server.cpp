@@ -1595,6 +1595,46 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
   return Ok(resp);
 }
 
+/// Content of queued, running and recently finished requests. The authorizer
+/// lets only an `access=admin` key reach it; the check here also covers a
+/// server without keys, which must never hand out conversations.
+HttpResponse AdminSessions(const HttpRequest& req, TextGenerationBackend& b) {
+  if (req.api_key == nullptr || req.api_key->access != ApiKeyAccess::kAdmin) {
+    return Err(403, "Forbidden",
+               "this route needs an API key with access=admin",
+               "permission_error", "permission_denied");
+  }
+  using Peek = TextGenerationBackend::SessionPeek;
+  json::Value data = json::Value::array();
+  for (const auto& peek : b.session_peeks()) {
+    json::Value entry = json::Value::object();
+    entry["request"] = Trace::Text(peek.http_request);
+    entry["generation"] = peek.request_id;
+    entry["state"] = peek.state == Peek::State::kQueued    ? "queued"
+                     : peek.state == Peek::State::kRunning ? "running"
+                                                           : "finished";
+    entry["client"] = Trace::Text(peek.client);
+    entry["model"] = Trace::Text(peek.model);
+    entry["prompt_tokens"] = peek.prompt_tokens;
+    entry["cached_tokens"] = peek.cached_prompt_tokens;
+    entry["generated_tokens"] = peek.generated_tokens;
+    entry["started_ms"] = peek.started_ms;
+    if (peek.state == Peek::State::kFinished) {
+      entry["ended_ms"] = peek.ended_ms;
+      entry["finish"] = peek.finish;
+    }
+    entry["prompt"] = Trace::Text(peek.prompt);
+    entry["prompt_truncated"] = peek.prompt_truncated;
+    entry["output"] = Trace::Text(peek.output);
+    entry["output_truncated"] = peek.output_truncated;
+    data.push_back(std::move(entry));
+  }
+  json::Value resp = json::Value::object();
+  resp["object"] = "list";
+  resp["data"] = std::move(data);
+  return Ok(resp);
+}
+
 /// Context held by in-flight requests across all sessions, over the sum of
 /// their capacities.
 double KvCacheUsageRatio(const TextGenerationBackend& b) {
@@ -1999,6 +2039,7 @@ void HttpServer::register_routes() {
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
+  add("GET", "/v1/admin/sessions", AdminSessions);
   add("GET", "/metrics", LlamaMetrics);
   add("GET", "/v1/metrics", LlamaMetrics);
 

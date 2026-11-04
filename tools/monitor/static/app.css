@@ -25,6 +25,11 @@ body > main, .status-row, body > .detail, footer { max-width: 1440px; margin-inl
 .long-table th.num, .long-table td { text-align: right; padding: 0 0 0 6px; white-space: nowrap; }
 .long-table thead th { font-size: .65rem; }
 .toggle { font-size: var(--text-sm); color: var(--muted); }
+.peek-entry { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; }
+.peek-entry summary { cursor: pointer; }
+.peek-state { font-weight: 600; text-transform: uppercase; font-size: .7rem; }
+.peek-state.state-running { color: var(--accent, inherit); }
+.peek-text { white-space: pre-wrap; word-break: break-word; max-height: 24rem; overflow: auto; margin: 4px 0 10px; font-size: var(--text-sm); }
 .fill-col { min-width: 180px; }
 .fill { display: flex; align-items: center; gap: 8px; }
 .bar { flex: 1; height: 6px; background: var(--line); border-radius: 4px; overflow: hidden; min-width: 80px; }

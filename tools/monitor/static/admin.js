@@ -73,6 +73,8 @@ window.GufoAdmin = (() => {
     }).catch(() => {});
   }
 
+  const ACCESS_LABELS = { inference: 'Inference', monitor: 'Monitoring', admin: 'Admin' };
+
   // { state: () => monitor state | null, active: () => bool, onChange: (admin) => void }
   let options = {};
   let fetchedState = null;
@@ -168,7 +170,7 @@ window.GufoAdmin = (() => {
   }
 
   function syncModelControls() {
-    const monitor = $('admin-key-access').value === 'monitor';
+    const monitor = $('admin-key-access').value !== 'inference';
     $('admin-key-models').disabled = monitor;
     const all = $('admin-key-all-models').checked;
     for (const box of $('admin-key-model-list').querySelectorAll('input')) box.disabled = all || monitor;
@@ -217,8 +219,8 @@ window.GufoAdmin = (() => {
         }
         rows.push(el('tr', {},
           el('td', {}, key.name),
-          el('td', {}, key.access === 'monitor' ? 'Monitoring' : 'Inference'),
-          el('td', {}, key.access === 'monitor' ? '—' : key.models.length ? key.models.join(', ') : 'All'),
+          el('td', {}, ACCESS_LABELS[key.access] ?? 'Inference'),
+          el('td', {}, key.access !== 'inference' ? '—' : key.models.length ? key.models.join(', ') : 'All'),
           el('td', { class: 'num' }, fmt(used.requests ?? 0, 0)),
           el('td', { class: 'num' }, fmt(used.prompt_tokens ?? 0, 0)),
           el('td', { class: 'num' }, fmt(used.cached_tokens ?? 0, 0)),
@@ -264,7 +266,7 @@ window.GufoAdmin = (() => {
   async function submitKey(event) {
     event.preventDefault();
     const access = $('admin-key-access').value;
-    const models = access === 'monitor' || $('admin-key-all-models').checked ? []
+    const models = access !== 'inference' || $('admin-key-all-models').checked ? []
       : [...$('admin-key-model-list').querySelectorAll('input:checked')].map((box) => box.value);
     if (access === 'inference' && !$('admin-key-all-models').checked && !models.length) {
       showKeysError('Choose at least one model, or All models.');

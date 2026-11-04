@@ -137,6 +137,42 @@ public:
     std::uint32_t context{0};
   };
 
+  /// Content of one request for the administrator's peek. Held in memory
+  /// only, and only when the server runs with `--peek-sessions`.
+  struct SessionPeek {
+    enum class State : std::uint8_t { kQueued, kRunning, kFinished };
+    State state{State::kQueued};
+    /// The scheduler's number for the request: the `request=` value of
+    /// scheduler debug and progress lines, and `generation` in the trace.
+    std::uint64_t request_id{0};
+    /// The HTTP request id, the `X-Request-ID` header and `request=rN` of
+    /// the request log lines; empty when the request did not come through
+    /// the HTTP server. It differs from `request_id`: every HTTP request,
+    /// polls included, takes a number.
+    std::string http_request;
+    /// Key name, or the peer address when the request had no named key.
+    std::string client;
+    /// Served model of the request's session class; empty for the unnamed one.
+    std::string model;
+    std::size_t prompt_tokens{0};
+    std::size_t cached_prompt_tokens{0};
+    std::size_t generated_tokens{0};
+    /// Wall-clock milliseconds since the Unix epoch; `ended_ms` is 0 until
+    /// the request finishes.
+    std::int64_t started_ms{0};
+    std::int64_t ended_ms{0};
+    /// `stop`, `stop_sequence`, `length`, `cancelled` or `error`; empty until
+    /// the request finishes.
+    std::string finish;
+    /// Rendered prompt as the model reads it, special tokens spelled out.
+    /// Only its last tokens are kept; `prompt_truncated` says it was cut.
+    std::string prompt;
+    bool prompt_truncated{false};
+    /// Text streamed to the client so far (its tail when long).
+    std::string output;
+    bool output_truncated{false};
+  };
+
   /// One model name a backend answers to, with its per-request context.
   struct ServedModel {
     std::string id;
@@ -300,6 +336,12 @@ public:
   }
   /// Live execution sessions; empty when the backend has no session pool.
   [[nodiscard]] virtual std::vector<SessionState> session_states() const {
+    return {};
+  }
+  /// Queued, running and recently finished requests with their content,
+  /// running first, then queued, then finished newest first. Empty unless the
+  /// backend keeps peeks.
+  [[nodiscard]] virtual std::vector<SessionPeek> session_peeks() const {
     return {};
   }
   /// Whether the loaded backend accepts image inputs in chat requests.

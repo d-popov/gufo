@@ -387,6 +387,17 @@ std::vector<InferenceBackend::SessionState> InferenceBackend::session_states()
 #endif
 }
 
+std::vector<InferenceBackend::SessionPeek> InferenceBackend::session_peeks()
+    const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->scheduler->SessionPeeks()
+                          : std::vector<SessionPeek>{};
+#else
+  return {};
+#endif
+}
+
 InferenceBackend::SamplingDefaults InferenceBackend::sampling_defaults() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();

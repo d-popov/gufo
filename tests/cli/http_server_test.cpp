@@ -3580,11 +3580,13 @@ void TestApiKeyFileParsing() {
   std::string error;
   const auto table = ApiKeyTable::Parse(
       "# name credential options\n\n  alice sha256:" + alice +
-          " models=fn,fn-sub\r\nbob\tsha256:" + upper_bob + "\nwatch sha256:" +
-          ApiKeyDigest("watch-secret") + " access=monitor\n",
+          " models=fn,fn-sub\r\nbob\tsha256:" + upper_bob +
+          "\nwatch sha256:" + ApiKeyDigest("watch-secret") +
+          " access=monitor\nboss sha256:" + ApiKeyDigest("boss-secret") +
+          " access=admin\n",
       &error);
   assert(table.has_value());
-  assert(table->size() == 3);
+  assert(table->size() == 4);
   const auto* key = table->match("alice-secret");
   assert(key != nullptr && key->name == "alice");
   assert(key->access == ApiKeyAccess::kInference);
@@ -3593,6 +3595,7 @@ void TestApiKeyFileParsing() {
   key = table->match("bob-secret");
   assert(key != nullptr && key->allows_model("anything"));
   assert(table->match("watch-secret")->access == ApiKeyAccess::kMonitor);
+  assert(table->match("boss-secret")->access == ApiKeyAccess::kAdmin);
   assert(table->match("alice-secret ") == nullptr);
   assert(table->match("") == nullptr);
 
@@ -3606,7 +3609,7 @@ void TestApiKeyFileParsing() {
            {"al/ice" + good, "line 1: key name"},
            {"alice sha256:abc", "line 1: credential"},
            {"alice plain-secret", "line 1: credential"},
-           {"alice" + good + " access=admin", "line 1: access"},
+           {"alice" + good + " access=root", "line 1: access"},
            {"alice" + good + " colour=red", "line 1: unknown or repeated"},
            {"alice" + good + " models=a models=b",
             "line 1: unknown or repeated"},
@@ -3614,6 +3617,8 @@ void TestApiKeyFileParsing() {
            {"alice" + good + " models=", "line 1: models"},
            {"alice" + good + " models=a,", "line 1: models"},
            {"alice" + good + " access=monitor models=a", "line 1: a monitor"},
+           {"alice" + good + " access=admin models=a",
+            "line 1: a monitor or admin"},
            {"alice" + good + "\nalice sha256:" + ApiKeyDigest("x"),
             "line 2: duplicate key name"},
            {"alice" + good + "\nbob" + good, "line 2: credential of 'bob'"},
@@ -3659,6 +3664,21 @@ void TestAuthorization() {
                             std::to_string(body.size()) + "\r\n\r\n" + body),
                200);
   assert(secured.backend->calls == 1);
+  // The single --api-key has full inference access but no admin access, and
+  // a server without keys has none to give: neither serves request content.
+  secured.backend->peeks.emplace_back();
+  secured.backend->peeks.back().prompt = "secret question";
+  const auto keyed = secured.Send(
+      "GET /v1/admin/sessions HTTP/1.1\r\nAuthorization: Bearer "
+      "test-secret\r\n\r\n");
+  ExpectStatus(keyed, 403);
+  assert(keyed.find("secret question") == std::string::npos);
+  RunningServer open;
+  open.backend->peeks.emplace_back();
+  open.backend->peeks.back().prompt = "secret question";
+  const auto unkeyed = open.Send("GET /v1/admin/sessions HTTP/1.1\r\n\r\n");
+  ExpectStatus(unkeyed, 403);
+  assert(unkeyed.find("secret question") == std::string::npos);
 }
 
 void TestApiKeyFile() {
@@ -3676,7 +3696,8 @@ void TestApiKeyFile() {
   };
   write("alice sha256:" + ApiKeyDigest("alice-secret") + " models=test\n" +
         "bob sha256:" + ApiKeyDigest("bob-secret") + " models=other\n" +
-        "watch sha256:" + ApiKeyDigest("watch-secret") + " access=monitor\n");
+        "watch sha256:" + ApiKeyDigest("watch-secret") + " access=monitor\n" +
+        "boss sha256:" + ApiKeyDigest("boss-secret") + " access=admin\n");
 
   bool rejected = false;
   try {
@@ -3755,6 +3776,47 @@ void TestApiKeyFile() {
     }
     assert(server.backend->calls == 1);
 
+    // Request content is for an admin key alone: not a monitoring key, not an
+    // inference key, and not an admin key's way to submit work.
+    gufo::server::TextGenerationBackend::SessionPeek peek;
+    peek.state =
+        gufo::server::TextGenerationBackend::SessionPeek::State::kRunning;
+    peek.request_id = 7;  // the scheduler's number, not an HTTP id
+    peek.http_request = "r93";
+    peek.client = "alice";
+    peek.prompt = "secret question";
+    peek.output = "partial answ";
+    server.backend->peeks = {peek};
+    for (const std::string key : {"watch-secret", "alice-secret"}) {
+      const auto response = send(key, "GET", "/v1/admin/sessions");
+      ExpectStatus(response, 403);
+      assert(response.find("permission_denied") != std::string::npos);
+      assert(response.find("secret question") == std::string::npos);
+    }
+    const auto admin = send("boss-secret", "GET", "/v1/admin/sessions");
+    ExpectStatus(admin, 200);
+    assert(admin.find("\"request\":\"r93\"") != std::string::npos);
+    assert(admin.find("\"generation\":7") != std::string::npos);
+    assert(admin.find("\"request\":\"r7\"") == std::string::npos);
+    assert(admin.find("\"state\":\"running\"") != std::string::npos);
+    assert(admin.find("secret question") != std::string::npos);
+    assert(admin.find("partial answ") != std::string::npos);
+    ExpectStatus(send("boss-secret", "GET", "/slots"), 200);
+    ExpectStatus(send("boss-secret", "POST", "/v1/completions", completion),
+                 403);
+    ExpectStatus(send("boss-secret", "GET", "/peer"), 403);
+
+    // Polls take HTTP request ids too. The id the client gets in
+    // X-Request-ID after them is the one the backend's work is bound to, which
+    // is what a peek entry's `request` carries to match logs and the monitor.
+    ExpectStatus(send("alice-secret", "GET", "/health"), 200);
+    ExpectStatus(send("alice-secret", "GET", "/metrics"), 200);
+    const auto generated =
+        send("alice-secret", "POST", "/v1/completions", completion);
+    ExpectStatus(generated, 200);
+    assert(ResponseRequestId(generated) ==
+           server.backend->LastCall().trace_request);
+
     // Edits apply without a restart: alice is revoked, carol added.
     write("carol sha256:" + ApiKeyDigest("carol-secret") + "\n");
     const auto deadline =
@@ -3775,7 +3837,7 @@ void TestApiKeyFile() {
   std::clog.rdbuf(previous_sink);
   Logger::SetLevel(previous);
   const std::string log = logs.str();
-  assert(log.find("auth=key_file keys=3") != std::string::npos);
+  assert(log.find("auth=key_file keys=4") != std::string::npos);
   assert(log.find("event=received method=POST path=/v1/completions "
                   "body_bytes=30 key=alice") != std::string::npos);
   // The completion line names the key just before the memory fields.
@@ -3783,8 +3845,8 @@ void TestApiKeyFile() {
   assert(log.find("error_code=model_not_allowed key=bob") != std::string::npos);
   assert(log.find("event=api_keys_reloaded keys=1") != std::string::npos);
   assert(log.find("event=api_keys_reload_failed") != std::string::npos);
-  for (const std::string secret :
-       {"alice-secret", "bob-secret", "watch-secret", "carol-secret"})
+  for (const std::string secret : {"alice-secret", "bob-secret", "watch-secret",
+                                   "carol-secret", "boss-secret"})
     assert(log.find(secret) == std::string::npos);
   std::filesystem::remove_all(directory);
 }

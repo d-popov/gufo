@@ -1422,6 +1422,7 @@ models. One key per line:
 alice    sha256:9f86d0...  models=qwen3.8-flash-next
 bob      sha256:2c26b4...
 monitor  sha256:fcde2b...  access=monitor
+admin    sha256:3b7a1c...  access=admin
 ```
 
 - **NAME** is 1–64 characters of `A-Z a-z 0-9 . _ -`.
@@ -1431,7 +1432,12 @@ monitor  sha256:fcde2b...  access=monitor
 - **`access=monitor`** allows only `GET` on health, readiness, `/v1/models`,
   `/props`, `/slots` and `/metrics`. Every other route answers
   `403 permission_denied`. The default is `access=inference`, which allows
-  every route.
+  every route except the administrator's one below.
+- **`access=admin`** allows the same `GET` routes as `access=monitor` and
+  `GET /v1/admin/sessions` ([Request content](#request-content)), which
+  returns prompts and generated text. It cannot submit work. No other key
+  reaches that route, `access=inference` keys included, and a server with no
+  key file never serves it. Neither kind can list `models=`.
 - **`models=A,B`** allows only the listed served model names, on every route
   except the monitoring ones above, WebSocket upgrades included. The check
   uses the model of the service the route reaches (text, speech,
@@ -1647,6 +1653,36 @@ turn. Gufo-specific details stay in `usage.gufo`.
 TODO: retained-cache KV metrics, a validated administrative reload/drain
 interface, and in-process recovery after device reset or suspend/resume.
 
+### Request content
+
+`--peek-sessions N` lets an administrator read what is queued, running and
+recently finished. Gufo keeps, in memory only, for each request: the client,
+the model, token counts, the last 4096 tokens of the rendered prompt (special
+tokens spelled out) and the text streamed so far (its last 32–64 KiB). Finished
+requests go into a first-in, first-out history of the last `N`; the oldest
+leaves when a new one finishes. Requests that were cancelled or failed in the
+queue never held a session and are not kept. Nothing is written to disk or to
+the logs, and a restart empties it. `0` (the default) keeps nothing, and the
+server refuses `--peek-sessions` without `--api-key-file`, since no one could
+read it.
+
+`GET /v1/admin/sessions` needs an `access=admin` key (`403 permission_denied`
+for any other, and for a server without keys). It returns
+`{"object":"list","data":[...]}`: running requests first, then queued, then
+finished newest first. Each entry has `request` (the HTTP request id: the
+`X-Request-ID` header and the `request=rN` of the log lines; empty when the
+request did not come through the HTTP server), `generation` (the scheduler's
+own number: the `request=` of scheduler debug and progress lines, and
+`generation` in the trace; it differs from `request`, since every HTTP request,
+polls included, takes an HTTP number),
+`state` (`running`, `queued` or `finished`), `client`, `model`,
+`prompt_tokens`, `cached_tokens`, `generated_tokens`, `started_ms`,
+`prompt` and `output` with `prompt_truncated` and `output_truncated`, and, once
+finished, `ended_ms` and `finish` (`stop`, `stop_sequence`, `length`,
+`cancelled` or `error`). A running request's text is a snapshot; poll again for
+more. The route is a `GET`, so requests to it stay out of the log at the
+default level.
+
 ## Troubleshooting logs
 
 Server lifecycle and request logs go to stderr. Each request gets an
@@ -1700,7 +1736,9 @@ batch workspace) are suppressed by `--log-level=warn`/`error` too.
 
 Prompt text and message bodies stay unlogged at every level, and debug
 lines use the same escaping and redaction as the rest of the log. Only the
-opt-in [content trace](#content-trace), a separate file, records content. Client
+opt-in [content trace](#content-trace), a separate file, records content to
+disk; `--peek-sessions` ([Request content](#request-content)) holds it in
+memory for administrator keys and never writes it. Client
 identity is the exception: scheduler admission lines name a client by the peer
 address of its socket (`client_id=127.0.0.1` on the default loopback bind), so a
 public `--host` writes client IP addresses into the debug tier.

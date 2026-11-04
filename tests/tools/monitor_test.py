@@ -143,7 +143,9 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
     ready_status = 200
     slow = {}  # per slow request: pieces sent, and whether the monitor hung up
     models_status = 200
+    sessions_status = 200  # what /v1/admin/sessions answers; Gufo gives it to access=admin keys only
     chat_request = None
+    chat_requests = []  # every streamed chat request, in order
     def log_message(self, *args):
         pass
 
@@ -165,6 +167,12 @@ class FakeGufo(http.server.BaseHTTPRequestHandler):
             return self._reply(200, {"model_alias": model, "build_info": "0.22.0 (abc)",
                                      "total_slots": 1,
                                      "default_generation_settings": {"n_ctx": 65536}})
+        if path == "/v1/admin/sessions":
+            if self.sessions_status != 200:
+                return self._reply(self.sessions_status, {"error": {"code": "permission_denied"}})
+            return self._reply(200, {"object": "list", "data": [
+                {"request": "r7", "state": "running", "client": "alice",
+                 "prompt": "secret question", "output": "partial answ"}]})
         if path == "/slots":
             return self._reply(200, [
                 {"id": 0, "model": "fn", "n_ctx": 262144, "is_processing": True, "id_task": 3,
@@ -1614,8 +1622,9 @@ class KeyStoreTest(unittest.TestCase):
                 ("alice", "inference", [], "already exists"),
                 ("al ice", "inference", [], "key name"),
                 ("x" * 65, "inference", [], "key name"),
-                ("bob", "admin", [], "access"),
-                ("bob", "monitor", ["fn"], "monitor key"),
+                ("bob", "root", [], "access"),
+                ("bob", "monitor", ["fn"], "cannot list models"),
+                ("bob", "admin", ["fn"], "cannot list models"),
                 ("bob", "inference", ["a b"], "spaces or commas"),
                 ("bob", "inference", ["a,b"], "spaces or commas"),
                 ("bob", "inference", [""], "spaces or commas"),
@@ -2167,6 +2176,63 @@ class LongStatsHttpTest(unittest.TestCase):
         self.assertEqual(body["windows"]["168h"]["decode_tps"], 50.0)
         status, _ = self.get({"Authorization": "Bearer " + ADMIN_TOKEN})
         self.assertEqual(status, 200)
+
+
+class SessionsHttpTest(unittest.TestCase):
+    """The admin's view of request content: Gufo's /v1/admin/sessions, relayed and stored nowhere."""
+
+    def setUp(self):
+        FakeGufo.sessions_status = 200
+        self.addCleanup(setattr, FakeGufo, "sessions_status", 200)
+        self.gufo = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeGufo))
+        monitor = gm.Monitor(gm.GufoClient(f"http://127.0.0.1:{self.gufo.server_address[1]}",
+                                           GUFO_KEY), NoTelemetry())
+        self.server = serve(gm.Server(("127.0.0.1", 0), monitor, gm.AdminAuth(ADMIN_TOKEN), False))
+
+    def tearDown(self):
+        for server in (self.server, self.gufo):
+            server.shutdown()
+            server.server_close()
+
+    def get(self, headers):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
+                                                timeout=5)
+        connection.request("GET", "/api/sessions", headers=headers)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def test_admin_only(self):
+        for headers in ({}, {"X-Admin-Token": "wrong"}):
+            status, data = self.get(headers)
+            self.assertEqual((status, data), (401, b'{"error":"unauthorized"}'))
+            self.assertNotIn(b"secret question", data)
+
+    def test_relays_gufo_content(self):
+        status, data = self.get({"X-Admin-Token": ADMIN_TOKEN})
+        self.assertEqual(status, 200)
+        entry = json.loads(data)["data"][0]
+        self.assertEqual((entry["request"], entry["prompt"], entry["output"]),
+                         ("r7", "secret question", "partial answ"))
+
+    def test_says_what_to_fix_when_gufo_refuses_the_key(self):
+        for refused, hint in ((403, "access=admin"), (404, "--peek-sessions")):
+            FakeGufo.sessions_status = refused
+            status, data = self.get({"X-Admin-Token": ADMIN_TOKEN})
+            self.assertEqual(status, 502)
+            self.assertIn(hint, json.loads(data)["detail"])
+
+
+class AdminKeyLineTest(unittest.TestCase):
+    def test_admin_access_round_trips_and_cannot_list_models(self):
+        line = "boss sha256:" + "ab" * 32 + " access=admin"
+        key = gm.parse_key_line(line)
+        self.assertEqual(key["access"], "admin")
+        self.assertEqual(gm.format_key_line(key), line)
+        with self.assertRaises(gm.KeyFileError):
+            gm.parse_key_line(line + " models=a")
+
 
 
 if __name__ == "__main__":

@@ -1560,6 +1560,63 @@ void TestPendingClientsAreRoundRobinAndIndividuallyBounded() {
          "pending clients rotate before one client receives another admission");
 }
 
+void TestPeekListsLiveRequestsAndKeepsRecentFinished() {
+  using Peek = gufo::server::TextGenerationBackend::SessionPeek;
+  auto control = std::make_shared<FakeControl>();
+  control->max_context = 5000;
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {}, {.peek_sessions = 2});
+
+  // The HTTP server binds its request id to the submitting thread; the
+  // scheduler numbers requests itself, so the two differ.
+  auto active = [&] {
+    const gufo::server::Trace::RequestScope scope("r15");
+    return scheduler->Submit({1}, 4, 0.0F, {}, false,
+                             ClientMetadata("active-client"));
+  }();
+  control->WaitForAdvance(1);
+  auto queued = [&] {
+    const gufo::server::Trace::RequestScope scope("r16");
+    return scheduler->Submit({2}, 1, 0.0F, {}, false,
+                             ClientMetadata("queued-client"));
+  }();
+  auto peeks = scheduler->SessionPeeks();
+  Expect(peeks.size() == 2 && peeks[0].state == Peek::State::kRunning &&
+             peeks[0].client == "active-client" && peeks[0].prompt == "1" &&
+             peeks[1].state == Peek::State::kQueued &&
+             peeks[1].client == "queued-client" && peeks[1].prompt == "2",
+         "the peek lists the running request, then the queued one, with "
+         "their prompts");
+  Expect(peeks[0].http_request == "r15" && peeks[1].http_request == "r16" &&
+             peeks[0].http_request != "r" + std::to_string(peeks[0].request_id),
+         "a peek entry carries the HTTP request id, apart from the "
+         "scheduler's own number");
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  (void)queued.Wait();
+  // A prompt longer than the kept tail reports it was cut, and the third
+  // finished request pushes the oldest out of a two-entry history.
+  (void)scheduler
+      ->Submit(std::vector<TextRunnerToken>(4100, 3), 1, 0.0F, {}, false,
+               ClientMetadata("long-client"))
+      .Wait();
+  peeks = scheduler->SessionPeeks();
+  Expect(peeks.size() == 2 && peeks[0].state == Peek::State::kFinished &&
+             peeks[0].client == "long-client" && peeks[0].finish == "length" &&
+             peeks[0].prompt_truncated && peeks[0].prompt_tokens == 4100 &&
+             std::ranges::count(peeks[0].prompt, ',') == 4095,
+         "a long prompt keeps only its last 4096 tokens and says so");
+  Expect(peeks[1].client == "queued-client" && peeks[1].output == "200" &&
+             peeks[1].http_request == "r16" && peeks[1].generated_tokens == 1 &&
+             peeks[1].ended_ms != 0,
+         "finished requests keep their generated text, newest first, and the "
+         "oldest leaves a full history");
+  Expect(
+      MakeScheduler(std::make_shared<FakeControl>(), 1)->SessionPeeks().empty(),
+      "a scheduler without --peek-sessions retains no content");
+}
+
 void TestExpiredQueuedRequestNeverConsumesState() {
   auto control = std::make_shared<FakeControl>();
   control->block_advance_label = 1;
@@ -3306,6 +3363,7 @@ int main() {
   TestDefaultPolicyKeepsQueueRoomForOtherClients();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();
+  TestPeekListsLiveRequestsAndKeepsRecentFinished();
   TestExpiredQueuedRequestNeverConsumesState();
   TestSlowConsumerOutputIsBoundedAndReclaimed();
   TestCompletedAbandonedStreamReleasesOutputBudget();

@@ -61,6 +61,16 @@
       <p id="requests-empty" class="muted">No completed requests yet.</p>
     </section>
 
+    <section id="peek-section">
+      <div class="section-head">
+        <h2 class="with-icon"><span data-icon="messages-square"></span>Request content</h2>
+        <label class="toggle"><input type="checkbox" id="peek-on"> Show content</label>
+      </div>
+      <p id="peek-note" class="muted">Off: nothing is fetched. Gufo keeps the end of each prompt and the generated text of queued,
+        running and the last finished requests in memory (<code>--peek-sessions</code>); the monitor stores none of it.</p>
+      <div id="peek-list"></div>
+    </section>
+
     <section id="admin-keys-section" hidden>
       <div class="section-head">
         <h2 class="with-icon"><span data-icon="key-round"></span>API keys</h2>
@@ -91,6 +101,7 @@
           <select id="admin-key-access">
             <option value="inference">Inference</option>
             <option value="monitor">Monitoring only (health, models, props, slots, metrics)</option>
+            <option value="admin">Admin (monitoring plus request content, no inference)</option>
           </select>
           <fieldset id="admin-key-models">
             <legend>Models</legend>

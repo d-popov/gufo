@@ -405,7 +405,18 @@ python3 tools/monitor/gufo-monitor.py --gufo http://127.0.0.1:8080 \
 ```
 
 The monitor's own Gufo key can be a monitoring key (`access=monitor`): it only needs
-`/ready`, `/v1/models`, `/props`, `/slots` and `/metrics`.
+`/ready`, `/v1/models`, `/props`, `/slots` and `/metrics`. Make it `access=admin` to use
+**Request content** (below); an admin key reads the same routes and cannot submit work.
+
+## Request content
+
+The **Request content** section of `/monitor` lists what Gufo holds with `--peek-sessions N`:
+the queued and running requests and the last `N` finished ones (a first-in, first-out history),
+each with the client, token counts, the end of its prompt and the text generated so far. Tick
+**Show content** to fetch it (every 2 s, only while ticked); the monitor relays Gufo's
+`GET /v1/admin/sessions` through `GET /api/sessions` (admin sign-in only) and stores nothing.
+Gufo answers only an `access=admin` key: with any other the section says what to change.
+The text is the admin's to read: it is the users' conversations.
 
 ## Credits portal
 

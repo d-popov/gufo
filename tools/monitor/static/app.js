@@ -433,6 +433,7 @@ function scheduleRender() {
 function sessionExpired() {
   if (expired) return;
   expired = true;
+  stopPeek();
   source?.close();
   $('expired').hidden = false;
   window.GufoAdmin.load().catch(() => {});  // the key and account panels close too
@@ -498,6 +499,105 @@ function connect() {
   });
 }
 
+// ---------------------------------------------------------------- request content
+// What Gufo holds with --peek-sessions: queued and running requests and the last finished
+// ones, each with the end of its prompt and the text generated so far. Fetched only while
+// "Show content" is ticked; the monitor keeps nothing. Text goes in with textContent only.
+
+const PEEK_MS = 2000;
+let peekEpoch = 0;     // bumped whenever the section stops, so a late response can tell it is stale
+let peekAbort = null;  // the fetch in flight, aborted on stop
+let peekTimer = null;
+let peekBusy = false;
+const peekOpen = new Set();  // request ids the admin expanded, kept across refreshes
+
+function peekSummary(entry) {
+  const parts = [entry.request || `generation ${entry.generation}`, entry.client || 'anonymous'];
+  if (entry.model) parts.push(entry.model);
+  parts.push(`${fmt(entry.prompt_tokens, 0)} in`, `${fmt(entry.generated_tokens, 0)} out`);
+  return parts.join(' · ');
+}
+
+function peekBlock(title, text, truncated) {
+  const pre = el('pre', { class: 'peek-text' });
+  pre.textContent = text || '(empty)';
+  const note = truncated ? ' (only the end is kept)' : '';
+  return el('div', {}, el('div', { class: 'muted' }, title + note), pre);
+}
+
+function peekRowOf(entry) {
+  const state = entry.state === 'finished' ? entry.finish : entry.state;
+  const node = el('details', { class: 'peek-entry' },
+    el('summary', {}, el('span', { class: `peek-state state-${entry.state}` }, state), ' ', peekSummary(entry)),
+    peekBlock('Prompt', entry.prompt, entry.prompt_truncated),
+    peekBlock('Output', entry.output, entry.output_truncated));
+  node.open = peekOpen.has(entry.generation);
+  node.addEventListener('toggle', () => {
+    if (node.open) peekOpen.add(entry.generation);
+    else peekOpen.delete(entry.generation);
+  });
+  return node;
+}
+
+function renderPeek(data) {
+  const list = $('peek-list');
+  const entries = data?.data ?? [];
+  if (!entries.length) {
+    list.replaceChildren(el('p', { class: 'muted' }, 'No requests held. Is Gufo started with --peek-sessions?'));
+    return;
+  }
+  list.replaceChildren(...entries.map(peekRowOf));
+}
+
+async function refreshPeek() {
+  if (peekBusy) return;
+  peekBusy = true;
+  const epoch = peekEpoch;
+  const controller = new AbortController();
+  peekAbort = controller;
+  // A response that arrives after the section was switched off, or the session ended, is dropped
+  // unread: it must never put content back on a page that no longer shows it.
+  const current = () => epoch === peekEpoch;
+  try {
+    const response = await fetch('/api/sessions',
+      { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+    if (!current()) return;
+    if (response.status === 401) return sessionExpired();
+    const body = await response.json().catch(() => ({}));
+    if (!current()) return;
+    if (!response.ok) {
+      $('peek-list').replaceChildren(el('p', { class: 'bad' }, body.detail ?? `HTTP ${response.status}`));
+      return;
+    }
+    renderPeek(body);
+  } catch (error) {
+    if (current()) $('peek-list').replaceChildren(el('p', { class: 'bad' }, 'The monitor is not reachable.'));
+  } finally {
+    if (current()) peekBusy = false;
+  }
+}
+
+// Off, or the session ended: no timer, no request in flight, nothing of the content left in the page.
+function stopPeek() {
+  peekEpoch += 1;
+  clearInterval(peekTimer);
+  peekTimer = null;
+  peekAbort?.abort();
+  peekAbort = null;
+  peekBusy = false;
+  peekOpen.clear();
+  $('peek-list').replaceChildren();
+  $('peek-on').checked = false;
+}
+
+function setPeek(on) {
+  stopPeek();
+  if (!on) return;
+  $('peek-on').checked = true;
+  refreshPeek();
+  peekTimer = setInterval(refreshPeek, PEEK_MS);
+}
+
 // ---------------------------------------------------------------- setup
 // API keys and accounts live in admin.js (GufoAdmin), fed with this page's state; the
 // page header and the admin sign-in in header.js (GufoHeader).
@@ -533,6 +633,7 @@ document.addEventListener('DOMContentLoaded', () => {
     requestsDirty = true;
     scheduleRender();
   });
+  $('peek-on').addEventListener('change', (event) => setPeek(event.target.checked));
   window.GufoHeader.init({ onSession, onAdminTab: showAdminSection });
   window.GufoHeader.refresh().catch(() => {});
   window.GufoAdmin.init({ state: () => state, onChange: () => window.GufoHeader.refresh().catch(() => {}) });

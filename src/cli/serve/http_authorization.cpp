@@ -68,6 +68,12 @@ bool IsMonitoringRoute(const HttpRequest& request) {
   return std::ranges::find(kPaths, request.path) != kPaths.end();
 }
 
+/// The route that returns request content. Only an admin key may read it;
+/// the handler checks that too, so a server without keys never serves it.
+bool IsAdminRoute(const HttpRequest& request) {
+  return request.method == "GET" && request.path == "/v1/admin/sessions";
+}
+
 }  // namespace
 
 std::optional<HttpResponse> AuthorizeRequest(
@@ -92,6 +98,13 @@ std::optional<HttpResponse> AuthorizeRequest(
     return Refuse(403, "Forbidden",
                   "this API key may only read health, models, props, slots "
                   "and metrics",
+                  "permission_error", "permission_denied");
+  }
+  if (key->access == ApiKeyAccess::kAdmin && !IsMonitoringRoute(request) &&
+      !IsAdminRoute(request)) {
+    return Refuse(403, "Forbidden",
+                  "this API key may only read health, models, props, slots, "
+                  "metrics and admin sessions",
                   "permission_error", "permission_denied");
   }
   if (!key->models.empty() && !IsMonitoringRoute(request)) {

@@ -65,6 +65,10 @@ struct TextSchedulerPolicy {
   /// pending capture for this long is reported as a lost device. Zero
   /// disables it.
   std::chrono::milliseconds stall_timeout{0};
+  /// Finished requests kept, with their prompt tail and generated text, for
+  /// the administrator's peek. Zero disables the peek: no request content is
+  /// then retained. Running and queued requests are listed while it is on.
+  std::size_t peek_sessions{0};
   bool log_progress{false};
 };
 
@@ -150,6 +154,10 @@ public:
   [[nodiscard]] bool device_lost() const noexcept;
   /// One entry per session; admitted requests hold one until terminal.
   [[nodiscard]] std::vector<SessionState> SessionStates() const;
+  /// Content of queued, running and recently finished requests; see
+  /// TextGenerationBackend::SessionPeek. Empty when `peek_sessions` is zero.
+  [[nodiscard]] std::vector<TextGenerationBackend::SessionPeek> SessionPeeks()
+      const;
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
 
