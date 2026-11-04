@@ -13,7 +13,7 @@ const CARDS = [
     sub: (s) => (s.gpu_mhz != null ? `${fmt(s.gpu_mhz, 0)} MHz` : '') },
   { key: 'gtt_used_gb', icon: 'memory-stick', label: 'GPU memory (GTT)', unit: 'GB', digits: 1,
     sub: (s) => `of ${fmt(s.gtt_total_gb, 1)} GB` },
-  { key: 'mem_avail_gb', icon: 'memory-stick', label: 'Memory available', unit: 'GB', digits: 1,
+  { key: 'mem_avail_gb', icon: 'memory-stick', label: 'Memory available', unit: 'GB', digits: 1, low: true,
     sub: (s) => `swap ${fmt(s.swap_used_gb, 1)} of ${fmt(s.swap_total_gb, 1)} GB used` },
   { key: 'gpu_temp_c', icon: 'thermometer', label: 'GPU temperature', unit: '°C', digits: 0 },
   { key: 'gpu_power_w', icon: 'plug-zap', label: 'GPU power', unit: 'W', digits: 0 },
@@ -165,6 +165,7 @@ function buildCards() {
   for (const card of CARDS) {
     const value = el('span', { class: 'card-number' }, '—');
     const sub = el('div', { class: 'card-sub' });
+    const extreme = el('div', { class: 'card-sub card-peak' });
     const area = svg('path', { class: 'area' });
     const line = svg('path');
     const dots = svg('path', { class: 'dots' });
@@ -175,8 +176,8 @@ function buildCards() {
     root.append(el('div', { class: 'card' },
       el('div', { class: 'card-label with-icon' }, window.GufoIcons.svg(card.icon), card.label),
       el('div', { class: 'card-value' }, value, unit),
-      sub, chart));
-    Object.assign(card, { valueNode: value, unitNode: unit, subNode: sub, area, line, dots });
+      sub, extreme, chart));
+    Object.assign(card, { valueNode: value, unitNode: unit, subNode: sub, peakNode: extreme, area, line, dots });
   }
   root.append(buildLongCard());
 }
@@ -250,14 +251,36 @@ function sparkline(card, values) {
   card.dots.setAttribute('d', dots);
 }
 
+// "15 min": the span the charts show, from the monitor's history length and poll interval.
+function historyWindowLabel() {
+  const seconds = (state.history_len ?? 0) * (state.poll_s ?? 1);
+  if (seconds >= 3600) return `${fmt(seconds / 3600, seconds % 3600 ? 1 : 0)} h`;
+  return seconds >= 60 ? `${fmt(seconds / 60, seconds % 60 ? 1 : 0)} min` : `${fmt(seconds, 0)} s`;
+}
+
+// The highest value in the chart window (the lowest for a card where less is worse).
+function extremeOf(series, low) {
+  let best = null;
+  for (const value of series) {
+    if (value == null || !Number.isFinite(value)) continue;
+    if (best == null || (low ? value < best : value > best)) best = value;
+  }
+  return best;
+}
+
 function renderCards() {
   const sample = state.sample ?? {};
+  const span = historyWindowLabel();
   for (const card of CARDS) {
     const value = card.value ? card.value(sample) : sample[card.key];
     card.valueNode.textContent = fmt(value, card.digits);
     card.unitNode.textContent = value == null ? '' : card.unit ?? '';
     card.subNode.textContent = card.sub ? card.sub(sample) : '';
-    sparkline(card, state.history[card.key] ?? []);
+    const series = state.history[card.key] ?? [];
+    const extreme = extremeOf(series, card.low);
+    card.peakNode.textContent = extreme == null ? ''
+      : `${card.low ? 'lowest' : 'max'} ${fmt(extreme, card.digits)}${card.unit ? ` ${card.unit}` : ''} · last ${span}`;
+    sparkline(card, series);
   }
 }
 
@@ -530,15 +553,15 @@ function peekBlockOf(title) {
   return { pre, note, node: el('div', {}, el('div', { class: 'muted' }, title, note), pre) };
 }
 
-// A block's text changes only when Gufo's did, and a block the admin scrolled stays where it is;
-// one scrolled to its end keeps following the end as the output grows.
-function setPeekBlock(block, text, truncated) {
+// A block's text changes only when Gufo's did. A block the admin scrolled stays where it is; an
+// output scrolled to its end (or too short to scroll yet) keeps following the end as it grows.
+function setPeekBlock(block, text, truncated, follow) {
   const shown = text || '(empty)';
   if (block.pre.textContent !== shown) {
     const { scrollTop, scrollHeight, clientHeight } = block.pre;
     const atEnd = scrollTop + clientHeight >= scrollHeight - 4;
     block.pre.textContent = shown;
-    block.pre.scrollTop = atEnd && scrollTop > 0 ? block.pre.scrollHeight : scrollTop;
+    block.pre.scrollTop = follow && atEnd ? block.pre.scrollHeight : scrollTop;
   }
   block.note.textContent = truncated ? ' (only the end is kept)' : '';
 }
@@ -560,8 +583,8 @@ function updatePeekRow(row, entry) {
   row.state.className = `peek-state state-${entry.state}`;
   row.state.textContent = peekState(entry);
   row.label.textContent = ` ${peekSummary(entry)}`;
-  setPeekBlock(row.prompt, entry.prompt, entry.prompt_truncated);
-  setPeekBlock(row.output, entry.output, entry.output_truncated);
+  setPeekBlock(row.prompt, entry.prompt, entry.prompt_truncated, false);
+  setPeekBlock(row.output, entry.output, entry.output_truncated, true);
 }
 
 // Rows are kept between polls and updated in place: rebuilding the list every 2 s threw the
@@ -586,7 +609,11 @@ function renderPeek(data) {
   for (const generation of [...peekRows.keys()]) if (!seen.has(generation)) peekRows.delete(generation);
   const current = Array.from(list.children);
   if (current.length !== nodes.length || current.some((node, index) => node !== nodes[index])) {
+    // Moving a node resets what it scrolled; put each block back where the admin left it.
+    const scrolled = [...peekRows.values()].flatMap((row) => [row.prompt.pre, row.output.pre])
+      .map((pre) => [pre, pre.scrollTop]);
     list.replaceChildren(...nodes);
+    for (const [pre, top] of scrolled) pre.scrollTop = top;
   }
 }
 
