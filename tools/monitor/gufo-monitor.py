@@ -109,6 +109,7 @@ ENV_KEYS = ("GUFO_PUBLIC_URL", "GUFO_API_URL")
 # The admin session cookie, from POST /api/admin/login; sent to /monitor and /api/.
 ADMIN_COOKIE_NAME = "gufo_monitor_admin"
 ADMIN_COOKIE_MAX_AGE = 12 * 3600
+ADMIN_COOKIE_REMEMBER_MAX_AGE = 30 * 24 * 3600  # "Keep me signed in" on the admin sign-in
 LIBRARY_TOKEN_PREFIX = "glib-"  # the read-only bearer an MCP client holds instead of the admin token
 SIGNIN_LIMIT = 10  # sign-in attempts per client address per SIGNIN_WINDOW_S
 SIGNIN_WINDOW_S = 60.0
@@ -1132,6 +1133,9 @@ class Monitor:
         self._published_request_seq = 0
         self.billing = None  # with --billing-config: meters each completed request
         self.stats: StatsStore | None = None  # hourly sums for the long-window tile
+        self.peak_tps: dict[str, float | None] = {"prefill": None, "decode": None}
+        self._peaks_seeded = False
+        self.solo_rates = SlotRates()  # the lone session's rates, apart from slot_rates
 
     # -- polling
 
@@ -1159,6 +1163,7 @@ class Monitor:
         telemetry = self.telemetry.read()
         with self.cond:
             self._record(t, status, metrics, deltas, slots, rates, telemetry)
+            self._raise_peaks(slots, slots_t)
             self._publish()
         if self.stats is not None:
             self.stats.maybe_flush(t)
@@ -1236,6 +1241,29 @@ class Monitor:
         except OSError:
             return []
         return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
+
+    def _raise_peaks(self, slots: list[dict], t: float):
+        """The best prefill and decode rates of a session with the server to itself. They
+        come from a rate window of their own that starts when exactly one session is running
+        and is dropped the moment that stops being true: the smoothed rates of the sessions
+        still span up to RATE_WINDOW_S of time shared with a session that has since ended.
+        Decode appears once the lone span reaches MIN_RATE_SPAN_S. The stored bests are read
+        once."""
+        if self.stats is not None and not self._peaks_seeded:
+            self._peaks_seeded = True
+            for kind, value in self.stats.peaks.items():
+                if value is not None and value > (self.peak_tps[kind] or 0):
+                    self.peak_tps[kind] = value
+        busy = [s for s in slots if s.get("is_processing")]
+        if len(busy) != 1:
+            self.solo_rates.reset()
+            return
+        decode, prefill = self.solo_rates.update(busy, t)[(busy[0].get("model"), busy[0].get("id"))]
+        for kind, rate in (("prefill", prefill), ("decode", decode)):
+            if rate and rate > (self.peak_tps[kind] or 0):  # decode is None until known
+                self.peak_tps[kind] = rate
+                if self.stats is not None:
+                    self.stats.note_peak(kind, rate)
 
     def _record(self, t, status, metrics, deltas, slots, rates, telemetry):
         self.status = status
@@ -1342,6 +1370,7 @@ class Monitor:
             "props": self.props,
             "slots": self.slots,
             "sample": self.sample,
+            "peak_tps": self.peak_tps,
             "totals": self.totals,
             "log_totals": self.log_totals,
             "key_usage": self.key_usage,
@@ -1616,6 +1645,9 @@ class StatsStore:
             meta = dict(self.conn.execute("SELECT name, value FROM meta").fetchall())
         self.log_since: float | None = meta.get("log_since")  # first log line seen
         self.samples_since: float | None = meta.get("samples_since")  # first GPU sample
+        # The best prefill and decode rates a single session reached; kept for good.
+        self.peaks: dict[str, float | None] = {
+            kind: meta.get(f"peak_{kind}_tps") for kind in ("prefill", "decode")}
         self._hours: dict[int, collections.Counter] = {}
         self._keys: dict[str, float] = {}
         self._flushed_t: float | None = None
@@ -1671,6 +1703,12 @@ class StatsStore:
             if self.samples_since is None or t < self.samples_since:
                 self.samples_since = t
 
+    def note_peak(self, kind: str, rate: float):
+        """Raise the best rate of one session on its own: KIND is "prefill" or "decode"."""
+        with self.lock:
+            if self.peaks[kind] is None or rate > self.peaks[kind]:
+                self.peaks[kind] = rate
+
     def maybe_flush(self, now: float):
         if self._flushed_t is None:
             self._flushed_t = now
@@ -1701,6 +1739,11 @@ class StatsStore:
                 if value is not None:
                     conn.execute("INSERT INTO meta (name, value) VALUES (?, ?) ON CONFLICT (name) "
                                  "DO UPDATE SET value = min(value, excluded.value)", (name, value))
+            for kind, value in self.peaks.items():
+                if value is not None:
+                    conn.execute("INSERT INTO meta (name, value) VALUES (?, ?) ON CONFLICT (name) "
+                                 "DO UPDATE SET value = max(value, excluded.value)",
+                                 (f"peak_{kind}_tps", value))
             oldest = now - STATS_RETENTION_S
             conn.execute("DELETE FROM hours WHERE hour < ?", (int(oldest // 3600),))
             conn.execute("DELETE FROM seen WHERE t < ?", (oldest,))
@@ -2100,9 +2143,11 @@ class AdminAuth:
         return hmac.new(self._token, b"gufo-monitor-admin-v2:%d" % expires,
                         hashlib.sha256).hexdigest().encode()
 
-    def session(self, now: float | None = None) -> str:
-        """A new session cookie value, valid for ADMIN_COOKIE_MAX_AGE."""
-        expires = int(time.time() if now is None else now) + ADMIN_COOKIE_MAX_AGE
+    def session(self, now: float | None = None, max_age: int = ADMIN_COOKIE_MAX_AGE) -> str:
+        """A new session cookie value, valid for MAX_AGE seconds. The expiry is part of what
+        is signed, so a longer one needs no other state, and no way to end it early short of
+        changing the token."""
+        expires = int(time.time() if now is None else now) + max_age
         return f"{expires}.{self._sign(expires).decode()}"
 
     def derive(self, purpose: str) -> str:
@@ -2446,8 +2491,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # -- admin sign-in, from the profile menu of either page
 
     def _admin_login(self):
-        """The admin token for the admin session cookie, sent to /monitor and /api/.
-        Attempts are rate limited per client address, like the portal's sign-in."""
+        """The admin token for the admin session cookie, sent to /monitor and /api/. With
+        `"remember": true` the cookie lasts ADMIN_COOKIE_REMEMBER_MAX_AGE instead of
+        ADMIN_COOKIE_MAX_AGE. Attempts are rate limited per client address, like the
+        portal's sign-in."""
         if not self.server.limiter.allow("admin:" + self.client_ip()):
             return self._error(429, "too many attempts, try again in a minute")
         body = self._read_json(4096)
@@ -2455,8 +2502,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not isinstance(token, str) or not self.server.admin.check_token(token.strip()):
             time.sleep(0.5)
             return self._error(401, "wrong admin token")
+        max_age = ADMIN_COOKIE_REMEMBER_MAX_AGE if body.get("remember") is True \
+            else ADMIN_COOKIE_MAX_AGE
         self._send(204, b"", "text/plain", (
-            self._admin_cookie(self.server.admin.session(), ADMIN_COOKIE_MAX_AGE),))
+            self._admin_cookie(self.server.admin.session(max_age=max_age), max_age),))
 
     def _admin_logout(self):
         self._send(204, b"", "text/plain", (self._admin_cookie("", 0),))

@@ -331,6 +331,27 @@ function renderPill() {
   $('model').textContent = models.length ? models.join(' · ') : status.model ?? '';
 }
 
+// The server's performance while sessions run, as the share of the best a single session
+// reached: its prefill rate over the best prefill plus its decode rate over the best decode.
+// One session alternating between the two stays near 100 %; below that, sessions or
+// settings cost throughput, above it they gain. Null while nothing runs or no best is known.
+function performanceOf(sample, peaks) {
+  const parts = [['Prefill', sample.prefill_tps, peaks?.prefill], ['Decode', sample.decode_tps, peaks?.decode]];
+  if (!parts.some(([, , peak]) => peak > 0) || !(state.slots ?? []).some((s) => s.processing)) return null;
+  const shares = parts.map(([name, rate, peak]) => ({ name, rate: rate ?? 0, peak, pct: peak > 0 ? (100 * (rate ?? 0)) / peak : 0 }));
+  return { pct: shares.reduce((sum, s) => sum + s.pct, 0), shares };
+}
+
+function renderPerformance() {
+  const node = $('performance');
+  const performance = expired || !streamUp ? null : performanceOf(state.sample ?? {}, state.peak_tps);
+  node.hidden = !performance;
+  if (!performance) return;
+  node.textContent = `Performance ${fmt(performance.pct, 0)} %`;
+  node.title = performance.shares.map((s) => `${s.name} ${fmt(s.rate, 0)} of ${s.peak > 0 ? fmt(s.peak, 0) : '—'} tok/s `
+    + `(${fmt(s.pct, 1)} %)`).join('\n') + '\n100 % = the best rate a single session reached, prefill and decode each';
+}
+
 // ---------------------------------------------------------------- sessions
 
 function renderSessions() {
@@ -440,6 +461,7 @@ function render() {
   renderQueued = false;
   if (!state) return;
   renderPill();
+  renderPerformance();
   renderCards();
   renderSessions();
   renderRequests();
@@ -494,7 +516,7 @@ function applyTick(tick) {
     requestsDirty = true;
   }
   for (const key of ['status', 'models', 'props', 'slots', 'sample', 'totals', 'log_totals',
-                     'key_usage', 'key_reload', 'seq']) {
+                     'key_usage', 'key_reload', 'peak_tps', 'seq']) {
     state[key] = tick[key];
   }
   const history = state.history;

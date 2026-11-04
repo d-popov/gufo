@@ -1983,6 +1983,23 @@ class KeyAdminHttpTest(unittest.TestCase):
         self.assertEqual(len(cookies), 1)  # the admin cookie only; there is no monitor cookie
         return cookies[0]
 
+    def test_keep_me_signed_in_lasts_30_days_only_when_asked_for_with_true(self):
+        def sign_in(body):
+            response, _ = self.request("POST", "/api/admin/login", None,
+                                       {"token": ADMIN_TOKEN, **body})
+            self.assertEqual(response.status, 204)
+            return response.headers.get("Set-Cookie")
+
+        for body in ({}, {"remember": False}, {"remember": "true"}, {"remember": 1}):
+            self.assertIn(f"Max-Age={12 * 3600};", sign_in(body), body)
+        cookie = sign_in({"remember": True})
+        self.assertIn(f"Max-Age={30 * 24 * 3600};", cookie)
+        headers = {"Cookie": cookie.split(";")[0]}
+        expires = self.server.admin.valid_until(headers)  # the signed expiry, not just Max-Age
+        self.assertAlmostEqual(expires, time.time() + 30 * 24 * 3600, delta=30)
+        response, _ = self.request("GET", "/api/keys", headers)
+        self.assertEqual(response.status, 200)
+
     def test_keys_are_the_admins_alone(self):
         new = {"name": "alice", "access": "inference", "models": ["fn"]}
         for headers in ({}, {"Authorization": "Bearer wrong"}, {"X-Admin-Token": "wrong"},
@@ -2425,6 +2442,64 @@ class StatsStoreTest(unittest.TestCase):
         monitor.add_request(stats_record(now - 1, "r5"))
         day = self.stats.long_window(now)["windows"]["24h"]
         self.assertEqual((day["requests"], day["serving_pct"]), (1, 0.0))
+
+    def scripted_monitor(self, script):
+        """A monitor whose /slots answers are script(t) for each poll_once(t)."""
+        monitor = gm.Monitor(gm.GufoClient("http://127.0.0.1:9", None), NoTelemetry())
+        monitor.stats = self.stats
+        now = [0.0]
+        monitor._poll_status = lambda: {"state": "ready", "detail": None, "model": None}
+        monitor._poll_info = lambda: None
+        monitor._poll_metrics = lambda: {}
+        monitor._poll_slots = lambda: script(now[0])
+
+        def poll(t):
+            now[0] = t
+            monitor.poll_once(t)
+            return dict(monitor.peak_tps)
+
+        return monitor, poll
+
+    @staticmethod
+    def gufo_slot(slot_id, processing=True, decoded=0, processed=0):
+        return {"id": slot_id, "id_task": 7 + slot_id, "is_processing": processing,
+                "n_prompt_tokens_processed": processed,
+                "next_token": [{"n_decoded": decoded}]}
+
+    def test_peak_decode_ignores_time_shared_with_a_session_that_ended(self):
+        def script(t):  # two sessions at 30 tok/s each until 10 s, then A alone at 50 tok/s
+            if t <= 10:
+                return [self.gufo_slot(0, decoded=int(30 * t)), self.gufo_slot(1, decoded=int(30 * t))]
+            return [self.gufo_slot(0, decoded=int(300 + 50 * (t - 10))),
+                    self.gufo_slot(1, processing=False)]
+
+        monitor, poll = self.scripted_monitor(script)
+        for t in range(1, 14):
+            # Shared time, then A's first lone seconds (from 11 s): no lone rate yet.
+            self.assertEqual(poll(t), {"prefill": None, "decode": None}, t)
+        # A's smoothed rate (its 30 s window) is about 34 tok/s here; the lone span says 50.
+        self.assertEqual(poll(14), {"prefill": None, "decode": 50.0})
+        self.assertEqual(poll(15)["decode"], 50.0)
+        self.stats.flush()
+        self.stats.conn.close()
+        self.stats = gm.StatsStore(self.path)  # a monitor restart
+        monitor, poll = self.scripted_monitor(lambda t: [self.gufo_slot(0, decoded=int(40 * t))])
+        for t in range(1, 6):
+            peaks = poll(t)
+        self.assertEqual(peaks, {"prefill": None, "decode": 50.0})  # 40 tok/s keeps the best
+
+    def test_peak_prefill_is_the_rate_of_a_lone_prompt(self):
+        def script(t):  # two prompts at 500 tok/s each, then one at 1500 tok/s from 4 s
+            if t <= 4:
+                return [self.gufo_slot(0, processed=int(500 * t)),
+                        self.gufo_slot(1, processed=int(500 * t))]
+            return [self.gufo_slot(0, processed=int(2000 + 1500 * (t - 4))),
+                    self.gufo_slot(1, processing=False)]
+
+        _, poll = self.scripted_monitor(script)
+        for t in range(1, 6):  # 5 s is the first lone poll: one sample, no rate yet
+            self.assertIsNone(poll(t)["prefill"], t)
+        self.assertEqual(poll(6)["prefill"], 1500.0)
 
 
 class LongStatsHttpTest(unittest.TestCase):

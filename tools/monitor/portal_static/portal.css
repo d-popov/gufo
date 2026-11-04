@@ -13,6 +13,7 @@ main { max-width: 1040px; margin: 0 auto; }
 .field label { font-size: var(--text-sm); font-weight: 600; }
 .field input { width: 100%; min-height: 44px; }
 .field-hint { font-size: var(--text-xs); }
+.form .check { display: flex; align-items: center; gap: 8px; font-size: var(--text-sm); color: var(--muted); }
 .form .btn-block { width: 100%; min-height: 44px; justify-content: center; }
 .form p { margin: 0; }
 .form-error { padding: 10px 12px; border: 1px solid var(--bad); border-radius: var(--radius-sm); font-size: var(--text-sm); overflow-wrap: anywhere; }

@@ -274,8 +274,10 @@ Open `http://127.0.0.1:8099/?admin`, or choose **Admin sign-in** in the profile 
 Enter the admin token in the portal's **Admin** authentication tab; the shared header
 then links to the monitor (`/monitor`). If the token file does not exist, the monitor creates it on first start at
 `$XDG_CONFIG_HOME/gufo-monitor/admin-token` with mode 0600. The monitor is the admin's
-alone: nobody else sees it, from any host, and the admin sign-in lasts 12 hours. When it
-ends, the open monitor page says so and links to the sign-in.
+alone: nobody else sees it, from any host, and the admin sign-in lasts 12 hours, or 30 days
+with **Keep me signed in** ticked (off by default; the token never leaves the sign-in form
+either way). When it ends, the open monitor page says so and links to the sign-in. Portal
+accounts stay signed in for 30 days.
 
 Scripts send the admin token as `X-Admin-Token: <token>` or
 `Authorization: Bearer <token>`.
@@ -330,6 +332,16 @@ WantedBy=default.target
   "Generating" without a rate, and the session is left out of the total. The token
   counters in `/metrics` only grow when a request completes, so they cannot give a live
   rate.
+- **Performance %** (beside the model names, while a session runs): the summed prefill
+  rate over the best prefill rate plus the summed decode rate over the best decode rate,
+  in percent. The bests are the highest rates a session reached while it was the only one
+  running (the 30 s smoothed rates above), kept in `--stats-file` and so across restarts.
+  Example: prefill 500 of 1500 tok/s (33.3 %) plus decode 30 of 50 tok/s (60 %) is
+  93 %. One session alternates between the two and stays near 100 %; less means
+  sessions or settings cost throughput, more means sessions overlap profitably. Nothing
+  is shown until a single session has run. The bests are server-wide, not per model, and
+  are not lowered by a slower build or model: delete the `peak_prefill_tps` and
+  `peak_decode_tps` rows of the `meta` table to start again.
 - **Cache reuse and draft acceptance:** `/metrics` counter differences over the last
   5 minutes, so they cover completed requests only. A counter that drops means Gufo
   restarted, and the next poll starts a new baseline.
@@ -830,7 +842,9 @@ a **Re-verify against chain** button. Routes (admin authentication, like the oth
   address, counted like the portal's (`CF-Connecting-IP` from loopback). Changes are
   JSON requests, so a cross-site form cannot submit them.
 - **Admin cookie:** `gufo_monitor_admin` holds its expiry time and an HMAC of it under
-  the admin token, never the token; the monitor refuses it after 12 hours, and an open
+  the admin token; the monitor refuses it after 12 hours (30 days when signed in with
+  `"remember": true`, so ticking **Keep me signed in**; it cannot be revoked short of
+  changing the admin token), and an open
   event stream ends then too. It has `Path=/` (sent to `/monitor` and `/api/`),
   `HttpOnly` and `SameSite=Strict`, and `Secure` with `--secure-cookie` or behind a
   proxy that sends `X-Forwarded-Proto: https`. Signing out clears it in the browser;

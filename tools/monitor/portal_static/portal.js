@@ -173,6 +173,7 @@ function clearAdmin() {
   adminWanted = false;
   adminAttempt++;
   $('admin-login-token').value = '';
+  $('admin-login-remember').checked = false;
   showError('admin-login-error', null);
 }
 
@@ -234,7 +235,8 @@ function setUpAuthTabs() {
 async function adminLogin(event) {
   event.preventDefault();
   const attempt = ++adminAttempt;
-  const error = await window.GufoHeader.signInAdmin($('admin-login-token').value);
+  const error = await window.GufoHeader.signInAdmin($('admin-login-token').value,
+    $('admin-login-remember').checked);
   if (attempt !== adminAttempt) return;
   showError('admin-login-error', error);
   if (error) return;

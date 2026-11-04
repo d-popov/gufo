@@ -172,11 +172,11 @@ window.GufoHeader = (() => {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body ?? {}) });
   }
 
-  // The admin sign-in with TOKEN; null once signed in (the session is then refreshed),
-  // otherwise what went wrong.
-  async function signInAdmin(token) {
+  // The admin sign-in with TOKEN; REMEMBER keeps the session for 30 days instead of 12 hours.
+  // Null once signed in (the session is then refreshed), otherwise what went wrong.
+  async function signInAdmin(token, remember = false) {
     try {
-      const response = await adminRequest('/api/admin/login', { token });
+      const response = await adminRequest('/api/admin/login', { token, remember });
       if (!response.ok) {
         return response.status === 401 ? 'Wrong admin token.'
           : response.status === 429 ? 'Too many attempts; try again in a minute.'
