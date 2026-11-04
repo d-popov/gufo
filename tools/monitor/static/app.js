@@ -505,6 +505,7 @@ function connect() {
 // "Show content" is ticked; the monitor keeps nothing. Text goes in with textContent only.
 
 const PEEK_MS = 2000;
+const peekRows = new Map();  // generation -> the row's nodes, reused from poll to poll
 let peekEpoch = 0;     // bumped whenever the section stops, so a late response can tell it is stale
 let peekAbort = null;  // the fetch in flight, aborted on stop
 let peekTimer = null;
@@ -518,35 +519,75 @@ function peekSummary(entry) {
   return parts.join(' · ');
 }
 
-function peekBlock(title, text, truncated) {
+// queued, running, or finished with how it ended (stop, length, cancelled, error)
+function peekState(entry) {
+  return entry.state === 'finished' ? `finished · ${entry.finish}` : entry.state;
+}
+
+function peekBlockOf(title) {
+  const note = el('span', { class: 'muted' });
   const pre = el('pre', { class: 'peek-text' });
-  pre.textContent = text || '(empty)';
-  const note = truncated ? ' (only the end is kept)' : '';
-  return el('div', {}, el('div', { class: 'muted' }, title + note), pre);
+  return { pre, note, node: el('div', {}, el('div', { class: 'muted' }, title, note), pre) };
 }
 
-function peekRowOf(entry) {
-  const state = entry.state === 'finished' ? entry.finish : entry.state;
-  const node = el('details', { class: 'peek-entry' },
-    el('summary', {}, el('span', { class: `peek-state state-${entry.state}` }, state), ' ', peekSummary(entry)),
-    peekBlock('Prompt', entry.prompt, entry.prompt_truncated),
-    peekBlock('Output', entry.output, entry.output_truncated));
-  node.open = peekOpen.has(entry.generation);
-  node.addEventListener('toggle', () => {
-    if (node.open) peekOpen.add(entry.generation);
-    else peekOpen.delete(entry.generation);
+// A block's text changes only when Gufo's did, and a block the admin scrolled stays where it is;
+// one scrolled to its end keeps following the end as the output grows.
+function setPeekBlock(block, text, truncated) {
+  const shown = text || '(empty)';
+  if (block.pre.textContent !== shown) {
+    const { scrollTop, scrollHeight, clientHeight } = block.pre;
+    const atEnd = scrollTop + clientHeight >= scrollHeight - 4;
+    block.pre.textContent = shown;
+    block.pre.scrollTop = atEnd && scrollTop > 0 ? block.pre.scrollHeight : scrollTop;
+  }
+  block.note.textContent = truncated ? ' (only the end is kept)' : '';
+}
+
+function peekRowOf(generation) {
+  const row = { generation, state: el('span', {}), label: el('span', {}),
+    prompt: peekBlockOf('Prompt'), output: peekBlockOf('Output') };
+  row.node = el('details', { class: 'peek-entry' },
+    el('summary', {}, row.state, ' ', row.label), row.prompt.node, row.output.node);
+  row.node.open = peekOpen.has(generation);
+  row.node.addEventListener('toggle', () => {
+    if (row.node.open) peekOpen.add(generation);
+    else peekOpen.delete(generation);
   });
-  return node;
+  return row;
 }
 
+function updatePeekRow(row, entry) {
+  row.state.className = `peek-state state-${entry.state}`;
+  row.state.textContent = peekState(entry);
+  row.label.textContent = ` ${peekSummary(entry)}`;
+  setPeekBlock(row.prompt, entry.prompt, entry.prompt_truncated);
+  setPeekBlock(row.output, entry.output, entry.output_truncated);
+}
+
+// Rows are kept between polls and updated in place: rebuilding the list every 2 s threw the
+// admin's scroll position and text selection away. The list is touched only when the set or
+// order of requests changed.
 function renderPeek(data) {
   const list = $('peek-list');
   const entries = data?.data ?? [];
   if (!entries.length) {
+    peekRows.clear();
     list.replaceChildren(el('p', { class: 'muted' }, 'No requests held. Is Gufo started with --peek-sessions?'));
     return;
   }
-  list.replaceChildren(...entries.map(peekRowOf));
+  const seen = new Set();
+  const nodes = entries.map((entry) => {
+    seen.add(entry.generation);
+    if (!peekRows.has(entry.generation)) peekRows.set(entry.generation, peekRowOf(entry.generation));
+    const row = peekRows.get(entry.generation);
+    updatePeekRow(row, entry);
+    return row.node;
+  });
+  for (const generation of [...peekRows.keys()]) if (!seen.has(generation)) peekRows.delete(generation);
+  const current = Array.from(list.children);
+  if (current.length !== nodes.length || current.some((node, index) => node !== nodes[index])) {
+    list.replaceChildren(...nodes);
+  }
 }
 
 async function refreshPeek() {
@@ -586,6 +627,7 @@ function stopPeek() {
   peekAbort = null;
   peekBusy = false;
   peekOpen.clear();
+  peekRows.clear();
   $('peek-list').replaceChildren();
   $('peek-on').checked = false;
 }
