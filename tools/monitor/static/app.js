@@ -165,7 +165,7 @@ function buildCards() {
   for (const card of CARDS) {
     const value = el('span', { class: 'card-number' }, '—');
     const sub = el('div', { class: 'card-sub' });
-    const extreme = el('div', { class: 'card-sub card-peak' });
+    const extreme = el('span', { class: 'card-peak' });
     const area = svg('path', { class: 'area' });
     const line = svg('path');
     const dots = svg('path', { class: 'dots' });
@@ -174,9 +174,9 @@ function buildCards() {
     chart.append(area, line, dots);
     const unit = el('span', { class: 'card-unit' });
     root.append(el('div', { class: 'card' },
-      el('div', { class: 'card-label with-icon' }, window.GufoIcons.svg(card.icon), card.label),
+      el('div', { class: 'card-label with-icon' }, window.GufoIcons.svg(card.icon), card.label, extreme),
       el('div', { class: 'card-value' }, value, unit),
-      sub, extreme, chart));
+      sub, chart));
     Object.assign(card, { valueNode: value, unitNode: unit, subNode: sub, peakNode: extreme, area, line, dots });
   }
   root.append(buildLongCard());
@@ -278,8 +278,10 @@ function renderCards() {
     card.subNode.textContent = card.sub ? card.sub(sample) : '';
     const series = state.history[card.key] ?? [];
     const extreme = extremeOf(series, card.low);
-    card.peakNode.textContent = extreme == null ? ''
-      : `${card.low ? 'lowest' : 'max'} ${fmt(extreme, card.digits)}${card.unit ? ` ${card.unit}` : ''} · last ${span}`;
+    // In the title, so the tile does not grow; the window and unit are in its tooltip.
+    card.peakNode.textContent = extreme == null ? '' : `${card.low ? 'low' : 'max'} ${fmt(extreme, card.digits)}`;
+    card.peakNode.title = extreme == null ? '' : `${card.low ? 'Lowest' : 'Highest'} in the last ${span}: `
+      + `${fmt(extreme, card.digits)}${card.unit ? ` ${card.unit}` : ''}`;
     sparkline(card, series);
   }
 }
