@@ -1,10 +1,10 @@
 'use strict';
 
-// The chat's Python tool. The model's code runs in /static/pyworker.js, a worker that has no
-// network (see there); this side starts it on first use, hands it Pyodide's files from
-// /static/pyodide/ (signed-in users only), runs one call at a time with a time limit, and
-// returns the text for the model and any matplotlib figures for the thread. Variables stay
-// between calls until a timeout or Stop resets the box.
+// The chat's Python tool. The model's code runs in pyworker.js, a worker that has no network
+// (see there); this side starts it on first use, hands it Pyodide's files (from /static/pyodide/
+// for signed-in users, or from a shared chat's own address for its guests), runs one call at a
+// time with a time limit, and returns the text for the model and any matplotlib figures for the
+// thread. Variables stay between calls until a timeout or Stop resets the box.
 
 window.GufoPython = (() => {
   const WORKER_URL = '/static/pyworker.js';
@@ -38,8 +38,10 @@ window.GufoPython = (() => {
     return text.length <= max ? text : `${text.slice(0, max)}\n[output cut at ${max.toLocaleString()} characters]`;
   }
 
+  // `workerUrl` is the worker script, `assetUrl` the folder (ending in /) of the runtime's files.
   function create({
-    makeWorker = () => new Worker(WORKER_URL, { type: 'module' }), request = (url) => fetch(url),
+    workerUrl = WORKER_URL, assetUrl = ASSET_URL,
+    makeWorker = () => new Worker(workerUrl, { type: 'module' }), request = (url) => fetch(url),
     bootMs = BOOT_MS, runMs = RUN_MS,
   } = {}) {
     let worker = null;     // the box; null before first use and after a reset
@@ -55,7 +57,7 @@ window.GufoPython = (() => {
       const reply = (message, transfer = []) => { if (worker === target) target.postMessage(message, transfer); };
       if (!/^[\w.+-]+$/.test(String(name))) return reply({ type: 'asset', id, error: 'not a Pyodide file' });
       try {
-        const response = await request(ASSET_URL + name);
+        const response = await request(assetUrl + name);
         if (!response.ok) return reply({ type: 'asset', id, error: `HTTP ${response.status}` });
         const buffer = await response.arrayBuffer();
         reply({ type: 'asset', id, buffer }, [buffer]);
@@ -159,6 +161,7 @@ window.GufoPython = (() => {
     }
 
     return {
+      TOOL,
       run,
       warm: () => { start().catch(() => {}); },  // download the runtime now, not at the first call
       get state() { return state; },

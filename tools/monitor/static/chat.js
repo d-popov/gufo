@@ -518,19 +518,6 @@ function costMicro(model, usage) {
   return Number((scaled + 999_999n) / 1_000_000n);
 }
 
-function describe(stats) {
-  const parts = [];
-  if (stats.tps) parts.push(`${stats.tps.toFixed(1)} tok/s`);
-  if (stats.ttft_ms != null) parts.push(`${(stats.ttft_ms / 1000).toFixed(1)} s to first token`);
-  if (stats.completion_tokens != null) {
-    const cached = stats.cached_tokens ? ` (${stats.cached_tokens} cached)` : '';
-    parts.push(`${stats.prompt_tokens} in${cached} · ${stats.completion_tokens} out`);
-  }
-  if (stats.calls) parts.push(`${stats.calls} tool ${stats.calls === 1 ? 'call' : 'calls'}`);
-  if (stats.cost_micro != null) parts.push(billed ? fmtUsd(stats.cost_micro) : `${fmtUsd(stats.cost_micro)} list price`);
-  return parts.join(' · ');
-}
-
 // The chat's running total, always in view: what it has cost (with prices), and the tokens
 // billed so far. Every turn resends the history, so tokens count the whole prompts.
 function renderTotal() {
@@ -555,121 +542,18 @@ function renderTotal() {
 
 // ---------------------------------------------------------------- messages
 
-// Pictures and videos a tool found, each linked to its page. Only addresses on the media hosts
-// are drawn, whatever a saved chat holds.
-function mediaBox(items) {
-  const box = document.createElement('div');
-  box.className = 'media';
-  for (const raw of items) {
-    const item = window.GufoWebTools?.safeMedia(raw);
-    if (!item) continue;
-    const figure = document.createElement('figure');
-    if (item.kind === 'video') {
-      const video = document.createElement('video');
-      video.controls = true;
-      video.preload = 'none';
-      video.playsInline = true;
-      video.poster = item.thumb;
-      video.src = item.src;
-      figure.className = 'wide';
-      figure.append(video);
-    } else {
-      const link = document.createElement('a');
-      link.href = item.page;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      const img = document.createElement('img');
-      img.src = item.thumb;
-      img.alt = item.title;
-      img.loading = 'lazy';
-      img.referrerPolicy = 'no-referrer';
-      link.append(img);
-      figure.append(link);
-    }
-    const caption = document.createElement('figcaption');
-    const title = document.createElement('a');
-    title.href = item.page;
-    title.target = '_blank';
-    title.rel = 'noopener noreferrer';
-    title.textContent = item.title || 'Wikimedia Commons';
-    caption.append(title, document.createTextNode([item.license, item.author].filter(Boolean).map((part) => ` · ${part}`).join('')));
-    figure.append(caption);
-    box.append(figure);
-  }
-  return box;
+const View = window.GufoMessageView;
+
+// What a reply cost, for the line under it.
+function costText(stats) {
+  if (stats.cost_micro == null) return null;
+  return billed ? fmtUsd(stats.cost_micro) : `${fmtUsd(stats.cost_micro)} list price`;
 }
 
-// The figures a tool drew, shown in full with a way to keep each one.
-function figureBox(figures) {
-  const box = document.createElement('div');
-  box.className = 'figures';
-  figures.forEach((src, index) => {
-    const figure = document.createElement('figure');
-    const img = document.createElement('img');
-    img.src = src;
-    img.alt = `Figure ${index + 1} drawn by Python`;
-    const caption = document.createElement('figcaption');
-    const save = document.createElement('a');
-    save.href = src;
-    save.download = `figure-${index + 1}.png`;
-    save.textContent = 'Save PNG';
-    caption.append(save);
-    figure.append(img, caption);
-    box.append(figure);
-  });
-  return box;
-}
-
-// Fills one message block: optional thinking, the text, attached images, then its stats.
+// Fills one message block: optional thinking and tool steps, the text, attached images, then its stats.
 function fillMessage(block, message) {
   block.replaceChildren();
-  if (message.reasoning) {
-    const details = document.createElement('details');
-    details.className = 'thinking';
-    details.open = !message.content;
-    const summary = document.createElement('summary');
-    summary.textContent = 'Thinking';
-    const text = document.createElement('div');
-    text.textContent = message.reasoning;
-    details.append(summary, text);
-    block.append(details);
-  }
-  for (const step of message.steps ?? []) {
-    const details = document.createElement('details');
-    details.className = `step ${step.state}`;
-    const summary = document.createElement('summary');
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    const label = document.createElement('span');
-    label.textContent = step.label;
-    summary.append(dot, label);
-    if (step.via === 'reader') {
-      const via = document.createElement('span');
-      via.className = 'via';
-      via.textContent = 'via r.jina.ai';
-      summary.append(via);
-    }
-    details.append(summary);
-    if (step.code) {
-      const code = document.createElement('pre');
-      code.className = 'code';
-      code.textContent = step.code;
-      details.append(code);
-    }
-    const result = document.createElement('pre');
-    result.textContent = step.excerpt || '';
-    details.append(result);
-    block.append(details);
-    if (step.media?.length) block.append(mediaBox(step.media));
-    if (step.figures?.length) {
-      block.append(figureBox(step.figures));
-    } else if (step.figureCount) {
-      const note = document.createElement('div');
-      note.className = 'note';
-      note.textContent = `${step.figureCount} figure${step.figureCount === 1 ? '' : 's'} drawn; images are not kept after a reload.`;
-      block.append(note);
-    }
-  }
+  View.fillThinkingAndSteps(block, message);
   const text = document.createElement('div');
   const waiting = message.pending && !message.content && !message.reasoning;
   if (waiting) text.className = 'live';
@@ -728,10 +612,12 @@ function fillMessage(block, message) {
   if (message.stats) {
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = describe(message.stats);
+    meta.textContent = View.describe(message.stats, costText(message.stats));
     block.append(meta);
   }
 }
+
+const syncedRooms = new Set();  // the rooms that have been sent this page's tools and effort
 
 // A chat that is shared continues in its room, so its own composer is off and a note points to the room.
 function renderShared() {
@@ -741,6 +627,8 @@ function renderShared() {
   for (const id of ['prompt', 'send', 'talk']) $(id).disabled = Boolean(shared);
   $('prompt').placeholder = shared ? 'This chat is shared: write in the room' : 'Message Gufo…';
   lockMessages();
+  // A room made before its owner's tools were captured, or while another device changed them, gets this chat's settings once.
+  if (shared && sharing && !syncedRooms.has(shared.id)) { syncedRooms.add(shared.id); window.GufoShare.update(); }
 }
 
 function markShared(shared) {
@@ -1463,7 +1351,10 @@ function autosize() {
 $('prompt').addEventListener('input', () => { autosize(); updateSendLabel(); });
 $('effort').value = localStorage.getItem(EFFORT_KEY) || '';
 $('model').addEventListener('change', () => localStorage.setItem(MODEL_KEY, $('model').value));
-$('effort').addEventListener('change', () => localStorage.setItem(EFFORT_KEY, $('effort').value));
+$('effort').addEventListener('change', () => {
+  localStorage.setItem(EFFORT_KEY, $('effort').value);
+  if (sharing) window.GufoShare.update();
+});
 
 // ---------------------------------------------------------------- talk mode
 
@@ -1665,6 +1556,13 @@ function selectedTools() {
   return ids;
 }
 
+// What a shared room of this chat offers: the same tools (the library too, when ticked: guests then read it through the
+// link), and the same effort.
+function shareSettings() {
+  const tools = [...selectedTools()];
+  return { tools, effort: $('effort').value };
+}
+
 function updateToolsCount() {
   const count = selectedTools().size;
   $('tools-count').textContent = count ? String(count) : '';
@@ -1714,6 +1612,7 @@ $('tools-menu').addEventListener('change', (event) => {
   if (box.checked) allowedTools.add(box.value); else allowedTools.delete(box.value);
   localStorage.setItem(TOOLS_KEY, JSON.stringify([...allowedTools]));
   updateToolsCount();
+  if (sharing) window.GufoShare.update();
   if (box.checked && box.value === 'run_python') window.GufoPython.warm();  // fetch the runtime now
 });
 document.addEventListener('click', (event) => { if (!$('tools').contains(event.target)) setToolsOpen(false); });
@@ -1753,7 +1652,11 @@ async function loadModels() {
     if (talkAvailable !== couldSpeak && active()) renderMessages();
     $('talk').hidden = !talkAvailable;
     if (talkAvailable) loadVoicePrefs();
-    if (data.share === true && window.GufoShare && !sharing) { sharing = true; window.GufoShare.init({ chat: active, shared: markShared }); }
+    if (data.share === true && window.GufoShare && !sharing) {
+      sharing = true;
+      window.GufoShare.init({ chat: active, shared: markShared, settings: shareSettings });
+      renderShared();
+    }
     ownerKnown({ owner: typeof data.owner === 'string' ? data.owner : null, sync: Boolean(data.sync) });  // no owner (an older monitor): no database is opened
     found = data.models.length;
     const select = $('model');

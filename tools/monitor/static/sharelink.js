@@ -1,10 +1,12 @@
 'use strict';
 
 // "Share" on the chat page: makes the open chat a room with a public link (see shares.py) and shows it to copy. The links themselves
-// are listed and revoked on /shares. Only the admin sees the button.
+// are listed and revoked on /shares. Only the admin sees the button. The room offers the tools and thinking effort chosen here: they
+// are sent with the link, and again whenever they change while the open chat is shared.
 (() => {
   const $ = (id) => document.getElementById(id);
-  let host = null;   // { chat() } from chat.js: the open chat
+  let host = null;   // { chat(), shared(link), settings() } from chat.js: the open chat, and its room's {tools, effort}
+  let pending = null; // the settings update waiting to be sent
 
   async function create() {
     const chat = host?.chat();
@@ -18,7 +20,12 @@
           days: Number($('share-days').value),
           max_messages: Number($('share-messages').value),
           max_audio: Number($('share-audio').value),
-          ...(chat ? { chat_id: chat.id, messages: chat.messages.map(({ role, content, error }) => ({ role, content, error })) } : {}),
+          ...host.settings(),
+          ...(chat ? { chat_id: chat.id, messages: chat.messages.map(({ role, content, error, reasoning, steps, stats }) => ({
+            role, content, error, reasoning, stats,
+            // The room shows a step as the chat does, without the figures' bytes.
+            steps: steps?.map(({ figures, ...step }) => ({ ...step, ...(figures?.length ? { figureCount: figures.length } : {}) })),
+          })) } : {}),
         }),
       });
       const body = await response.json();
@@ -34,7 +41,25 @@
     $('share-create').disabled = false;
   }
 
+  // Sends the current tools and effort to the open chat's room, a moment after the last change.
+  function update() {
+    clearTimeout(pending);
+    pending = setTimeout(async () => {
+      const id = host?.chat()?.shared?.id;
+      if (!id) return;
+      try {
+        const response = await fetch(`/api/chat/shares/${encodeURIComponent(id)}/settings`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(host.settings()),
+        });
+        if (!response.ok) throw new Error(`${response.status}`);
+      } catch (error) {
+        $('status').textContent = `The shared room did not get the new settings (${error.message}).`;
+      }
+    }, 400);
+  }
+
   window.GufoShare = {
+    update,
     init(options) {
       host = options;
       $('share-chat').hidden = false;

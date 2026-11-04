@@ -4,11 +4,12 @@
 // the Python the model writes, can make a network request: not fetch, not XMLHttpRequest,
 // not WebSocket, not through the prototype. It never sees the monitor's pages, cookies or
 // storage either. Pyodide's own files reach it as messages from the chat page, and fetch is
-// replaced before the runtime loads so that it answers only for those files.
+// replaced before the runtime loads so that it answers only for those files. They live in
+// pyodide/ beside this file, which is served at /static/ and under a shared chat's address.
 
-import { loadPyodide } from '/static/pyodide/pyodide.mjs';
+import { loadPyodide } from './pyodide/pyodide.mjs';
 
-const BASE = '/static/pyodide/';
+const BASE = new URL('./pyodide/', import.meta.url).pathname;
 const MAX_OUTPUT_CHARS = 20000;
 const MAX_FIGURES = 4;
 const TYPES = { wasm: 'application/wasm', json: 'application/json', js: 'text/javascript', mjs: 'text/javascript' };

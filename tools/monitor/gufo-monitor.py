@@ -81,6 +81,7 @@ STATIC_FILES = {
     "voice.js": (STATIC_DIR, _JS),
     "sharelink.js": (STATIC_DIR, _JS),
     "share.js": (STATIC_DIR, _JS),
+    "messageview.js": (STATIC_DIR, _JS),
     "share.css": (STATIC_DIR, _CSS),
     "shares.js": (STATIC_DIR, _JS),
     "shares.css": (STATIC_DIR, _CSS),
@@ -132,9 +133,9 @@ SECURITY_HEADERS = (
 # come from these hosts, and no other image or media host may load on the chat page.
 UPLOAD_HOST = "https://upload.wikimedia.org"
 MEDIA_HOSTS = f"{UPLOAD_HOST} https://thumb.wikimedia.org"
-# The chat page alone may also read https sites: its browser tools (static/webtools.js) make
-# the model's web requests from the user's browser, with no credentials. Every other page
-# keeps `connect-src 'self'`.
+# The chat page and a shared chat's page (/s/TOKEN) may also read https sites: their browser tools
+# (static/webtools.js) make the model's web requests from the user's or the asking visitor's browser,
+# with no credentials. Every other page keeps `connect-src 'self'`.
 CHAT_SECURITY_HEADERS = tuple(
     (name, value.replace("connect-src 'self';", "connect-src 'self' https:;")
      .replace("img-src 'self' data:;", f"img-src 'self' data: {MEDIA_HOSTS}; media-src 'self' {UPLOAD_HOST};"))
@@ -142,8 +143,9 @@ CHAT_SECURITY_HEADERS = tuple(
     for name, value in SECURITY_HEADERS)
 
 # The chat's Python tool (static/pybox.js, pyworker.js). tools/monitor/fetch-pyodide.py puts
-# the runtime in PYODIDE_DIR; it is served only to signed-in chat users. The worker file gets
-# a CSP that allows no network at all, which is what keeps the model's Python in its box.
+# the runtime in PYODIDE_DIR; it is served to signed-in chat users, and under a shared link's
+# token (/api/share/TOKEN/pyworker.js, .../pyodide/FILE) while its room offers Python. The worker
+# file gets a CSP that allows no network at all, which is what keeps the model's Python in its box.
 PYODIDE_DIR = STATIC_DIR / "pyodide"
 PYODIDE_FILE = re.compile(r"[\w+-][\w.+-]*")
 PYODIDE_TYPES = {".js": _JS, ".mjs": _JS, ".wasm": "application/wasm", ".json": "application/json"}
@@ -561,13 +563,16 @@ class ChatRuns:
 
 VOICE_NAME = re.compile(r"[\w.-]{1,64}")  # a speech server's voice name
 # Shared links (shares.py): what a link's visitors may do per minute, and how many replies may be written for all of
-# them at once, so a link cannot take the model from the owner.
+# them at once, so a link cannot take the model from the owner. A message is one chat request; the later rounds of its
+# reply and the asker's reports of its tool steps are counted apart, as their own browser makes several per message.
 GUEST_CHATS_PER_MINUTE = 6
+GUEST_ROUNDS_PER_MINUTE = 120
 GUEST_AUDIO_PER_MINUTE = 24
 GUEST_MISSES_PER_MINUTE = 20
 GUEST_REPLIES_AT_ONCE = 2
 GUEST_SPEECH_AT_ONCE = 2
-SHARE_PATH = re.compile(r"^/(?:s|api/share)/([A-Za-z0-9_-]{1,80})(?:/(chat|transcribe|speak|conversation))?$")
+SHARE_PATH = re.compile(r"^/(?:s|api/share)/([A-Za-z0-9_-]{1,80})(?:/(chat|transcribe|speak|conversation|steps|library|pyworker\.js"
+                        r"|pyodide/[^/]+|figure/\d{1,15}/\d{1,2}/\d{1,2}\.png))?$")
 STYLE_MAX = 300  # characters of a style setting: a reply style for the model, a voice instruction for the voice
 LANGUAGE_NAME = re.compile(r"[a-z]{2,30}")  # a language as the speech models name it: "bulgarian"
 
@@ -2197,6 +2202,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.public_url: str | None = None  # GUFO_PUBLIC_URL, which a link's URL starts with
         # What a link's visitors may ask for, per link, and how many wrong tokens one address may try.
         self.guest_chat = RateLimiter(GUEST_CHATS_PER_MINUTE, 60.0)
+        self.guest_rounds = RateLimiter(GUEST_ROUNDS_PER_MINUTE, 60.0)
         self.guest_audio = RateLimiter(GUEST_AUDIO_PER_MINUTE, 60.0)
         self.guest_misses = RateLimiter(GUEST_MISSES_PER_MINUTE, 60.0)
         self.guest_replies = threading.BoundedSemaphore(GUEST_REPLIES_AT_ONCE)
@@ -2222,15 +2228,22 @@ def versioned_assets(html: bytes) -> bytes:
     return STATIC_REFERENCE.sub(add, html)
 
 
-def reply_piece(line: bytes) -> str:
-    """The text of a streamed reply's `data:` line (its content delta), or "" for any other line."""
+def stream_chunk(line: bytes) -> dict | None:
+    """A streamed reply's `data:` line as its JSON object, or None for any other line."""
     if not line.startswith(b"data:") or b"[DONE]" in line:
-        return ""
+        return None
     try:
-        piece = json.loads(line[5:])["choices"][0]["delta"].get("content")
-    except (ValueError, LookupError, TypeError, AttributeError):
-        return ""
-    return piece if isinstance(piece, str) else ""
+        chunk = json.loads(line[5:])
+    except ValueError:
+        return None
+    return chunk if isinstance(chunk, dict) else None
+
+
+def chunk_delta(chunk: dict) -> dict:
+    """The delta of a streamed chunk's first choice, or {}."""
+    choices = chunk.get("choices")
+    delta = choices[0].get("delta") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+    return delta if isinstance(delta, dict) else {}
 
 
 def shares_module():
@@ -2817,15 +2830,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _room_chat(self, share: dict, data: dict, shared: bool) -> dict | None:
         """The owner's chat DATA as its room requires. The chat's first `base` messages are the owner's history and are never
         rewritten (they keep their images, reasoning and every field); what was said in the room since the link was made is
-        added after them, whatever else the data held. While the link is active the chat carries a `shared` mark (the link,
-        which switches the chat's own composer off: it continues in the room). None if the data does not hold all `base`
-        messages yet (a stale or partial copy)."""
+        added after them, whatever else the data held, replies with their reasoning, tool steps (a figure count instead of
+        the figures, as a kept chat holds them) and stats. While the link is active the chat carries a `shared` mark (the
+        link, which switches the chat's own composer off: it continues in the room). None if the data does not hold all
+        `base` messages yet (a stale or partial copy)."""
         if not isinstance(data.get("messages"), list) or len(data["messages"]) < share["base"]:
             return None
         room = self.server.shares.transcript(share["owner"], share["id"]) or []
         data["messages"] = data["messages"][:share["base"]] + [
-            {"role": m["role"], "content": m["content"], **({"name": m["name"]} if m["name"] else {})}
-            for m in room[share["seeded"]:] if m["content"]]
+            {"role": m["role"], "content": m["content"], **({"name": m["name"]} if m["name"] else {}),
+             **{key: m[key] for key in ("reasoning", "steps", "stats") if key in m}}
+            for m in room[share["seeded"]:] if m["content"] or m.get("steps")]
         data["updated"] = int(time.time() * 1000)
         if shared:
             data["shared"] = {"id": share["id"], "url": self._share_url(share["token"])}
@@ -2848,7 +2863,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass  # the owner's chat storage is full: the room goes on without its mirror
 
     def _shares_admin(self, method: str, path: str):
-        """GET /api/chat/shares lists the links, POST creates one for a chat, DELETE /api/chat/shares/ID revokes an active
+        """GET /api/chat/shares lists the links, POST creates one for a chat (with the chat's tools and effort), PUT
+        /api/chat/shares/ID/settings changes an active one's tools and effort, DELETE /api/chat/shares/ID revokes an active
         one and removes a revoked or expired one, GET /api/chat/shares/ID/messages reads a conversation. The admin's only."""
         shares = self.server.shares
         if shares is None:
@@ -2874,7 +2890,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 share = shares.create("admin", body.get("title"), body.get("days", module.DEFAULT_DAYS),
                                       body.get("max_messages", module.DEFAULT_MESSAGES),
                                       body.get("max_audio", module.DEFAULT_AUDIO), module.clean_seed(body.get("messages")),
-                                      chat_id, len(body["messages"]) if isinstance(body.get("messages"), list) else 0)
+                                      chat_id, len(body["messages"]) if isinstance(body.get("messages"), list) else 0,
+                                      body.get("tools"), body.get("effort"))
                 self._mirror_share({**share, "owner": "admin"}, True)
                 return self._json(200, json.dumps(show(share)).encode())
             if method == "GET":  # /api/chat/shares/ID/messages
@@ -2883,6 +2900,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if found is None:
                     return self._error(404, "not_found")
                 return self._json(200, json.dumps({"messages": found}, ensure_ascii=False).encode())
+            if method == "PUT":  # /api/chat/shares/ID/settings
+                parts = path.split("/")
+                if len(parts) != 6 or parts[5] != "settings" or not module.SHARE_ID.fullmatch(parts[4]):
+                    return self._error(404, "not_found")
+                body = self._read_json()
+                if body is None:
+                    return self._error(400, "expected {tools, effort}")
+                share = shares.settings("admin", parts[4], body.get("tools"), body.get("effort"))
+                if share is None:
+                    return self._error(404, "not_found")
+                chat = (self.server.chat_store.item("admin", "chat", share["chat_id"])
+                        if self.server.chat_store is not None and share["chat_id"] else None)
+                if chat is not None:  # a room from before replies carried their thinking and steps takes them from the chat
+                    shares.refresh_seed("admin", share["id"], chat.get("messages"))
+                return self._json(200, json.dumps(show(share)).encode())
             share_id = path.rsplit("/", 1)[1]
             if not module.SHARE_ID.fullmatch(share_id):
                 return self._error(404, "not_found")
@@ -2895,6 +2927,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, json.dumps({"result": done}).encode())
         except module.ShareError as error:
             return self._error(error.status, error.message)
+
+    def _room_tools(self, share: dict) -> list:
+        """The tools the room offers now (shares.room_tools): Python only with its runtime, the library's only with a library."""
+        return shares_module().room_tools(share, python_installed(), self.server.library is not None)
 
     def _share_model(self) -> str | None:
         models = [m["id"] for m in self.server.monitor.models]
@@ -2911,7 +2947,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(404, "not_found")
         module = shares_module()
         if method == "GET" and kind is None and path.startswith("/s/"):
-            return self._file(STATIC_DIR / "share.html", "text/html; charset=utf-8")  # the page asks for itself below
+            # The page asks for itself below. Its browser runs the room's web tools for the visitor who asks, like the chat page.
+            return self._file(STATIC_DIR / "share.html", "text/html; charset=utf-8", security=CHAT_SECURITY_HEADERS)
         share = shares.find(token)
         if share is None:
             if not self.server.guest_misses.allow("share:" + self.client_ip()):
@@ -2919,24 +2956,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(404, "not_found")
         owner_prefs = (self.server.chat_store.voice_prefs(share["owner"]) if self.server.chat_store is not None
                        else dict(DEFAULT_VOICE_PREFS))
+        section, _, rest = (kind or "").partition("/")
         if method == "GET":
+            if kind is None:
+                model = self._share_model()
+                return self._json(200, json.dumps(shares.view(share, model, self.server.voice is not None, owner_prefs,
+                                                              python_installed(), self.server.library is not None),
+                                                  ensure_ascii=False).encode())
             if kind == "conversation":
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 number = lambda name: int(query[name][0]) if query.get(name, [""])[0].isdigit() else None  # noqa: E731
                 room = shares.conversation(token, number("rev"), number("before"))
-                room.update(messages_left=share["max_messages"] - share["messages"], audio_left=share["max_audio"] - share["audio"])
+                room.update(messages_left=share["max_messages"] - share["messages"], audio_left=share["max_audio"] - share["audio"],
+                            now=int(time.time()))  # the page times a reply being written by this clock
                 return self._json(200, json.dumps(room, ensure_ascii=False).encode())
-            model = self._share_model()
-            return self._json(200, json.dumps(shares.view(share, model, self.server.voice is not None, owner_prefs),
-                                              ensure_ascii=False).encode())
-        if kind not in ("chat", "transcribe", "speak"):
+            if section == "figure":
+                row_id, step, index = (int(part) for part in rest.removesuffix(".png").split("/"))
+                png = shares.figure(token, row_id, step, index)
+                return self._send(200, png, "image/png") if png is not None else self._error(404, "not_found")
+            if section in ("pyworker.js", "pyodide"):
+                # The Python runtime for the room's run_python, only while the room offers it.
+                if "run_python" not in self._room_tools(share):
+                    return self._error(404, "not_found")
+                if section == "pyodide":
+                    return self._pyodide_file(rest)
+                return self._file(STATIC_DIR / "pyworker.js", _JS, cache="no-cache", security=PYWORKER_SECURITY_HEADERS)
             return self._error(404, "not_found")
-        limiter = self.server.guest_chat if kind == "chat" else self.server.guest_audio
-        if not limiter.allow(f"{kind}:{token}"):
+        if kind not in ("chat", "steps", "library", "transcribe", "speak"):
+            return self._error(404, "not_found")
+        if kind in ("transcribe", "speak") and not self.server.guest_audio.allow(f"{kind}:{token}"):
             return self._error(429, "slow down a little")
         try:
             if kind == "chat":
                 return self._share_chat(shares, module, share, owner_prefs)
+            if kind == "steps":
+                return self._share_steps(shares, module, share)
+            if kind == "library":
+                return self._share_library(module, share)
             return self._share_audio(shares, module, share, kind, owner_prefs)
         except module.ShareError as error:
             return self._error(error.status, error.message)
@@ -2944,27 +3000,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _share_chat(self, shares, module, share: dict, owner_prefs: dict):
         """A visitor's message: it joins the shared conversation, the model answers it with the whole conversation in view, and
         the answer is written into the conversation as it arrives, so every page shows it. The asker's connection also gets
-        the stream, which is what feeds their Talk mode; if they leave, the reply is still finished for the others."""
-        text, name, note = module.clean_post(self._read_json(module.MESSAGE_CHARS * 4 + 4096))
+        the stream, which is what feeds their Talk mode and their browser's tool loop; if they leave, the reply is still
+        finished for the others. A body with `reply` is the next round of that reply instead (see _share_continue)."""
+        body = self._read_json(module.CHAT_BYTES)
+        token = share["token"]
+        if isinstance(body, dict) and "reply" in body:
+            if not self.server.guest_rounds.allow("round:" + token):
+                raise module.ShareError(429, "slow down a little")
+            return self._share_continue(shares, module, share, owner_prefs, body)
+        if not self.server.guest_chat.allow("chat:" + token):
+            raise module.ShareError(429, "slow down a little")
+        text, name, note = module.clean_post(body)
+        offered = module.clean_offered(body.get("tools"), self._room_tools(share))
+        tool_note = module.clean_note(body.get("tool_note"), module.TOOL_NOTE_CHARS)
+        effort = module.clean_effort(body.get("effort")) or share["effort"]
         model = self._share_model()
         if model is None or self.server.chat_key is None:
             raise module.ShareError(503, "the model is not available right now")
-        token = share["token"]
         if not shares.take_message(token):
             raise module.ShareError(403, "this link has used up its messages")
         if not self.server.guest_replies.acquire(blocking=False):
             shares.refund_message(token)
             raise module.ShareError(503, "busy: several replies are being written; try again in a moment")
-        reply = None
-        upstream = None
         try:
-            try:
-                reply = shares.ask(token, name, text)
-            except module.ShareError:
-                shares.refund_message(token)
-                raise
-            self._mirror_share(share, True)
-            payload = module.build_request(shares.context(token), model, owner_prefs.get("reply_style"), note)
+            reply = shares.ask(token, name, text)
+        except module.ShareError:
+            shares.refund_message(token)
+            self.server.guest_replies.release()
+            raise
+        self._mirror_share(share, True)
+        payload = module.build_request(shares.context(token), model, owner_prefs.get("reply_style"), note, tool_note, effort,
+                                       offered)
+        self._share_round(shares, module, share, reply, shares.turn(reply), payload)
+
+    def _share_continue(self, shares, module, share: dict, owner_prefs: dict, body: dict):
+        """The next model round of a reply whose tools the asker's browser has run: `extra` holds the model's calls and their
+        results since the question, `turn` the secret the asker got with the reply. It costs no message. The round with
+        index MAX_ROUNDS - 1 is offered no tools, so the reply ends with an answer."""
+        reply, nonce = body.get("reply"), body.get("turn")
+        if not isinstance(reply, int) or isinstance(reply, bool) or not isinstance(nonce, str):
+            raise module.ShareError(400, "expected {reply, turn, extra}")
+        enabled = self._room_tools(share)
+        extra = module.clean_extra(body.get("extra"), enabled)
+        offered = module.clean_offered(body.get("tools"), enabled)
+        note = module.clean_note(body.get("note"))
+        tool_note = module.clean_note(body.get("tool_note"), module.TOOL_NOTE_CHARS)
+        effort = module.clean_effort(body.get("effort")) or share["effort"]
+        steps = module.clean_steps(body["steps"], enabled) if "steps" in body else None
+        model = self._share_model()
+        if model is None or self.server.chat_key is None:
+            raise module.ShareError(503, "the model is not available right now")
+        token = share["token"]
+        if steps is not None:
+            shares.set_steps(token, reply, nonce, *steps)
+        if not self.server.guest_replies.acquire(blocking=False):
+            raise module.ShareError(503, "busy: several replies are being written; try again in a moment")
+        try:
+            turn = shares.begin_round(token, reply, nonce)
+        except module.ShareError:
+            self.server.guest_replies.release()
+            raise
+        payload = module.build_request(shares.context(token) + extra, model, owner_prefs.get("reply_style"), note, tool_note,
+                                       effort, offered if turn.rounds < module.MAX_ROUNDS - 1 else None)
+        self._share_round(shares, module, share, reply, turn, payload)
+
+    def _share_round(self, shares, module, share: dict, reply: int, turn, payload: dict):
+        """Stream one model round of a reply to its asker and into the room: text, reasoning and the usage its stats are
+        summed from. The reply stays open when the model called the tools it was offered and the asker is still connected
+        (their browser runs them and continues it); otherwise it is finished. Holds a place of guest_replies, taken by the
+        caller, until the round ends."""
+        token = share["token"]
+        upstream = None
+        keep_open = False
+        try:
             status, upstream = self.server.monitor.gufo.open_post(
                 "/v1/chat/completions", json.dumps(payload, ensure_ascii=False).encode(), api_key=self.server.chat_key)
             if status != 200:
@@ -2975,17 +3083,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Room-Reply", str(reply))
+            self.send_header("X-Room-Turn", turn.nonce)
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            asker_here, pending, flushed = True, [], time.monotonic()
+            asker_here, flushed, separated, called = True, time.monotonic(), False, False
+            text, thinking, usage, timings = [], [], None, None
+
+            def flush():
+                nonlocal text, thinking, separated, flushed
+                shares.extend_reply(token, reply, "".join(text), "".join(thinking), separate=not separated)
+                separated = separated or bool(text)
+                text, thinking, flushed = [], [], time.monotonic()
+
             for line in iter(upstream.readline, b""):
-                piece = reply_piece(line)
-                if piece:
-                    pending.append(piece)
-                    if time.monotonic() - flushed >= 0.3:  # the room is updated a few times a second, not per token
-                        shares.extend_reply(token, reply, "".join(pending))
-                        pending, flushed = [], time.monotonic()
+                if turn.aborted:
+                    break  # the asker stopped the reply
+                chunk = stream_chunk(line)
+                if chunk is not None:
+                    delta = chunk_delta(chunk)
+                    content, reasoning = delta.get("content"), delta.get("reasoning_content")
+                    content = content if isinstance(content, str) else ""
+                    reasoning = reasoning if isinstance(reasoning, str) else ""
+                    if content or reasoning:
+                        turn.piece()
+                        text.append(content)
+                        thinking.append(reasoning)
+                    called = called or bool(delta.get("tool_calls"))
+                    usage = chunk.get("usage") or usage
+                    timings = chunk.get("timings") or timings
+                    if (text or thinking) and time.monotonic() - flushed >= 0.3:  # a few room updates a second, not per token
+                        flush()
                 if asker_here:
                     try:
                         self.wfile.write(line)
@@ -2993,8 +3122,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             self.wfile.flush()
                     except OSError:
                         asker_here = False  # they left; the reply is finished for everyone else
-            if pending:
-                shares.extend_reply(token, reply, "".join(pending))
+            if text or thinking:
+                flush()
+            turn.add_usage(usage, timings)
+            keep_open = called and "tools" in payload and asker_here  # nobody is left to run the tools of a page that left
         except module.ShareError:
             raise
         except OSError:
@@ -3002,10 +3133,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             if upstream is not None:
                 upstream.close()
-            if reply is not None:
-                shares.finish_reply(token, reply)
+            shares.end_round(token, reply, keep_open)
+            if not keep_open:
                 self._mirror_share(share, True)
             self.server.guest_replies.release()
+
+    def _share_steps(self, shares, module, share: dict):
+        """The asker's browser reports the tool steps of its reply, which replace those the room shows; with abort the
+        reply is finished as it is (they pressed Stop, or their page failed). Answers 204."""
+        if not self.server.guest_rounds.allow("round:" + share["token"]):
+            raise module.ShareError(429, "slow down a little")
+        body = self._read_json(module.STEPS_BYTES)
+        if body is None:
+            raise module.ShareError(400, "expected {reply, turn, steps}")
+        reply, nonce, abort = body.get("reply"), body.get("turn"), body.get("abort") is True
+        if not isinstance(reply, int) or isinstance(reply, bool) or not isinstance(nonce, str):
+            raise module.ShareError(400, "expected {reply, turn, steps}")
+        steps = (module.clean_steps(body["steps"], self._room_tools(share)) if "steps" in body
+                 else (None, ()))
+        shares.set_steps(share["token"], reply, nonce, *steps, abort=abort)
+        if abort:
+            self._mirror_share(share, True)
+        self._send(204, b"", "text/plain")
+
+    def _share_library(self, module, share: dict):
+        """POST /api/share/TOKEN/library {name, arguments} -> {text, is_error}: the asker's browser runs a room's library
+        tool, as the admin's chat does through /api/library/call. Only search_library and read_library, only while the
+        owner enables them for the link, and nothing else of the library: no list, no change, no /mcp."""
+        if self.server.library is None:
+            raise module.ShareError(404, "the library is not available")
+        if not self.server.guest_rounds.allow("round:" + share["token"]):
+            raise module.ShareError(429, "slow down a little")
+        body = self._read_json()
+        name = body.get("name") if isinstance(body, dict) else None
+        offered = [tool for tool in self._room_tools(share) if tool in module.LIBRARY_TOOLS]
+        if isinstance(name, str) and name not in offered:
+            raise module.ShareError(403, "this room does not offer that tool")
+        return self._library_call(self.server.library, body, offered)
 
     def _share_audio(self, shares, module, share: dict, kind: str, owner_prefs: dict):
         """A visitor's utterance to text, or a reply's text to speech in the owner's voice. At most
@@ -3197,19 +3361,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 job = library.jobs.get(rest)
                 return reply(200, job) if job else self._error(404, "no such job")
             if method == "POST" and route == "call":
-                body = self._read_json()
-                if body is None or not isinstance(body.get("name"), str):
-                    return self._error(400, "expected a JSON object with name and arguments")
-                arguments = body.get("arguments")
-                mcp = library_modules()[1]
-                if body["name"] not in {tool["name"] for tool in mcp.TOOLS}:
-                    return self._error(400, "unknown tool")
-                try:
-                    return reply(200, {"text": mcp.call_tool(
-                        library, body["name"], arguments if isinstance(arguments, dict) else {}),
-                        "is_error": False})
-                except ValueError as error:
-                    return reply(200, {"text": str(error), "is_error": True})
+                return self._library_call(library, self._read_json(),
+                                          {tool["name"] for tool in library_modules()[1].TOOLS})
             if method == "POST" and route == "relink":
                 return reply(200, {"changed": library.relink()})
             if method == "POST" and route == "ingest":
@@ -3219,6 +3372,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except modules.LibraryError as error:
             return self._error(error.status, error.message)
         self._error(404, "not_found")
+
+    def _library_call(self, library, body, allowed):
+        """POST /api/library/call and a room's library tools: {name, arguments} -> {text, is_error}, one call of a library
+        MCP tool named in `allowed`. A wrong request to the tool is an answer with is_error, for the model to read."""
+        if body is None or not isinstance(body.get("name"), str):
+            return self._error(400, "expected a JSON object with name and arguments")
+        if body["name"] not in allowed:
+            return self._error(400, "unknown tool")
+        arguments = body.get("arguments")
+        try:
+            answer = {"text": library_modules()[1].call_tool(
+                library, body["name"], arguments if isinstance(arguments, dict) else {}), "is_error": False}
+        except ValueError as error:
+            answer = {"text": str(error), "is_error": True}
+        except library_modules()[0].LibraryError as error:
+            return self._error(error.status, error.message)
+        self._json(200, json.dumps(answer, ensure_ascii=False).encode())
 
     def _library_ingest(self, library, modules):
         """POST /api/library/ingest {text | pdf_base64, title?, filename?, tags?, digest?}
@@ -3287,6 +3457,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._library("PUT")
         if urllib.parse.urlsplit(self.path).path.startswith("/api/chat/items/"):
             return self._sync_route("PUT")
+        if urllib.parse.urlsplit(self.path).path.startswith("/api/chat/shares/"):
+            return self._shares_admin("PUT", urllib.parse.urlsplit(self.path).path)
         self._mutation("PUT")
 
     def do_DELETE(self):
@@ -3415,6 +3587,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """One file of the Python runtime, for the chat: signed-in chat users and the admin."""
         if not (self._admin() or self._chat_user() is not None):
             return self._json(401, b'{"error":"unauthorized"}')
+        self._pyodide_file(name)
+
+    def _pyodide_file(self, name: str):
+        """One file of the Python runtime, for whoever the caller let in."""
         path = PYODIDE_DIR / name
         if not PYODIDE_FILE.fullmatch(name) or not path.is_file():
             return self._json(404, b'{"error":"not_found"}')

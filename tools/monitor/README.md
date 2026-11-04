@@ -86,29 +86,54 @@ chat, whose history belongs to its room.
 **Shared chats.** *Share* on the chat page (the admin's) turns the open chat into a room with a public link,
 `GUFO_PUBLIC_URL/s/TOKEN`. Everyone with the link sees the same conversation, which the monitor keeps, and can write in it, press
 Talk to speak to it and have replies read aloud, with no account and no sign-in. Pages poll it about every 1.5 s; a reply appears
-as it is written. Each person is shown by a name they choose (the model is told who said what), one reply is written at a time, and
-the room starts with the chat's whole text (long messages whole; images, reasoning and tool steps stay in your own chat), of which a visitor's page shows the latest 200 messages and loads earlier ones on request, while the model reads the latest 40 (at most 60,000 characters). You choose an expiry (1, 7 or 30 days, or never), a number of
-messages (default 100) and of speech requests (default 400). `/shares` (profile menu, *Shared chats*) lists the links with their use
-and state, opens a room, **reads** a whole conversation, **revokes** a link (it stops working at once) and removes revoked or
-expired ones.
+as it is written, and every reply shows what it shows in your chat: its thinking, its tool steps (labels, code, result excerpts,
+found media, drawn figures) and its stats line (tok/s, time to first token, tokens, tool calls). Each person is shown by a name
+they choose (the model is told who said what), one reply is written at a time, and the room starts with the chat's whole text
+(long messages whole; images, reasoning and tool steps of your earlier messages stay in your own chat), of which a visitor's page
+shows the latest 200 messages and loads earlier ones on request, while the model reads the latest 40 (at most 60,000 characters).
+You choose an expiry (1, 7 or 30 days, or never), a number of messages (default 100) and of speech requests (default 400).
+`/shares` (profile menu, *Shared chats*) lists the links with their use and state, opens a room, **reads** a whole conversation,
+**revokes** a link (it stops working at once) and removes revoked or expired ones.
 
 The room *is* your chat. While the link is active the chat carries a banner, its own composer is off, and you continue it in the
-room like everyone else; what is said there is added to the chat's history after your messages. Your original messages are never
-rewritten (they keep their images, reasoning and every field), and the server refuses any device's copy that would remove the
-mark or overwrite the room. Revoking frees the chat with everything said in the room in its history; deleting the chat ends its
-room.
+room like everyone else; what is said there is added to the chat's history after your messages, replies with their thinking,
+steps (figures as a count, like any kept chat) and stats. Your original messages are never rewritten (they keep their images,
+reasoning and every field), and the server refuses any device's copy that would remove the mark or overwrite the room. Revoking
+frees the chat with everything said in the room in its history; deleting the chat ends its room.
 
-What a link allows is only that: the shared conversation, the model, your saved voice, and the limits. A visitor gets no key, none
-of your other chats, projects, memory, tools or library, and nothing of the monitor: every other route still answers 401 to them.
-The monitor builds each request to the model itself from the conversation and a whitelist (plain text only; no system messages,
-tools, images or model choice; thinking off, answers capped at 1024 tokens), speaks with your voice, and caps message count and
-size. A link is rate-limited (6 messages and 24 speech requests a minute), at most 2 replies are written and at most 2 speech
-requests run for all links at once (another gets "busy" at once and costs its link nothing), and an address that tries many wrong
-links is slowed down. Wrong, revoked and expired links answer the same 404, and the log shows only the first four characters of a
-token. The costs are yours: guests use your inference key and the GPU, and nothing is billed to the credits portal. Treat a link
-like a password: whoever has it can read and write in the room until it ends. `--shares-file` holds them (mode 0600); without
-`GUFO_PUBLIC_URL` the links point at this machine's own address. A file from an earlier version is carried over, its logged
-conversations included.
+**Tools and effort in a room.** The room uses the browser tools you enabled for the chat (web search, fetching pages, finding
+media, library search and pages, Python) and the chat's reasoning effort, as they were when you shared it and as you change them
+while it is shared. Visitors see which tools are on but cannot change them; each visitor may pick the effort of their own
+messages (*Owner's default*, none, low, medium, high, max). The library's tools are offered only when you tick them and the
+monitor has a library, and then every visitor can search and read your **whole** library through the link (its own route,
+`POST /api/share/TOKEN/library` with `{name, arguments}`, answered like `/api/library/call`); treat such a link like a password
+to the library. Only those two read-only tools are reachable: not `list_library`, no other library route, no change, no `/mcp`.
+The tools run where they run in your chat, in a browser: the browser of the visitor who asked. The model asks for a tool, that
+visitor's page runs it (web requests from their browser, library calls through the link, Python in their browser's sandbox, its
+runtime served under the link while the room offers Python) and sends the results back for the next model round, up to 6 rounds
+a reply, the last without tools; everyone else watches the steps and the answer appear in the room. The monitor offers the model
+only the room's tools, takes back only well-formed calls of them with their results (sizes capped), and only from the page that
+asked (each reply has its own secret turn), counts the rounds, writes the reply, the thinking and the stats itself (from the
+model's own usage
+report, not the page's), and keeps the steps a page reports only after checking them (known tools and states, texts clipped,
+media only from Wikimedia's hosts, at most 4 PNG figures a step and 6 MiB a reply, served from the link; library steps keep only
+their text). A reply waits while its
+tools run; if its asker goes quiet for 5 minutes it is finished as it is, and their Stop finishes it at once. The share page may
+therefore read https sites and show Wikimedia media, like the chat page.
+
+What a link allows is only that: the shared conversation, the model, the room's tools, your saved voice, and the limits. A
+visitor gets no key, none of your other chats, projects or memory, nothing of your library beyond the two tools above when you
+enable them, and nothing of the monitor: every other route still answers 401 to them. The monitor builds each request to the
+model itself from the conversation and a whitelist (plain text and the reply's own tool calls; no system messages, images or
+model choice; the tools and efforts above only; answers capped at 8192 tokens a round), speaks with your voice, and caps message
+count and size. A link is rate-limited (6 messages, 120 later rounds, step reports and library calls, and 24 speech requests a
+minute; only a message counts against its message limit), at most 2 model rounds stream
+and at most 2 speech requests run for all links at once (another gets "busy" at once and costs its link nothing; a reply waiting
+for its tools holds no place), and an address that tries many wrong links is slowed down. Wrong, revoked and expired links answer
+the same 404, and the log shows only the first four characters of a token. The costs are yours: guests use your inference key
+and the GPU, and nothing is billed to the credits portal. Treat a link like a password: whoever has it can read and write in the
+room until it ends. `--shares-file` holds them (mode 0600); without `GUFO_PUBLIC_URL` the links point at this machine's own
+address. A file from an earlier version is carried over, its logged conversations included.
 
 `--asr-ignore-language chinese` (repeatable) treats an utterance the recognizer hears as that language as noise: no text comes
 back and talk mode keeps listening. Qwen3-ASR names breath and random sounds as Chinese often enough for this to matter.
@@ -166,8 +191,8 @@ search), which then sees that URL or query; those steps are labelled "via r.jina
 thread, and it limits anonymous use to about 20 requests a minute. Set `READER` to `''` in
 `static/webtools.js` to use only sites that allow direct reads (and no search). Local,
 private and IP-address URLs are never fetched, and page text is marked as untrusted in the
-system note. Only the chat page may connect to https sites (`connect-src 'self' https:`);
-every other page keeps `connect-src 'self'`.
+system note. Only the chat page and a shared chat's page may connect to https sites
+(`connect-src 'self' https:`); every other page keeps `connect-src 'self'`.
 
 **Pictures and video.** With **Pictures and video** ticked, the model can ask `find_media` for
 freely licensed photos or short clips on [Wikimedia Commons](https://commons.wikimedia.org),
@@ -175,7 +200,7 @@ asked from your browser like the other web tools. They appear in the thread as a
 thumbnails, each linked to its Commons page with its license and author; videos play in place, from Commons' VP9 WebM rendition nearest 480p (about 1 MB per second, instead of an original that can be 100 MB). Commons has no H.264 rendition, so a browser without WebM/VP9 support (iOS before 17.4) cannot play them inline: the caption link opens the file on Commons.
 The model names what to look for and gets titles, credits and page links back; it never supplies
 an address, and the page draws only files on `upload.wikimedia.org` and `thumb.wikimedia.org`,
-which are the only image and media hosts the chat page's CSP allows. Nothing is hosted or
+which are the only image and media hosts the chat page's (and a shared chat's page's) CSP allows. Nothing is hosted or
 copied by the monitor. Pictures are loaded straight from Wikimedia by your browser and are
 re-fetched when a saved chat is reopened. Commons holds photos and clips, not every
 web image; search results from the open web are not shown as pictures.
@@ -191,7 +216,8 @@ the browser, which then keeps it. The box is a module worker, `static/pyworker.j
 with a policy of its own, `default-src 'none'; connect-src 'none'`, so the model's code has
 no network (not `fetch`, `XMLHttpRequest`, `WebSocket` or the prototype's `fetch`), no
 cookies or storage of the monitor, and no files of the host. The page hands it the runtime's
-files, which only signed-in chat users can download. Figures are not kept after a reload.
+files, which only signed-in chat users can download, and visitors of a shared chat whose room offers Python, under its
+link. Figures are not kept after a reload of your chat; a room keeps them (see Shared chats).
 
 ## Library
 
@@ -221,7 +247,8 @@ it back into text.
 **Reading.** `GET /api/library/search?q=` (every word first, any word if none has all),
 `GET /api/library/pages[?kind=]`, `GET /api/library/pages/SLUG?offset=&limit=` with the page's
 links and backlinks. In the chat, the Tools menu has **Library search** and **Library pages**
-(admin only); the page calls `POST /api/library/call` with its session, so the model never
+(admin only; a room offers them when you enable them for its chat, see *Shared chats*); the page calls `POST /api/library/call`
+with its session, so the model never
 sees a token. A tool call is shown in the thread like any other and the system note tells the
 model to keep library text out of web searches and URLs.
 

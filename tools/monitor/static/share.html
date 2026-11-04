@@ -15,6 +15,11 @@
   <script src="/static/language.js" defer></script>
   <script src="/static/avatar.js" defer></script>
   <script src="/static/talk.js" defer></script>
+  <script src="/static/librarytools.js" defer></script>
+  <script src="/static/webtools.js" defer></script>
+  <script src="/static/pybox.js" defer></script>
+  <script src="/static/tools.js" defer></script>
+  <script src="/static/messageview.js" defer></script>
   <script src="/static/share.js" defer></script>
 </head>
 <body>
@@ -39,6 +44,16 @@
       <div class="controls">
         <button id="talk" type="button" class="secondary" aria-pressed="false" hidden
                 title="Talk: it listens, answers aloud, and listens again">Talk</button>
+        <label class="effort" title="How much the model thinks first, for your messages">Thinking
+          <select id="effort"></select>
+        </label>
+        <div id="tools" class="tools" hidden>
+          <button id="tools-button" type="button" class="secondary" aria-haspopup="true" aria-expanded="false"
+                  aria-controls="tools-menu" title="The tools the model may use here">
+            <span>Tools</span><span id="tools-count" class="count"></span>
+          </button>
+          <div id="tools-menu" class="tools-menu" role="group" aria-label="Tools the model may use" hidden></div>
+        </div>
         <span id="language" class="language" hidden title="The language this chat is assumed to be in. Type /lang to change it."></span>
         <span id="status" role="status"></span>
         <button id="send" type="submit">Send</button>

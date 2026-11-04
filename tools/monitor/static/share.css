@@ -1,4 +1,4 @@
-/* The page a shared link opens: the chat's look without the site header, projects or tools. */
+/* The page a shared link opens: the chat's look without the site header or projects. Its tools are the owner's, shown read-only. */
 main.chat.share { height: 100dvh; min-height: 0; padding: var(--space-3); box-sizing: border-box; }
 .share .toolbar { display: flex; align-items: baseline; gap: var(--space-3); }
 .share .muted { color: var(--muted); font-size: var(--text-sm); }
@@ -8,3 +8,7 @@ main.chat.share { height: 100dvh; min-height: 0; padding: var(--space-3); box-si
 .message.user.other { margin-left: 0; background: var(--panel); border-bottom-right-radius: 16px; border-bottom-left-radius: 4px; }
 .message .who { display: block; margin-bottom: 2px; color: var(--muted); font-size: var(--text-xs); }
 .share .earlier { display: block; margin: 0 auto var(--space-4); }
+.share .effort[hidden] { display: none; }
+.share .tools-menu .lead { padding: 6px 10px; color: var(--muted); font-size: var(--text-xs); }
+.share .tool-option.fixed { cursor: default; }
+.share .tool-option.fixed:hover { background: none; }
