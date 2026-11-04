@@ -1453,7 +1453,7 @@ struct TextGenerationScheduler::Impl {
             },
             request->prompt_context, request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->session_class, request->cache_persist);
+            request->session_class, request->cache_persist, request->client_id);
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {

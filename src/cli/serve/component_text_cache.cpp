@@ -20,6 +20,8 @@
 namespace gufo::server {
 namespace {
 using Clock = std::chrono::steady_clock;
+// How long a session stays preferred for the client that last used it.
+constexpr auto kClientAffinity = std::chrono::minutes(15);
 class SettledSignal final : public cache::CompletionSignal {
 public:
   bool Ready() const noexcept override { return true; }
@@ -186,6 +188,10 @@ struct ComponentTextCache::Impl {
     cache::Identity live_input;
     // Acquisition order; cold assignment replaces the oldest live frontier.
     std::uint64_t used{};
+    // The client that last used this session, and until when it is preferred
+    // for that client's next request.
+    std::string owner;
+    Clock::time_point owner_until{};
     // Index into classes; fixed for the slot's lifetime.
     std::size_t klass{};
     bool busy{};
@@ -1085,7 +1091,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     const ContinuationCache::CancellationCheck& cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse,
     std::size_t stable, bool stop_at_eos, std::size_t session_class,
-    bool persist) {
+    bool persist, std::string_view client) {
   if (cancelled && cancelled())
     return {};
   const auto& klass = impl_->classes.at(session_class);
@@ -1131,10 +1137,24 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
              cache::InputIdentity(e.live_tokens.size(), e.live_input)},
             e.live_tokens.size() - kUncoveredTokens);
       };
-      using Rank = std::tuple<bool, bool, bool, bool, std::uint64_t>;
+      // A session stays its client's for kClientAffinity after that client
+      // used it: others take sessions that are not (or no longer) preferred
+      // first, and a client takes its own before anyone else's. When every
+      // session is preferred by someone, the ordinary order decides.
+      const auto now = Clock::now();
+      const auto taken = [&](const Impl::Entry& e) {
+        return !e.owner.empty() && e.owner != client && now < e.owner_until;
+      };
+      const auto mine = [&](const Impl::Entry& e) {
+        return !client.empty() && e.owner == client && now < e.owner_until;
+      };
+      using Rank =
+          std::tuple<bool, bool, bool, bool, bool, bool, std::uint64_t>;
       const auto rank = [&](const Impl::Entry& e) {
-        return Rank{uncovered(e), !e.slot->PreservationComplete(), bool(e.live),
-                    e.live_tokens.size() >= kUncoveredTokens, e.used};
+        return Rank{taken(e),     !mine(e),
+                    uncovered(e), !e.slot->PreservationComplete(),
+                    bool(e.live), e.live_tokens.size() >= kUncoveredTokens,
+                    e.used};
       };
       std::optional<Rank> selected_rank;
       for (auto& candidate : impl_->entries) {
@@ -1180,10 +1200,10 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                             other->live_tokens == candidate->live_tokens;
                    });
           };
-          if (std::tie(std::get<0>(candidate_rank),
-                       std::get<1>(candidate_rank)) >
-                  std::tie(std::get<0>(*selected_rank),
-                           std::get<1>(*selected_rank)) ||
+          if (std::tie(std::get<2>(candidate_rank),
+                       std::get<3>(candidate_rank)) >
+                  std::tie(std::get<2>(*selected_rank),
+                           std::get<3>(*selected_rank)) ||
               (candidate->live &&
                candidate->live_tokens.size() >= kUncoveredTokens &&
                !impl_->index.HasCheckpoint(
@@ -1206,6 +1226,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       throw cache::SlotBusy();
     entry->busy = true;
     entry->used = ++impl_->clock;
+    entry->owner = std::string(client);
+    entry->owner_until = Clock::now() + kClientAffinity;
     if (!live) {
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();

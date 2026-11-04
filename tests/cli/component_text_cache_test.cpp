@@ -325,6 +325,29 @@ void InPassCapturePreservesBoundaryAndLiveTail() {
     independent.Invalidate();
   }
 }
+// A session is its client's for a while after use: a client whose next prompt
+// matches nothing replaces its own session, not another client's, which
+// plain least-recently-used order would take.
+void ClientKeepsItsSession() {
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, {});
+  const auto use = [&](std::string_view client,
+                       const std::vector<TextRunnerToken>& prompt) {
+    auto lease = cache.Acquire(prompt, {}, {}, false, 0, true, 0, true, client);
+    auto* slot = &dynamic_cast<State&>(lease->state()).slot;
+    runner->adapter->Append(*slot, prompt, prompt);
+    (void)lease->Commit(prompt, {}, prompt);
+    return slot;
+  };
+  auto* const first = use("b", {1, 2, 3});
+  auto* const second = use("a", {4, 5, 6});
+  assert(first != second);
+  assert(use("a", {7, 8, 9}) == second);
+  assert(use("a", {10, 11, 12}) == second);
+  // An unknown client finds b's session preferred, and a's too: with none
+  // free of preference the least recently used one is taken.
+  assert(use("c", {13, 14, 15}) == first);
+}
 void ColdAcquireResetsOnce() {
   auto runner = std::make_shared<Runner>();
   ComponentTextCache cache(runner, 1, 1 << 22, {});
@@ -2461,6 +2484,7 @@ int main() {
   BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
   InPassCapturePreservesBoundaryAndLiveTail();
   ColdAcquireResetsOnce();
+  ClientKeepsItsSession();
   ColdAssignmentAvoidsDrainingCancelledSlot();
   ColdAssignmentAvoidsDrainingCancelledSlot(true);
   ColdAssignmentKeepsOneDuplicateDeepFrontier();

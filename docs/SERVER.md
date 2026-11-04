@@ -1473,6 +1473,14 @@ bounds admission and output buffering and propagates client cancellation to
 model runners. An in-flight GPU operation may finish before its request retires.
 See [CLI.md](CLI.md) for supported configuration flags.
 
+**Sticky sessions.** A session is preferred for the client (key name, else peer
+address) that last used it, for 15 minutes. A request that matches no live
+session takes, in order, a session of its own client's, then one preferred by
+nobody (or whose 15 minutes ended), and only then another client's, oldest use
+first. A client therefore finds its conversation where it left it, and its
+cache hits survive other clients' traffic. When every session is preferred, the
+oldest takes the request: preference never makes a request wait.
+
 Admission groups text requests by the socket peer's IP address across chat and
 compatibility endpoints. Caller-provided identity headers do not affect quotas;
 clients behind the same proxy or NAT share a peer quota.

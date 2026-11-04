@@ -187,7 +187,7 @@ public:
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
       bool stop_at_eos = true, std::size_t session_class = 0,
-      bool persist = true);
+      bool persist = true, std::string_view client = {});
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse in this
