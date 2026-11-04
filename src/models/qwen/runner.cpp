@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +42,10 @@ namespace {
 using namespace gufo::ext;
 
 constexpr std::size_t kQwenMaxResumeTokens = 9;
+// A step that keeps more rows than an ordinary verification (a wide copy)
+// leaves the draft caught up and cannot rewind (FinishSpeculativeDecode).
+static_assert(kQwenMaxResumeTokens ==
+              hip::QwenDFlashGpuDraftBackend::kMaxPendingRows + 1);
 
 [[nodiscard]] inline hip::ComponentCacheHooks HipComponentCacheHooks() {
   return {[] { return ext::HostSnapshotCeilingBytes(); },
@@ -455,7 +460,12 @@ public:
     frontier_logits_ = std::move(verification.next_token_logits);
     frontier_published_ = !result.stop;
     set_pending_token(frontier_published_ ? frontier_ : std::nullopt);
-    if (verification.draft_count == 0)
+    // A wide copy that kept more rows than the draft may leave pending has
+    // already injected them (CatchUpPendingFeatures): its state is final, like
+    // a target-only step's.
+    if (verification.draft_count == 0 ||
+        verification.emitted_tokens.size() >
+            hip::QwenDFlashGpuDraftBackend::kMaxPendingRows)
       rollback_position_.reset();
   }
 
@@ -666,10 +676,20 @@ public:
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
+    // The verifier admits a wide lookup copy; the draft keeps neural blocks
+    // and batched copies at --draft-tokens (QwenDFlashGpuDraftConfig).
+    auto verifier_options = speculative_options_;
+    if (dflash_model_ != nullptr &&
+        copy_rows_ > verifier_options.max_draft_tokens + 1) {
+      verifier_options.max_draft_tokens = copy_rows_ - 1;
+      verifier_options.initial_draft_tokens = copy_rows_ - 1;
+    }
     return std::make_unique<QwenTextRunnerState>(
         model_, dynamic_cast<models::qwen::ContinuationAdapter&>(adapter), slot,
-        speculative_options_);
+        verifier_options);
   }
+  /// Caps wide copy verification; call before any state is bound.
+  void LimitCopyRows(std::uint32_t rows) noexcept { copy_rows_ = rows; }
   void ReconcileComponentState(TextRunnerState& state,
                                std::size_t position) const override {
     auto& qwen = RequireQwenState(state);
@@ -724,6 +744,14 @@ public:
           *dflash_model_, max_context_, MaximumDecodeBatchWidth());
       usage.temporary_scratch_bytes += draft.temporary_scratch_bytes;
       resident_weights += dflash_model_->GetPackedWeightBytes();
+      // A wide copy grows the session's SSM replay ring to every one of its
+      // rows (QwenGpuArena::EnsureSsmReplayCapacity).
+      if (const auto ring = std::bit_ceil(std::size_t{copy_rows_});
+          ring > hip::kSsmReplayCapacity)
+        usage.temporary_scratch_bytes +=
+            hip::QwenGpuArena::SsmReplayLogBytes(model_->GetConfig(), ring) -
+            hip::QwenGpuArena::SsmReplayLogBytes(model_->GetConfig(),
+                                                 hip::kSsmReplayCapacity);
     }
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
@@ -1077,7 +1105,8 @@ private:
       std::uint32_t context) const {
     return {.max_context = context,
             .max_draft_tokens = speculative_options_.max_draft_tokens,
-            .policy = dflash_policy_};
+            .policy = dflash_policy_,
+            .max_copy_rows = copy_rows_};
   }
   // Device state one session of `context` tokens holds: the target's, its
   // recurrent state and the draft's.
@@ -1108,6 +1137,9 @@ private:
   hip::QwenExecutionPolicy execution_policy_;
   std::string artifact_fingerprint_;
   std::string draft_artifact_fingerprint_;
+  /// Rows a lookup copy of a request decoding alone may verify (DFlash).
+  std::uint32_t copy_rows_{static_cast<std::uint32_t>(
+      hip::QwenGpuExecutor::kMaxWideVerificationRows)};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
@@ -1250,9 +1282,27 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenTextRunner(
       options.speculative.dflash_policy == ext::TextDFlashDraftPolicy::kFixed
           ? speculative::DFlashDraftPolicy::kFixed
           : speculative::DFlashDraftPolicy::kAdaptive;
-  return CreateQwenTextRunner(
+  const bool speculative = dflash_model != nullptr;
+  auto runner = std::make_shared<QwenTextRunner>(
       std::move(model), max_context, std::move(dflash_model),
       speculative_options, dflash_policy, model_fingerprint, draft_fingerprint);
+  // Each session's wide copies need a larger SSM replay ring (ResourceClaim).
+  // Narrow the width until the configured sessions fit, rather than refusing
+  // a session count the ordinary verifier width fits.
+  const std::size_t sessions = std::max<std::size_t>(options.session_count, 1);
+  for (auto rows = static_cast<std::uint32_t>(
+           hip::QwenGpuExecutor::kMaxWideVerificationRows);
+       speculative; rows /= 2) {
+    runner->LimitCopyRows(rows);
+    const auto claim = runner->ResourceClaim();
+    if (rows <= hip::kSsmReplayCapacity || !claim.state_capacity_bytes ||
+        !claim.per_request_state_bytes || !claim.temporary_scratch_bytes ||
+        sessions * (*claim.per_request_state_bytes +
+                    *claim.temporary_scratch_bytes) <=
+            *claim.state_capacity_bytes)
+      break;
+  }
+  return runner;
 }
 
 }  // namespace gufo::models::qwen
