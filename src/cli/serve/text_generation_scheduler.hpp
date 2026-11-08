@@ -12,6 +12,7 @@
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/sched/policy.hpp"
 
 namespace gufo::server {
 
@@ -24,7 +25,8 @@ enum class TextRequestPhase : std::uint8_t {
   kTerminal,
 };
 
-inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
+inline constexpr std::size_t kDefaultDecodeActivePrefillTokens =
+    sched::kDefaultDecodeActivePrefillTokens;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =
@@ -40,10 +42,6 @@ inline constexpr std::size_t kDefaultMaxPendingRequestsPerClient = 8;
 
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
-  /// Decode rounds every active decoder runs after each prefill chunk that
-  /// shares the device with it. More rounds raise decode speed beside a
-  /// prefill at the cost of prefill speed.
-  std::size_t decode_rounds{1};
 };
 
 struct TextSchedulerPolicy {
