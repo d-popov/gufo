@@ -110,6 +110,8 @@ public:
   [[nodiscard]] std::vector<ServedModel> served_models() const override;
   [[nodiscard]] std::vector<SessionState> session_states() const override;
   [[nodiscard]] std::vector<SessionPeek> session_peeks() const override;
+  [[nodiscard]] std::optional<PromptAdmissionBudget> prompt_admission_budget()
+      const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;

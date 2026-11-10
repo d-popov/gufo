@@ -132,7 +132,8 @@ DeepSeek maps `minimal`/`low` to `low`, `medium`/`high`/`xhigh` to `high`,
 and `max` to `max`.
 The [functional suite](../../tests/functional/README.md) with
 `--suite sampling-defaults --sampling-preset qwen38` (or
-`deepseek4`) compares omitted and explicit settings, including C2 replay.
+`deepseek4`, or `provider` for a model with its own defaults) compares omitted
+and explicit settings, including C2 replay.
 
 Sources: [Qwen27B](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices),
 [Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices),
@@ -1286,7 +1287,10 @@ Use appropriate HTTP status codes:
   rest `503 overloaded` with `Retry-After: 1`.
 - `499` internally recorded client cancellation
 - `500` internal failure
-- `503` model or backend unavailable, or GPU context lost (`device_lost`)
+- `503` model or backend unavailable, GPU context lost (`device_lost`), or a
+  prompt whose host prompt-state bytes do not fit the admission budget
+  (`insufficient_memory`, with `error.required_bytes` and
+  `error.remaining_bytes` and the same values under `usage.gufo`)
 
 Generation stops at the request budget or context capacity and reports a
 length finish reason when either limit is reached.
@@ -1562,6 +1566,16 @@ scheduler, such as on a deadline or a runner error, add none of these.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
 over the sum of all session contexts (sessions times context without session
 classes); retained cache entries are not counted.
+`gufo_prompt_state_budget_bytes` is the host RAM prompt state may claim before
+admission refuses, `gufo_prompt_state_reserved_bytes` the bytes charged to
+in-flight requests, and `gufo_prompt_state_available_bytes` the remainder.
+The charge covers the deterministic KV rows a prompt writes. Qwen and
+Flash-Next also sample host headroom at each submission, after the 4 GiB reserve
+and cgroup limits, and use the smaller of this sample and the startup budget.
+Outstanding requests are subtracted conservatively, even if their rows have
+already committed. This can refuse a prompt that would reuse existing pages.
+The check does not reserve output-token growth, evict caches or recheck during
+generation; other allocations can still exhaust memory after admission.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 

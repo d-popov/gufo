@@ -1617,6 +1617,10 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
   return *impl_->validated.runner;
 }
 
+const TextRunnerResourceClaim& TextRunnerPool::resource_claim() const noexcept {
+  return impl_->validated.resources;
+}
+
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->component_cache->capacity();
 }

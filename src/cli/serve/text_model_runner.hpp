@@ -173,6 +173,8 @@ public:
   /// Session classes in slot order. A pool built from a state count has one
   /// unnamed class with the runner's maximum context.
   [[nodiscard]] const std::vector<TextSessionClass>& classes() const noexcept;
+  /// Validated resource claim, including host prompt-state admission inputs.
+  [[nodiscard]] const TextRunnerResourceClaim& resource_claim() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
